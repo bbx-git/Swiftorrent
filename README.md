@@ -14,6 +14,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Resolves magnet metadata through BEP 5 DHT `get_peers`, BEP 10 extension negotiation, and BEP 9 `ut_metadata` requests.
 - Discovers `.torrent` download peers through HTTP/HTTPS trackers, UDP trackers, and BEP 5 DHT `get_peers`.
 - Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, bounded concurrent peer downloads, rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
+- Bounds every peer-wire network wait with connect and per-operation send/receive timeouts, so a peer that goes silent mid-message is torn down instead of parking a download slot.
+- Discovers additional inbound peers through BEP 11 PEX (consumes peer lists only; never advertises this client as a source).
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed, with a choice to remove only from Swiftorrent or also delete downloaded/partial files from disk.
 - Sanitizes torrent file names and multi-file path components before writing into the chosen destination.
@@ -21,8 +23,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads now use a small pool of concurrent tracker/DHT peers with basic piece availability tracking. The downloader does not yet use PEX, local peer discovery, encryption, NAT traversal, bandwidth limits, or partial file selection.
-- Magnet links can now fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT. PEX is still missing.
+- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking. The downloader does not yet use local peer discovery, encryption, NAT traversal, bandwidth limits, or partial file selection.
+- Magnet links can fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
 ## Requirements
@@ -108,14 +110,9 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 
 ### P2 — Performance & polish
 
-- Cache verified pieces; `verifiedPieces()` re-hashes the whole on-disk dataset and runs up to 3× per `download()`.
-- Add HTTP `Range`/resume support to web-seed downloads (currently GETs whole files; mid-file failure restarts the file).
-- Reduce fragile force-unwraps in `makePeerID` and the `SecRandomCopyBytes` path.
-- Add PEX (inbound peer discovery only).
-- Add peer-wire read/connect timeouts for every long-running network wait.
+- Reduce the remaining fragile force-unwrap in the `SecRandomCopyBytes` path.
 - Add file selection and per-file progress.
 
 ### Hardening tests
 
-- Cancellation tears down a stalled connection within the timeout window.
 - Integration tests using assets only from `~/Documents/Xcode/aTemp`.

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Network
 @testable import SwiftorrentCore
 import Testing
 
@@ -433,6 +434,68 @@ struct CoreParsingTests {
         #expect(peers == [trackerPeer])
     }
 
+    @Test("Peer wire tears down a silent peer within the timeout window")
+    func peerWireTimesOutOnSilentPeer() async throws {
+        // A loopback listener that accepts the connection but never sends a
+        // handshake back, modelling a peer that connects then goes silent.
+        let holder = AcceptedConnections()
+        let listener = try NWListener(using: .tcp)
+        listener.newConnectionHandler = { connection in
+            connection.start(queue: .global(qos: .utility))
+            holder.add(connection)
+        }
+        let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if let port = listener.port {
+                        listener.stateUpdateHandler = nil
+                        continuation.resume(returning: port)
+                    }
+                case let .failed(error):
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default:
+                    break
+                }
+            }
+            listener.start(queue: .global(qos: .utility))
+        }
+        defer {
+            listener.cancel()
+            holder.cancelAll()
+        }
+
+        let client = PeerWireClient(
+            endpoint: PeerEndpoint(host: "127.0.0.1", port: port.rawValue),
+            infoHash: Data(repeating: 0, count: 20),
+            peerID: Data(repeating: 1, count: 20),
+            connectTimeout: 2,
+            ioTimeout: 0.5
+        )
+
+        let start = ContinuousClock.now
+        var thrown: Error?
+        do {
+            // connect() opens the socket and sends the handshake, then blocks
+            // on receiveExactly(68); the silent peer never replies.
+            try await client.connect()
+        } catch {
+            thrown = error
+        }
+        let elapsed = ContinuousClock.now - start
+        await client.close()
+
+        if let peerError = thrown as? PeerWireError, case .timedOut = peerError {
+            // Expected.
+        } else {
+            Issue.record("Expected PeerWireError.timedOut, got \(String(describing: thrown))")
+        }
+        // The handshake read should be abandoned shortly after ioTimeout, well
+        // before any default multi-second wait.
+        #expect(elapsed < .seconds(2))
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",
@@ -463,5 +526,26 @@ private struct MockDHTPeerFinder: DHTPeerFinding {
 
     func peers(for infoHash: Data) async throws -> [PeerEndpoint] {
         peers
+    }
+}
+
+/// Retains accepted loopback connections so they stay open for the duration of
+/// a timeout test, then tears them down on cleanup.
+private final class AcceptedConnections: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connections: [NWConnection] = []
+
+    func add(_ connection: NWConnection) {
+        lock.lock()
+        connections.append(connection)
+        lock.unlock()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let current = connections
+        connections.removeAll()
+        lock.unlock()
+        current.forEach { $0.cancel() }
     }
 }

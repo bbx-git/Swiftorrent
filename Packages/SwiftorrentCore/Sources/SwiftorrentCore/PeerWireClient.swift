@@ -16,6 +16,7 @@ public enum PeerWireError: Error, LocalizedError {
     case invalidPieceHash
     case extensionProtocolUnavailable
     case metadataUnavailable
+    case timedOut
 
     public var errorDescription: String? {
         switch self {
@@ -27,6 +28,7 @@ public enum PeerWireError: Error, LocalizedError {
         case .invalidPieceHash: "Downloaded piece failed SHA-1 verification."
         case .extensionProtocolUnavailable: "Peer does not support the BitTorrent extension protocol."
         case .metadataUnavailable: "Peer does not provide magnet metadata."
+        case .timedOut: "Peer stopped responding."
         }
     }
 }
@@ -40,6 +42,12 @@ public actor PeerWireClient {
     private let endpoint: PeerEndpoint
     private let infoHash: Data
     private let peerID: Data
+    /// Upper bound on how long the TCP connection may take to become ready.
+    private let connectTimeout: TimeInterval
+    /// Upper bound on any single send/receive wire operation. A peer that goes
+    /// silent mid-message is torn down within this window instead of parking a
+    /// download slot forever.
+    private let ioTimeout: TimeInterval
     private var connection: NWConnection?
     private var isChoked = true
     private var peerSupportsExtensions = false
@@ -48,10 +56,18 @@ public actor PeerWireClient {
     private var availablePieces = Set<Int>()
     private var availabilityIsKnown = false
 
-    public init(endpoint: PeerEndpoint, infoHash: Data, peerID: Data) {
+    public init(
+        endpoint: PeerEndpoint,
+        infoHash: Data,
+        peerID: Data,
+        connectTimeout: TimeInterval = 10,
+        ioTimeout: TimeInterval = 30
+    ) {
         self.endpoint = endpoint
         self.infoHash = infoHash
         self.peerID = peerID
+        self.connectTimeout = connectTimeout
+        self.ioTimeout = ioTimeout
     }
 
     public func connect() async throws {
@@ -61,35 +77,37 @@ public actor PeerWireClient {
         }
         let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: port, using: .tcp)
         self.connection = connection
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.stateUpdateHandler = { state in
-                    switch state {
-                    case .ready:
-                        connection.stateUpdateHandler = nil
-                        continuation.resume()
-                    case let .failed(error):
-                        connection.stateUpdateHandler = nil
-                        continuation.resume(throwing: error)
-                    case let .waiting(error):
-                        // Without waitForConnectivity, NWConnection parks unreachable or
-                        // refused peers in `.waiting` indefinitely. Fail fast instead.
-                        connection.stateUpdateHandler = nil
-                        connection.cancel()
-                        continuation.resume(throwing: error)
-                    case .cancelled:
-                        // Reached when `onCancel` (or `.waiting` above) cancels the
-                        // connection; resume so the continuation never leaks.
-                        connection.stateUpdateHandler = nil
-                        continuation.resume(throwing: CancellationError())
-                    default:
-                        break
+        try await withTimeout(connectTimeout) {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    connection.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            connection.stateUpdateHandler = nil
+                            continuation.resume()
+                        case let .failed(error):
+                            connection.stateUpdateHandler = nil
+                            continuation.resume(throwing: error)
+                        case let .waiting(error):
+                            // Without waitForConnectivity, NWConnection parks unreachable or
+                            // refused peers in `.waiting` indefinitely. Fail fast instead.
+                            connection.stateUpdateHandler = nil
+                            connection.cancel()
+                            continuation.resume(throwing: error)
+                        case .cancelled:
+                            // Reached when `onCancel` (or `.waiting` above) cancels the
+                            // connection; resume so the continuation never leaks.
+                            connection.stateUpdateHandler = nil
+                            continuation.resume(throwing: CancellationError())
+                        default:
+                            break
+                        }
                     }
+                    connection.start(queue: .global(qos: .utility))
                 }
-                connection.start(queue: .global(qos: .utility))
+            } onCancel: {
+                connection.cancel()
             }
-        } onCancel: {
-            connection.cancel()
         }
         try await send(handshake())
         let response = try await receiveExactly(68)
@@ -352,18 +370,20 @@ public actor PeerWireClient {
     private func send(_ data: Data) async throws {
         try Task.checkCancellation()
         guard let connection else { throw PeerWireError.disconnected }
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.send(content: data, completion: .contentProcessed { error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
-                    }
-                })
+        try await withTimeout(ioTimeout) {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    connection.send(content: data, completion: .contentProcessed { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    })
+                }
+            } onCancel: {
+                connection.cancel()
             }
-        } onCancel: {
-            connection.cancel()
         }
     }
 
@@ -372,26 +392,49 @@ public actor PeerWireClient {
         while result.count < count {
             try Task.checkCancellation()
             guard let connection else { throw PeerWireError.disconnected }
-            let chunk = try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: count - result.count) { data, _, isComplete, error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else if let data, !data.isEmpty {
-                            continuation.resume(returning: data)
-                        } else if isComplete {
-                            continuation.resume(throwing: PeerWireError.disconnected)
-                        } else {
-                            continuation.resume(throwing: PeerWireError.disconnected)
+            let remaining = count - result.count
+            let chunk = try await withTimeout(ioTimeout) {
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                        connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
+                            if let error {
+                                continuation.resume(throwing: error)
+                            } else if let data, !data.isEmpty {
+                                continuation.resume(returning: data)
+                            } else {
+                                continuation.resume(throwing: PeerWireError.disconnected)
+                            }
                         }
                     }
+                } onCancel: {
+                    connection.cancel()
                 }
-            } onCancel: {
-                connection.cancel()
             }
             result.append(chunk)
         }
         return result
+    }
+
+    /// Races `operation` against a sleeping timer. If the timer wins, the
+    /// structured task group cancels the operation task on scope exit, whose
+    /// `onCancel` cancels the underlying `NWConnection`, so the parked
+    /// continuation resumes and nothing leaks. Surfaced error is `.timedOut`.
+    private func withTimeout<T: Sendable>(
+        _ seconds: TimeInterval,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw PeerWireError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw PeerWireError.timedOut
+            }
+            return result
+        }
     }
 }
 
