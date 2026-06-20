@@ -5,7 +5,7 @@ import PackageDescription
 let package = Package(
     name: "Swiftorrent",
     platforms: [
-        .macOS(.v15)
+        .macOS(.v26)
     ],
     products: [
         .executable(name: "Swiftorrent", targets: ["SwiftorrentApp"]),

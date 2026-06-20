@@ -17,13 +17,7 @@ public struct SwiftorrentRootView: View {
                 header
                 content
             }
-            .background(
-                LinearGradient(
-                    colors: [Color(nsColor: .windowBackgroundColor), Color.accentColor.opacity(0.10)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
+            .background(Color(nsColor: .windowBackgroundColor))
         }
         .fileImporter(isPresented: $importerPresented, allowedContentTypes: [.torrent], allowsMultipleSelection: true) { result in
             if case let .success(urls) = result {
@@ -54,7 +48,7 @@ public struct SwiftorrentRootView: View {
                 Label("Open .torrent", systemImage: "doc.badge.plus")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.glassProminent)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Magnet")
@@ -67,7 +61,10 @@ public struct SwiftorrentRootView: View {
                     magnetText = ""
                 }
                 .disabled(magnetText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .buttonStyle(.glass)
             }
+            .padding(14)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 8))
 
             Divider()
 
@@ -83,7 +80,10 @@ public struct SwiftorrentRootView: View {
                 } label: {
                     Label("Choose Folder", systemImage: "folder")
                 }
+                .buttonStyle(.glass)
             }
+            .padding(14)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 8))
 
             Spacer()
 
@@ -161,8 +161,8 @@ private struct TorrentRow: View {
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 9)
                         .padding(.vertical, 4)
-                        .background(color.opacity(0.16), in: Capsule())
                         .foregroundStyle(color)
+                        .glassEffect(.regular.tint(color.opacity(0.18)), in: Capsule())
                 }
 
                 ProgressView(value: item.progress)
@@ -218,7 +218,7 @@ private struct Metric: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
