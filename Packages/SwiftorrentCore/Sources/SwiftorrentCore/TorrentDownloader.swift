@@ -40,6 +40,7 @@ public struct TorrentDownloader: Sendable {
         try ensureAvailableCapacity(for: metainfo.totalSize - initialDownloaded, at: destination)
 
         if initialDownloaded >= metainfo.totalSize {
+            try writer.finalize()
             await progress(TorrentDownloadProgress(status: "Complete. Existing files verified. No seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
             return
         }
@@ -56,6 +57,7 @@ public struct TorrentDownloader: Sendable {
             let verifiedPieces = try writer.verifiedPieces()
             let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
             if verifiedBytes >= metainfo.totalSize {
+                try writer.finalize()
                 _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped")
                 await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
                 return
@@ -70,6 +72,7 @@ public struct TorrentDownloader: Sendable {
                 initialDownloaded: verifiedBytes,
                 progress: progress
             )
+            try writer.finalize()
             _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
             await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
             return
@@ -366,6 +369,7 @@ private actor PieceDownloadCoordinator {
 struct TorrentFileWriter: Sendable {
     let metainfo: TorrentMetainfo
     let destination: URL
+    private let partialExtension = "tor"
 
     func verifiedPieces() throws -> Set<Int> {
         var verified = Set<Int>()
@@ -406,6 +410,22 @@ struct TorrentFileWriter: Sendable {
         }
     }
 
+    func finalize() throws {
+        for file in metainfo.files {
+            let partialURL = try outputURL(for: file, partial: true)
+            guard FileManager.default.fileExists(atPath: partialURL.path) else {
+                continue
+            }
+
+            let finalURL = try outputURL(for: file, partial: false)
+            try FileManager.default.createDirectory(at: finalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: finalURL.path) {
+                try FileManager.default.removeItem(at: finalURL)
+            }
+            try FileManager.default.moveItem(at: partialURL, to: finalURL)
+        }
+    }
+
     func read(pieceIndex: Int, length: Int) throws -> Data? {
         let pieceStart = Int64(pieceIndex * metainfo.pieceLength)
         var result = Data()
@@ -433,10 +453,15 @@ struct TorrentFileWriter: Sendable {
     }
 
     private func write(chunk: Data, to file: TorrentFile, at offset: Int64) throws {
-        let url = destination.appendingPathComponent(file.path)
+        let url = try outputURL(for: file, partial: true)
+        let finalURL = try outputURL(for: file, partial: false)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+            if FileManager.default.fileExists(atPath: finalURL.path) {
+                try FileManager.default.copyItem(at: finalURL, to: url)
+            } else {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
         }
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
@@ -445,7 +470,9 @@ struct TorrentFileWriter: Sendable {
     }
 
     private func readChunk(from file: TorrentFile, at offset: Int64, count: Int) throws -> Data? {
-        let url = destination.appendingPathComponent(file.path)
+        let partialURL = try outputURL(for: file, partial: true)
+        let finalURL = try outputURL(for: file, partial: false)
+        let url = FileManager.default.fileExists(atPath: partialURL.path) ? partialURL : finalURL
         guard FileManager.default.fileExists(atPath: url.path) else {
             return nil
         }
@@ -461,5 +488,17 @@ struct TorrentFileWriter: Sendable {
             return Int(metainfo.totalSize - consumed)
         }
         return metainfo.pieceLength
+    }
+
+    private func outputURL(for file: TorrentFile, partial: Bool) throws -> URL {
+        let destinationURL = destination.standardizedFileURL
+        let finalURL = destinationURL.appendingPathComponent(file.path)
+        let outputURL = (partial ? finalURL.appendingPathExtension(partialExtension) : finalURL).standardizedFileURL
+        let destinationPath = destinationURL.path
+        let outputPath = outputURL.path
+        guard outputPath == destinationPath || outputPath.hasPrefix(destinationPath + "/") else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        return outputURL
     }
 }

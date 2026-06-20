@@ -168,9 +168,18 @@ struct CoreParsingTests {
         try writer.write(piece: Data("abcd".utf8), pieceIndex: 0)
 
         #expect(try writer.read(pieceIndex: 0, length: 4) == Data("abcd".utf8))
+        #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/a.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/b.txt").path))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("Root/a.txt.tor")) == Data("ab".utf8))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("Root/b.txt.tor")) == Data("cd".utf8))
+        #expect(try writer.verifiedPieces() == [0])
+
+        try writer.finalize()
+
         #expect(try Data(contentsOf: destination.appendingPathComponent("Root/a.txt")) == Data("ab".utf8))
         #expect(try Data(contentsOf: destination.appendingPathComponent("Root/b.txt")) == Data("cd".utf8))
-        #expect(try writer.verifiedPieces() == [0])
+        #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/a.txt.tor").path))
+        #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/b.txt.tor").path))
     }
 
     @Test("Torrent writer ignores corrupt resume pieces")
@@ -188,6 +197,31 @@ struct CoreParsingTests {
         try writer.write(piece: Data("ef".utf8), pieceIndex: 1)
 
         #expect(try writer.verifiedPieces() == [1])
+    }
+
+    @Test("Torrent writer refuses paths outside destination")
+    func torrentWriterRefusesEscapedPaths() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let destination = root.appendingPathComponent("Downloads", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let metainfo = TorrentMetainfo(
+            name: "Escaped",
+            announceURLs: [],
+            files: [TorrentFile(id: 0, path: "../escaped.txt", length: 4)],
+            pieceLength: 4,
+            pieceHashes: [Data(Insecure.SHA1.hash(data: Data("abcd".utf8)))],
+            totalSize: 4,
+            infoHash: Data(repeating: 0, count: 20),
+            infoDictionaryData: Data()
+        )
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+
+        #expect(throws: CocoaError.self) {
+            try writer.write(piece: Data("abcd".utf8), pieceIndex: 0)
+        }
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("escaped.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("escaped.txt.tor").path))
     }
 
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
