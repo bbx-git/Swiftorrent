@@ -292,6 +292,36 @@ struct CoreParsingTests {
         #expect(try writer.verifiedPieces() == [1])
     }
 
+    @Test("Torrent writer verifies only the requested piece subset")
+    func torrentWriterVerifiesPieceSubset() throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [
+            Data("abcd".utf8),
+            Data("ef".utf8)
+        ])
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+
+        try writer.write(piece: Data("abcd".utf8), pieceIndex: 0)
+        try writer.write(piece: Data("ef".utf8), pieceIndex: 1)
+
+        // Restricting the scan to a subset only reports matches within it, so a
+        // cached set can be refreshed without re-hashing already-valid pieces.
+        #expect(try writer.verifiedPieces(among: [1]) == [1])
+        #expect(try writer.verifiedPieces(among: [0]) == [0])
+        #expect(try writer.verifiedPieces(among: []) == [])
+        #expect(try writer.verifiedPieces(among: [0, 1]) == writer.verifiedPieces())
+    }
+
+    @Test("Peer id is exactly 20 ASCII bytes with the client prefix")
+    func makePeerIDIsTwentyASCIIBytes() throws {
+        let peerID = TorrentDownloader.makePeerID()
+        #expect(peerID.count == 20)
+        #expect(peerID.allSatisfy { $0 < 0x80 })
+        #expect(peerID.starts(with: Data("-SW0001-".utf8)))
+    }
+
     @Test("Torrent writer refuses paths outside destination")
     func torrentWriterRefusesEscapedPaths() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)

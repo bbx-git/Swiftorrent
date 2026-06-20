@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** All P1 items are done. Start P2: cache verified pieces (`verifiedPieces()` currently re-hashes the whole on-disk dataset up to 3× per `download()`), then HTTP `Range`/resume for web seeds, then PEX (inbound-only).
+- **Next Immediate Step:** P2 verified-piece caching is done. Next P2: HTTP `Range`/resume for web seeds, then PEX (inbound-only), then per-wait peer-wire timeouts and file selection.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -34,6 +34,7 @@
   - Changed app accent styling from blue to graphite black/grey.
   - Fixed all P0 (critical) roadmap items: untrusted-input crash/OOM/hang hardening across bencode, peer-wire, tracker, and DHT paths.
 - **Recent Fixes (Anti-Regression):**
+  - P2: verified-piece caching. `download()` now does one full `verifiedPieces()` hash scan, carries the set forward in a `var`, and after web seeds refreshes only the still-unverified indices via the new `TorrentFileWriter.verifiedPieces(among:)`. The pre-peer-download path reuses the cached set (peer discovery does no disk I/O), eliminating the previous up-to-3× full re-hash per download. Also hardened `makePeerID()` to build 20 ASCII bytes from `utf8` (no force-unwrapped `data(using: .ascii)!`). Added tests: piece-subset verification and 20-byte ASCII peer id.
   - P1: empty-availability heuristic fixed. `PeerWireClient.currentAvailability()` exposes `(pieces, isKnown)`; the download loop now queries live availability each pass, so `have`/`bitfield` messages received mid-download refine the set. The optimistic "assume full seed" fallback now applies only while the peer is undeclared (unchoked first) and self-corrects once it announces anything. The frozen `PeerDownloadSession.availablePieces` snapshot is now only used to seed rarest-first counts.
   - P1: `TrackerClient.makeAnnounceURL` now returns `URL?` (no `URL(string:)!` force-unwrap), refactored to a testable `static` helper; `announce` throws `invalidTrackerURL` when the URL can't be built, so the failing tracker is skipped by the per-tracker `catch` in `TorrentDownloader`/`MagnetMetadataResolver` group tasks instead of crashing.
   - P1: `PeerWireClient.connect` handles `.waiting` (cancels + fails fast on unreachable/refused peers) and `.cancelled` (resumes with `CancellationError`, no continuation leak); same `.waiting` fail-fast added to `TrackerClient`/`DHTClient` `waitUntilReady`.
@@ -53,7 +54,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 24 Swift Testing tests passed (latest add: announce-URL builder query/nil-base test).
+- **Tests:** Success, `swift test -c release`, 26 Swift Testing tests passed (latest add: piece-subset verification and 20-byte ASCII peer id).
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -69,4 +70,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- All P0 and P1 roadmap items are done. Next up: P2 — cache verified pieces (avoid 3× full re-hash per `download()`), HTTP `Range`/resume for web seeds, fragile force-unwraps in `makePeerID`/`SecRandomCopyBytes`, PEX (inbound-only), per-wait peer-wire timeouts, file selection — plus the two remaining hardening tests (cancellation teardown timing; integration tests from `~/Documents/Xcode/aTemp`).
+- All P0/P1 done; P2 verified-piece caching and the `makePeerID` force-unwrap are done. Next up: P2 — HTTP `Range`/resume for web seeds, PEX (inbound-only), per-wait peer-wire timeouts, file selection — plus the two remaining hardening tests (cancellation teardown timing; integration tests from `~/Documents/Xcode/aTemp`).

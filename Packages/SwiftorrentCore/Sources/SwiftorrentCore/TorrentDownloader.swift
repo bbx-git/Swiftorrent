@@ -45,8 +45,11 @@ public struct TorrentDownloader: Sendable {
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
-        let initialVerifiedPieces = try writer.verifiedPieces()
-        let initialDownloaded = bytesCompleted(for: initialVerifiedPieces, metainfo: metainfo)
+        // Full hash scan once. `verifiedPieces` is then carried forward and only
+        // refreshed for pieces that get written during this run, so we never
+        // re-hash already-valid pieces on the web-seed and peer paths below.
+        var verifiedPieces = try writer.verifiedPieces()
+        let initialDownloaded = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
         try ensureAvailableCapacity(for: metainfo.totalSize - initialDownloaded, at: destination)
 
         if initialDownloaded >= metainfo.totalSize {
@@ -63,7 +66,10 @@ public struct TorrentDownloader: Sendable {
                     initialDownloaded: initialDownloaded,
                     progress: progress
                 )
-                let verifiedPieces = try writer.verifiedPieces()
+                // Web seeds only write pieces we did not already have, so verify
+                // just the previously-unverified indices and fold the result in.
+                let unverified = Set(metainfo.pieceHashes.indices).subtracting(verifiedPieces)
+                verifiedPieces.formUnion(try writer.verifiedPieces(among: unverified))
                 let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
                 if verifiedBytes >= metainfo.totalSize {
                     try writer.finalize()
@@ -86,7 +92,8 @@ public struct TorrentDownloader: Sendable {
                 throw TrackerClientError.invalidResponse
             }
 
-            let verifiedPieces = try writer.verifiedPieces()
+            // Nothing writes to disk between the scan above and here (peer
+            // discovery does no I/O), so the cached set is still accurate.
             let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
             if verifiedBytes >= metainfo.totalSize {
                 try writer.finalize()
@@ -437,7 +444,15 @@ public struct TorrentDownloader: Sendable {
 
     public static func makePeerID() -> Data {
         let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)
-        return "-SW0001-\(suffix)0000".prefix(20).data(using: .ascii)!
+        // The identifier is ASCII by construction (hex suffix + literals), so
+        // `utf8` yields exactly its bytes and never traps — unlike a
+        // force-unwrapped `data(using: .ascii)`. Pad/truncate to the required
+        // 20-byte peer id defensively in case the prefix is ever shortened.
+        var data = Data("-SW0001-\(suffix)0000".utf8.prefix(20))
+        if data.count < 20 {
+            data.append(contentsOf: repeatElement(UInt8(ascii: "0"), count: 20 - data.count))
+        }
+        return data
     }
 }
 
@@ -541,8 +556,17 @@ struct TorrentFileWriter: Sendable {
     private let partialExtension = "tor"
 
     func verifiedPieces() throws -> Set<Int> {
+        try verifiedPieces(among: metainfo.pieceHashes.indices)
+    }
+
+    /// Verifies only `indices` against their expected hashes, returning the
+    /// subset that is present on disk and matches. Reading + SHA-1 hashing a
+    /// piece is expensive, so callers that already hold a cached verified set
+    /// pass just the still-unverified indices here to refresh it after new
+    /// pieces are written, instead of re-hashing the entire dataset.
+    func verifiedPieces<S: Sequence>(among indices: S) throws -> Set<Int> where S.Element == Int {
         var verified = Set<Int>()
-        for pieceIndex in metainfo.pieceHashes.indices {
+        for pieceIndex in indices {
             let length = pieceLength(for: pieceIndex)
             guard let piece = try read(pieceIndex: pieceIndex, length: length),
                   Data(Insecure.SHA1.hash(data: piece)) == metainfo.pieceHashes[pieceIndex] else {
