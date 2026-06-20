@@ -16,6 +16,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, bounded concurrent peer downloads, rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Bounds every peer-wire network wait with connect and per-operation send/receive timeouts, so a peer that goes silent mid-message is torn down instead of parking a download slot.
 - Discovers additional inbound peers through BEP 11 PEX (consumes peer lists only; never advertises this client as a source).
+- Lets you choose which files in a multi-file torrent to download, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files.
+- Shows per-file download progress in an expandable file list for multi-file torrents.
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed, with a choice to remove only from Swiftorrent or also delete downloaded/partial files from disk.
 - Sanitizes torrent file names and multi-file path components before writing into the chosen destination.
@@ -23,7 +25,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking. The downloader does not yet use local peer discovery, encryption, NAT traversal, bandwidth limits, or partial file selection.
+- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, and support per-file selection. The downloader does not yet use local peer discovery, encryption, NAT traversal, or bandwidth limits. Web-seed acceleration applies only to full (non-partial) selections.
 - Magnet links can fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
@@ -110,7 +112,7 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 
 ### P2 — Performance & polish
 
-- Add file selection and per-file progress.
+- (No open P2 items — file selection and per-file progress now ship; see **Features**.)
 
 ### Hardening tests
 

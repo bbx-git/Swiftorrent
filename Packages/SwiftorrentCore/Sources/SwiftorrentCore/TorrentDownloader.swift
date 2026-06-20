@@ -1,20 +1,41 @@
 import CryptoKit
 import Foundation
 
+public struct TorrentFileProgress: Sendable, Identifiable, Equatable {
+    public let id: Int
+    public let path: String
+    public let downloadedBytes: Int64
+    public let totalBytes: Int64
+    public let isSelected: Bool
+
+    public init(id: Int, path: String, downloadedBytes: Int64, totalBytes: Int64, isSelected: Bool) {
+        self.id = id
+        self.path = path
+        self.downloadedBytes = downloadedBytes
+        self.totalBytes = totalBytes
+        self.isSelected = isSelected
+    }
+}
+
 public struct TorrentDownloadProgress: Sendable {
     public let status: String
     public let downloadedBytes: Int64
     public let totalBytes: Int64
+    /// Per-file breakdown. Empty means "no change since the last update" so the
+    /// frequent status-only ticks (connecting, contacting trackers) don't have
+    /// to recompute the whole table; consumers keep the last non-empty value.
+    public let files: [TorrentFileProgress]
 
     public var fractionCompleted: Double {
         guard totalBytes > 0 else { return 0 }
         return min(1, max(0, Double(downloadedBytes) / Double(totalBytes)))
     }
 
-    public init(status: String, downloadedBytes: Int64, totalBytes: Int64) {
+    public init(status: String, downloadedBytes: Int64, totalBytes: Int64, files: [TorrentFileProgress] = []) {
         self.status = status
         self.downloadedBytes = downloadedBytes
         self.totalBytes = totalBytes
+        self.files = files
     }
 }
 
@@ -40,52 +61,82 @@ public struct TorrentDownloader: Sendable {
     public func download(
         metainfo: TorrentMetainfo,
         destination: URL,
+        selectedFileIDs: Set<Int>? = nil,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws {
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
-        // Full hash scan once. `verifiedPieces` is then carried forward and only
-        // refreshed for pieces that get written during this run, so we never
-        // re-hash already-valid pieces on the web-seed and peer paths below.
-        var verifiedPieces = try writer.verifiedPieces()
-        let initialDownloaded = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
-        try ensureAvailableCapacity(for: metainfo.totalSize - initialDownloaded, at: destination)
+        let layout = TorrentLayout(metainfo: metainfo)
 
-        if initialDownloaded >= metainfo.totalSize {
-            try writer.finalize()
-            await progress(TorrentDownloadProgress(status: "Complete. Existing files verified. No seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+        // Resolve the selection into the set of pieces we actually fetch. A full
+        // selection downloads every piece; a subset downloads only the pieces
+        // overlapping the chosen files (including boundary pieces shared with a
+        // deselected neighbor, which must be whole to verify the selected edge).
+        let allFileIDs = Set(metainfo.files.map(\.id))
+        let selection = selectedFileIDs ?? allFileIDs
+        let isFullSelection = selection.isSuperset(of: allFileIDs)
+        let selectablePieces = isFullSelection
+            ? Set(0..<layout.pieceCount)
+            : layout.pieceIndices(forFiles: selection)
+        let downloadTotal = selectablePieces.reduce(Int64(0)) { $0 + Int64(layout.length(ofPiece: $1)) }
+
+        guard !selectablePieces.isEmpty, downloadTotal > 0 else {
+            await progress(TorrentDownloadProgress(status: "No files selected.", downloadedBytes: 0, totalBytes: 0, files: fileProgress(metainfo: metainfo, selection: selection, perFileBytes: [Int64](repeating: 0, count: metainfo.files.count))))
             return
         }
 
-        if !metainfo.webSeedURLs.isEmpty {
+        func fileSnapshot(for pieces: Set<Int>) -> [TorrentFileProgress] {
+            fileProgress(metainfo: metainfo, selection: selection, perFileBytes: layout.completedBytesPerFile(completedPieces: pieces))
+        }
+
+        // Full hash scan once over the selected pieces. `verifiedPieces` is then
+        // carried forward and only refreshed for pieces written during this run,
+        // so we never re-hash already-valid pieces on the paths below.
+        var verifiedPieces = try writer.verifiedPieces(among: selectablePieces)
+        let initialDownloaded = bytesCompleted(for: verifiedPieces, layout: layout)
+        try ensureAvailableCapacity(for: downloadTotal - initialDownloaded, at: destination)
+
+        if initialDownloaded >= downloadTotal {
+            try writer.finalize(selectedFileIDs: selection)
+            await progress(TorrentDownloadProgress(status: "Complete. Existing files verified. No seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
+            return
+        }
+
+        // Web seeds fetch whole files over HTTP, which cannot satisfy the
+        // boundary pieces a partial selection needs, so the optimization only
+        // applies to a full download.
+        if isFullSelection, !metainfo.webSeedURLs.isEmpty {
             do {
                 try await downloadFromWebSeeds(
                     metainfo: metainfo,
                     writer: writer,
+                    layout: layout,
+                    selection: selection,
                     initialDownloaded: initialDownloaded,
+                    totalBytes: downloadTotal,
                     progress: progress
                 )
                 // Web seeds only write pieces we did not already have, so verify
                 // just the previously-unverified indices and fold the result in.
-                let unverified = Set(metainfo.pieceHashes.indices).subtracting(verifiedPieces)
+                let unverified = selectablePieces.subtracting(verifiedPieces)
                 verifiedPieces.formUnion(try writer.verifiedPieces(among: unverified))
-                let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
-                if verifiedBytes >= metainfo.totalSize {
-                    try writer.finalize()
-                    await progress(TorrentDownloadProgress(status: "Complete. Downloaded from web seed. No seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+                let verifiedBytes = bytesCompleted(for: verifiedPieces, layout: layout)
+                if verifiedBytes >= downloadTotal {
+                    try writer.finalize(selectedFileIDs: selection)
+                    await progress(TorrentDownloadProgress(status: "Complete. Downloaded from web seed. No seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
                     return
                 }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                await progress(TorrentDownloadProgress(status: "Web seed failed. Contacting trackers and DHT", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+                await progress(TorrentDownloadProgress(status: "Web seed failed. Contacting trackers and DHT", downloadedBytes: initialDownloaded, totalBytes: downloadTotal))
             }
         }
 
         let peerID = Self.makePeerID()
-        await progress(TorrentDownloadProgress(status: "Verified existing data. Contacting trackers and DHT", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
-        let peers = try await collectPeers(for: metainfo, peerID: peerID, downloaded: initialDownloaded, left: metainfo.totalSize - initialDownloaded, event: "started")
+        await progress(TorrentDownloadProgress(status: "Verified existing data. Contacting trackers and DHT", downloadedBytes: initialDownloaded, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
+        let peers = try await collectPeers(for: metainfo, peerID: peerID, downloaded: initialDownloaded, left: downloadTotal - initialDownloaded, event: "started")
         do {
             try Task.checkCancellation()
             guard !peers.isEmpty else {
@@ -94,34 +145,54 @@ public struct TorrentDownloader: Sendable {
 
             // Nothing writes to disk between the scan above and here (peer
             // discovery does no I/O), so the cached set is still accurate.
-            let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
-            if verifiedBytes >= metainfo.totalSize {
-                try writer.finalize()
+            let verifiedBytes = bytesCompleted(for: verifiedPieces, layout: layout)
+            if verifiedBytes >= downloadTotal {
+                try writer.finalize(selectedFileIDs: selection)
                 _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped", includeDHT: false)
-                await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+                await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
                 return
             }
 
             let downloaded = try await downloadPiecesConcurrently(
                 metainfo: metainfo,
                 destination: destination,
+                layout: layout,
+                selectablePieces: selectablePieces,
+                selection: selection,
+                downloadTotal: downloadTotal,
                 peers: Array(peers.shuffled().prefix(maxPeerAttempts)),
                 peerID: peerID,
                 verifiedPieces: verifiedPieces,
                 initialDownloaded: verifiedBytes,
                 progress: progress
             )
-            try writer.finalize()
+            try writer.finalize(selectedFileIDs: selection)
             _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped", includeDHT: false)
-            await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+            await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: selectablePieces)))
             return
+        }
+    }
+
+    private func fileProgress(metainfo: TorrentMetainfo, selection: Set<Int>, perFileBytes: [Int64]) -> [TorrentFileProgress] {
+        metainfo.files.map { file in
+            let done = file.id < perFileBytes.count ? min(perFileBytes[file.id], file.length) : 0
+            return TorrentFileProgress(
+                id: file.id,
+                path: file.path,
+                downloadedBytes: done,
+                totalBytes: file.length,
+                isSelected: selection.contains(file.id)
+            )
         }
     }
 
     private func downloadFromWebSeeds(
         metainfo: TorrentMetainfo,
         writer: TorrentFileWriter,
+        layout: TorrentLayout,
+        selection: Set<Int>,
         initialDownloaded: Int64,
+        totalBytes: Int64,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws {
         var lastError: Error?
@@ -129,13 +200,22 @@ public struct TorrentDownloader: Sendable {
             try Task.checkCancellation()
             do {
                 var downloadedBytes = initialDownloaded
+                var perFileBytes = [Int64](repeating: 0, count: metainfo.files.count)
                 for file in metainfo.files {
                     try Task.checkCancellation()
                     let sourceURL = webSeedURL.appendingTorrentRelativePath(file.path)
-                    await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: downloadedBytes, totalBytes: metainfo.totalSize))
-                    downloadedBytes += try await downloadWebSeedFile(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: downloadedBytes) { currentDownloadedBytes in
-                        await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: currentDownloadedBytes, totalBytes: metainfo.totalSize))
+                    let fileBase = downloadedBytes
+                    let baseFileBytes = perFileBytes
+                    let snapshot: @Sendable (Int64) -> [TorrentFileProgress] = { currentFileBytes in
+                        var bytes = baseFileBytes
+                        if file.id < bytes.count { bytes[file.id] = min(currentFileBytes, file.length) }
+                        return self.fileProgress(metainfo: metainfo, selection: selection, perFileBytes: bytes)
                     }
+                    await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: downloadedBytes, totalBytes: totalBytes, files: snapshot(0)))
+                    downloadedBytes += try await downloadWebSeedFile(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: downloadedBytes) { currentDownloadedBytes in
+                        await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: currentDownloadedBytes, totalBytes: totalBytes, files: snapshot(currentDownloadedBytes - fileBase)))
+                    }
+                    if file.id < perFileBytes.count { perFileBytes[file.id] = file.length }
                 }
                 return
             } catch is CancellationError {
@@ -219,6 +299,10 @@ public struct TorrentDownloader: Sendable {
     private func downloadPiecesConcurrently(
         metainfo: TorrentMetainfo,
         destination: URL,
+        layout: TorrentLayout,
+        selectablePieces: Set<Int>,
+        selection: Set<Int>,
+        downloadTotal: Int64,
         peers: [PeerEndpoint],
         peerID: Data,
         verifiedPieces: Set<Int>,
@@ -230,23 +314,28 @@ public struct TorrentDownloader: Sendable {
             metainfo: metainfo,
             peerID: peerID,
             initialDownloaded: initialDownloaded,
+            totalBytes: downloadTotal,
             progress: progress
         )
         guard !sessions.isEmpty else { throw TrackerClientError.invalidResponse }
 
         let writer = TorrentPieceWriter(writer: TorrentFileWriter(metainfo: metainfo, destination: destination))
         let coordinator = PieceDownloadCoordinator(
-            pieceLengths: metainfo.pieceHashes.indices.map { pieceLength(for: $0, metainfo: metainfo) },
+            layout: layout,
+            selectablePieces: selectablePieces,
             completedPieces: verifiedPieces,
             initialDownloaded: initialDownloaded,
             availabilityCounts: availabilityCounts(from: sessions)
         )
+        @Sendable func fileSnapshot(_ perFileBytes: [Int64]) -> [TorrentFileProgress] {
+            fileProgress(metainfo: metainfo, selection: selection, perFileBytes: perFileBytes)
+        }
 
         var lastError: Error?
         await withTaskGroup(of: Error?.self) { group in
             for session in sessions {
                 group.addTask {
-                    await progress(TorrentDownloadProgress(status: "Connected to peer \(session.endpoint.host):\(session.endpoint.port)", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+                    await progress(TorrentDownloadProgress(status: "Connected to peer \(session.endpoint.host):\(session.endpoint.port)", downloadedBytes: initialDownloaded, totalBytes: downloadTotal))
                     while true {
                         try? Task.checkCancellation()
                         guard !Task.isCancelled else { return CancellationError() }
@@ -256,26 +345,26 @@ public struct TorrentDownloader: Sendable {
                         // back optimistically to all pieces; this self-corrects as
                         // soon as the peer announces anything.
                         let (livePieces, isKnown) = await session.client.currentAvailability()
-                        let usablePieces = isKnown ? livePieces : Set(metainfo.pieceHashes.indices)
+                        let usablePieces = isKnown ? livePieces : selectablePieces
                         guard let pieceIndex = await coordinator.nextPiece(availablePieces: usablePieces) else {
                             return nil
                         }
 
                         do {
-                            let length = pieceLength(for: pieceIndex, metainfo: metainfo)
-                            await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: await coordinator.downloadedBytes, totalBytes: metainfo.totalSize))
+                            let length = layout.length(ofPiece: pieceIndex)
+                            await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: await coordinator.downloadedBytes, totalBytes: downloadTotal))
                             let piece = try await withTimeout(seconds: .seconds(60)) {
                                 try await session.client.downloadPiece(index: pieceIndex, length: length, expectedHash: metainfo.pieceHashes[pieceIndex])
                             }
                             try await writer.write(piece: piece, pieceIndex: pieceIndex)
-                            let downloaded = await coordinator.complete(pieceIndex: pieceIndex)
-                            await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
+                            let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
+                            await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: downloaded, totalBytes: downloadTotal, files: fileSnapshot(perFileBytes)))
                         } catch is CancellationError {
                             await coordinator.returnPiece(pieceIndex)
                             return CancellationError()
                         } catch {
                             await coordinator.returnPiece(pieceIndex)
-                            await progress(TorrentDownloadProgress(status: "Peer \(session.endpoint.host):\(session.endpoint.port) failed piece \(pieceIndex + 1).", downloadedBytes: await coordinator.downloadedBytes, totalBytes: metainfo.totalSize))
+                            await progress(TorrentDownloadProgress(status: "Peer \(session.endpoint.host):\(session.endpoint.port) failed piece \(pieceIndex + 1).", downloadedBytes: await coordinator.downloadedBytes, totalBytes: downloadTotal))
                             return error
                         }
                     }
@@ -312,6 +401,7 @@ public struct TorrentDownloader: Sendable {
         metainfo: TorrentMetainfo,
         peerID: Data,
         initialDownloaded: Int64,
+        totalBytes: Int64,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws -> [PeerDownloadSession] {
         var sessions: [PeerDownloadSession] = []
@@ -323,7 +413,7 @@ public struct TorrentDownloader: Sendable {
                     let client = PeerWireClient(endpoint: peer, infoHash: metainfo.infoHash, peerID: peerID)
                     do {
                         try Task.checkCancellation()
-                        await progress(TorrentDownloadProgress(status: "Connecting to peer \(peer.host):\(peer.port)", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+                        await progress(TorrentDownloadProgress(status: "Connecting to peer \(peer.host):\(peer.port)", downloadedBytes: initialDownloaded, totalBytes: totalBytes))
                         try await withTimeout(seconds: .seconds(20)) {
                             try await client.connect()
                         }
@@ -445,17 +535,9 @@ public struct TorrentDownloader: Sendable {
         return Array(peers).shuffled()
     }
 
-    private func pieceLength(for index: Int, metainfo: TorrentMetainfo) -> Int {
-        if index == metainfo.pieceHashes.count - 1 {
-            let consumed = Int64(index * metainfo.pieceLength)
-            return Int(metainfo.totalSize - consumed)
-        }
-        return metainfo.pieceLength
-    }
-
-    private func bytesCompleted(for pieces: Set<Int>, metainfo: TorrentMetainfo) -> Int64 {
+    private func bytesCompleted(for pieces: Set<Int>, layout: TorrentLayout) -> Int64 {
         pieces.reduce(Int64(0)) { total, pieceIndex in
-            total + Int64(pieceLength(for: pieceIndex, metainfo: metainfo))
+            total + Int64(layout.length(ofPiece: pieceIndex))
         }
     }
 
@@ -519,19 +601,21 @@ private actor TorrentPieceWriter {
 }
 
 private actor PieceDownloadCoordinator {
-    private let pieceLengths: [Int]
+    private let layout: TorrentLayout
     private let availabilityCounts: [Int: Int]
     private var pendingPieces: Set<Int>
     private var activePieces = Set<Int>()
     private var completedPieces: Set<Int>
     private var completedBytes: Int64
+    private var perFileBytes: [Int64]
 
-    init(pieceLengths: [Int], completedPieces: Set<Int>, initialDownloaded: Int64, availabilityCounts: [Int: Int]) {
-        self.pieceLengths = pieceLengths
+    init(layout: TorrentLayout, selectablePieces: Set<Int>, completedPieces: Set<Int>, initialDownloaded: Int64, availabilityCounts: [Int: Int]) {
+        self.layout = layout
         self.completedPieces = completedPieces
         self.completedBytes = initialDownloaded
         self.availabilityCounts = availabilityCounts
-        self.pendingPieces = Set(pieceLengths.indices).subtracting(completedPieces)
+        self.pendingPieces = selectablePieces.subtracting(completedPieces)
+        self.perFileBytes = layout.completedBytesPerFile(completedPieces: completedPieces)
     }
 
     var downloadedBytes: Int64 {
@@ -557,13 +641,18 @@ private actor PieceDownloadCoordinator {
         return piece
     }
 
-    func complete(pieceIndex: Int) -> Int64 {
+    func complete(pieceIndex: Int) -> (downloadedBytes: Int64, perFileBytes: [Int64]) {
         guard activePieces.remove(pieceIndex) != nil, !completedPieces.contains(pieceIndex) else {
-            return completedBytes
+            return (completedBytes, perFileBytes)
         }
         completedPieces.insert(pieceIndex)
-        completedBytes += Int64(pieceLengths[pieceIndex])
-        return completedBytes
+        completedBytes += Int64(layout.length(ofPiece: pieceIndex))
+        // Fold just this piece's slices into the running per-file tally instead
+        // of recomputing the whole table each completion.
+        for (id, bytes) in layout.completedBytesPerFile(completedPieces: [pieceIndex]).enumerated() where bytes > 0 {
+            perFileBytes[id] += bytes
+        }
+        return (completedBytes, perFileBytes)
     }
 
     func returnPiece(_ pieceIndex: Int) {
@@ -628,9 +717,22 @@ struct TorrentFileWriter: Sendable {
     }
 
     func finalize() throws {
+        try finalize(selectedFileIDs: Set(metainfo.files.map(\.id)))
+    }
+
+    /// Promotes the selected files' `.tor` partials to their final names. A
+    /// deselected file may still hold a small `.tor` partial of bytes from a
+    /// boundary piece it shares with a selected neighbor; those are removed so
+    /// the destination ends up with exactly the selected files.
+    func finalize(selectedFileIDs: Set<Int>) throws {
         for file in metainfo.files {
             let partialURL = try outputURL(for: file, partial: true)
             guard FileManager.default.fileExists(atPath: partialURL.path) else {
+                continue
+            }
+
+            guard selectedFileIDs.contains(file.id) else {
+                try? FileManager.default.removeItem(at: partialURL)
                 continue
             }
 

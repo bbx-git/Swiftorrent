@@ -13,6 +13,7 @@ public final class TorrentSession {
     private let magnetResolver = MagnetMetadataResolver()
     private let downloader = TorrentDownloader()
     private var tasks: [TorrentItem.ID: Task<Void, Never>] = [:]
+    private var metainfos: [TorrentItem.ID: TorrentMetainfo] = [:]
 
     public init(destination: URL = DefaultDownloadDirectory.url()) {
         self.destination = destination
@@ -31,13 +32,15 @@ public final class TorrentSession {
                 let data = try Data(contentsOf: url)
                 try Task.checkCancellation()
                 let metainfo = try metainfoParser.parse(data: data)
+                metainfos[item.id] = metainfo
                 update(item.id) {
                     $0.name = metainfo.name
                     $0.totalBytes = metainfo.totalSize
                     $0.outputRelativePaths = metainfo.files.map(\.path)
+                    $0.files = makeFileEntries(from: metainfo, existing: $0.files)
                     $0.status = "Starting download."
                 }
-                try await start(itemID: item.id, metainfo: metainfo)
+                try await runDownload(itemID: item.id, metainfo: metainfo)
             } catch is CancellationError {
                 return
             } catch {
@@ -68,13 +71,15 @@ public final class TorrentSession {
                         $0.state = .downloading
                     }
                 }
+                metainfos[item.id] = metainfo
                 update(item.id) {
                     $0.name = metainfo.name
                     $0.totalBytes = metainfo.totalSize
                     $0.outputRelativePaths = metainfo.files.map(\.path)
+                    $0.files = makeFileEntries(from: metainfo, existing: $0.files)
                     $0.status = "Metadata resolved. Starting download."
                 }
-                try await start(itemID: item.id, metainfo: metainfo)
+                try await runDownload(itemID: item.id, metainfo: metainfo)
             } catch is CancellationError {
                 return
             } catch {
@@ -89,10 +94,43 @@ public final class TorrentSession {
     public func remove(_ item: TorrentItem, deleteFiles: Bool = false) {
         tasks[item.id]?.cancel()
         tasks[item.id] = nil
+        metainfos[item.id] = nil
         if deleteFiles {
             removeFiles(for: item)
         }
         items.removeAll { $0.id == item.id }
+    }
+
+    /// Toggles whether a file inside a multi-file torrent is downloaded. If the
+    /// torrent is already running, its download is restarted with the new
+    /// selection (on-disk pieces are re-verified, so progress is preserved).
+    public func setFileSelected(itemID: TorrentItem.ID, fileID: Int, isSelected: Bool) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              let fileIndex = items[index].files.firstIndex(where: { $0.id == fileID }) else {
+            return
+        }
+        guard items[index].files[fileIndex].isSelected != isSelected else { return }
+        items[index].files[fileIndex].isSelected = isSelected
+        guard let metainfo = metainfos[itemID] else { return }
+        // Only relaunch torrents that are actively working; failed/queued rows
+        // pick up the new selection when they next start.
+        guard items[index].state == .downloading || items[index].state == .complete else { return }
+        items[index].state = .downloading
+        items[index].status = "Applying file selection."
+        tasks[itemID]?.cancel()
+        tasks[itemID] = Task {
+            defer { tasks[itemID] = nil }
+            do {
+                try await runDownload(itemID: itemID, metainfo: metainfo)
+            } catch is CancellationError {
+                return
+            } catch {
+                update(itemID) {
+                    $0.status = error.localizedDescription
+                    $0.state = .failed
+                }
+            }
+        }
     }
 
     private func removeFiles(for item: TorrentItem) {
@@ -131,19 +169,44 @@ public final class TorrentSession {
         }
     }
 
-    private func start(itemID: TorrentItem.ID, metainfo: TorrentMetainfo) async throws {
-        try await downloader.download(metainfo: metainfo, destination: destination) { [weak self] progress in
+    private func runDownload(itemID: TorrentItem.ID, metainfo: TorrentMetainfo) async throws {
+        let selected = selectedFileIDs(for: itemID, metainfo: metainfo)
+        let itemDestination = items.first(where: { $0.id == itemID })?.destination ?? destination
+        try await downloader.download(metainfo: metainfo, destination: itemDestination, selectedFileIDs: selected) { [weak self] progress in
             await self?.update(itemID) { item in
                 item.status = progress.status
                 item.totalBytes = progress.totalBytes
                 item.downloadedBytes = progress.downloadedBytes
                 item.progress = progress.fractionCompleted
+                item.applyFileProgress(progress.files)
                 if progress.fractionCompleted >= 1 {
                     item.state = .complete
                 } else {
                     item.state = .downloading
                 }
             }
+        }
+    }
+
+    private func selectedFileIDs(for itemID: TorrentItem.ID, metainfo: TorrentMetainfo) -> Set<Int> {
+        guard let item = items.first(where: { $0.id == itemID }), !item.files.isEmpty else {
+            return Set(metainfo.files.map(\.id))
+        }
+        return Set(item.files.filter(\.isSelected).map(\.id))
+    }
+
+    private func makeFileEntries(from metainfo: TorrentMetainfo, existing: [TorrentItem.FileEntry]) -> [TorrentItem.FileEntry] {
+        // Preserve any selection the user already toggled before metadata
+        // finished resolving (magnet path populates files late).
+        let selectionByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0.isSelected) })
+        return metainfo.files.map { file in
+            TorrentItem.FileEntry(
+                id: file.id,
+                path: file.path,
+                totalBytes: file.length,
+                downloadedBytes: 0,
+                isSelected: selectionByID[file.id] ?? true
+            )
         }
     }
 
@@ -166,12 +229,42 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
         case failed
     }
 
+    public struct FileEntry: Identifiable, Equatable, Sendable {
+        public let id: Int
+        public let path: String
+        public let totalBytes: Int64
+        public var downloadedBytes: Int64
+        public var isSelected: Bool
+
+        public init(id: Int, path: String, totalBytes: Int64, downloadedBytes: Int64 = 0, isSelected: Bool = true) {
+            self.id = id
+            self.path = path
+            self.totalBytes = totalBytes
+            self.downloadedBytes = downloadedBytes
+            self.isSelected = isSelected
+        }
+
+        public var fraction: Double {
+            guard totalBytes > 0 else { return 0 }
+            return min(1, max(0, Double(downloadedBytes) / Double(totalBytes)))
+        }
+
+        public var name: String {
+            (path as NSString).lastPathComponent
+        }
+
+        public var totalDescription: String {
+            ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        }
+    }
+
     public let id: UUID
     public var name: String
     public var source: Source
     public var destination: URL
     public var totalBytes: Int64
     public var outputRelativePaths: [String]
+    public var files: [FileEntry]
     public var downloadedBytes: Int64
     public var progress: Double
     public var status: String
@@ -184,6 +277,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
         self.destination = destination
         self.totalBytes = totalBytes
         self.outputRelativePaths = []
+        self.files = []
         self.downloadedBytes = 0
         self.progress = 0
         self.status = "Queued"
@@ -203,6 +297,19 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
 
     public var totalDescription: String {
         totalBytes > 0 ? ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file) : "Unknown"
+    }
+
+    /// Folds a downloader per-file snapshot into the existing entries. An empty
+    /// snapshot means "unchanged" so frequent status-only ticks don't clobber
+    /// the table; user-driven `isSelected` is always preserved.
+    mutating func applyFileProgress(_ snapshot: [TorrentFileProgress]) {
+        guard !snapshot.isEmpty else { return }
+        let bytesByID = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0.downloadedBytes) })
+        for index in files.indices {
+            if let bytes = bytesByID[files[index].id] {
+                files[index].downloadedBytes = bytes
+            }
+        }
     }
 }
 

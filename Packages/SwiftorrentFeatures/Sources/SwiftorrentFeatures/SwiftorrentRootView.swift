@@ -168,9 +168,16 @@ public struct SwiftorrentRootView: View {
                     ScrollView {
                         LazyVStack(spacing: 14) {
                             ForEach(session.items) { item in
-                                TorrentRow(item: item, isSelected: selectedItemID == item.id) {
-                                    requestRemoval(for: item)
-                                }
+                                TorrentRow(
+                                    item: item,
+                                    isSelected: selectedItemID == item.id,
+                                    setFileSelected: { fileID, isSelected in
+                                        session.setFileSelected(itemID: item.id, fileID: fileID, isSelected: isSelected)
+                                    },
+                                    remove: {
+                                        requestRemoval(for: item)
+                                    }
+                                )
                                 .id(item.id)
                                 .contentShape(Rectangle())
                                 .onTapGesture {
@@ -238,48 +245,85 @@ public struct SwiftorrentRootView: View {
 private struct TorrentRow: View {
     let item: TorrentItem
     let isSelected: Bool
+    let setFileSelected: (Int, Bool) -> Void
     let remove: () -> Void
+    @State private var showFiles = false
+
+    private var hasFileList: Bool { item.files.count > 1 }
 
     var body: some View {
-        HStack(spacing: 16) {
-            Image(systemName: icon)
-                .font(.title2)
-                .foregroundStyle(color)
-                .frame(width: 34, height: 34)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 16) {
+                Image(systemName: icon)
+                    .font(.title2)
+                    .foregroundStyle(color)
+                    .frame(width: 34, height: 34)
 
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text(item.name)
-                        .font(.headline)
-                    Spacer()
-                    Text(item.state.rawValue.capitalized)
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .foregroundStyle(badgeForeground)
-                        .glassEffect(.regular.tint(badgeColor.opacity(0.55)), in: Capsule())
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text(item.name)
+                            .font(.headline)
+                        Spacer()
+                        Text(item.state.rawValue.capitalized)
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .foregroundStyle(badgeForeground)
+                            .glassEffect(.regular.tint(badgeColor.opacity(0.55)), in: Capsule())
+                    }
+
+                    ProgressView(value: item.progress)
+                        .progressViewStyle(.linear)
+
+                    HStack {
+                        Text(item.status)
+                        Spacer()
+                        Text("\(item.downloadedDescription) / \(item.totalDescription)")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    if hasFileList {
+                        Button {
+                            withAnimation(.snappy(duration: 0.18)) { showFiles.toggle() }
+                        } label: {
+                            Label("\(selectedCount) of \(item.files.count) files", systemImage: showFiles ? "chevron.down" : "chevron.right")
+                                .font(.caption.weight(.medium))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                ProgressView(value: item.progress)
-                    .progressViewStyle(.linear)
-
-                HStack {
-                    Text(item.status)
-                    Spacer()
-                    Text("\(item.downloadedDescription) / \(item.totalDescription)")
+                Button(role: .destructive, action: remove) {
+                    Image(systemName: "xmark")
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.12)).interactive()))
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button(role: .destructive, action: remove) {
-                Image(systemName: "xmark")
+            if hasFileList, showFiles {
+                fileList
             }
-            .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.12)).interactive()))
         }
         .padding(14)
         .glassEffect(.regular.tint(isSelected ? Color.swiftorrentGraphite.opacity(0.18) : Color.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var selectedCount: Int {
+        item.files.filter(\.isSelected).count
+    }
+
+    private var fileList: some View {
+        VStack(spacing: 6) {
+            ForEach(item.files) { file in
+                FileSelectionRow(file: file) { isSelected in
+                    setFileSelected(file.id, isSelected)
+                }
+            }
+        }
+        .padding(.leading, 50)
+        .padding(.trailing, 6)
     }
 
     private var icon: String {
@@ -313,6 +357,41 @@ private struct TorrentRow: View {
         switch item.state {
         case .queued: .primary
         case .downloading, .complete, .failed: .white
+        }
+    }
+}
+
+private struct FileSelectionRow: View {
+    let file: TorrentItem.FileEntry
+    let setSelected: (Bool) -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Toggle(isOn: Binding(get: { file.isSelected }, set: { setSelected($0) })) {
+                EmptyView()
+            }
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(file.name)
+                    .font(.caption)
+                    .foregroundStyle(file.isSelected ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                if file.isSelected {
+                    ProgressView(value: file.fraction)
+                        .progressViewStyle(.linear)
+                        .controlSize(.mini)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(file.isSelected ? "\(Int(file.fraction * 100))% · \(file.totalDescription)" : "Skipped")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
         }
     }
 }

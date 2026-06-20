@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** The `SecRandomCopyBytes` force-unwrap is now removed (DHT node id uses `SystemRandomNumberGenerator`). Next P2: file selection + per-file progress. Remaining hardening test: integration tests from `~/Documents/Xcode/aTemp`.
+- **Next Immediate Step:** File selection + per-file progress now ship (see Recent Fixes). All listed P2 items are done. Only remaining roadmap item: hardening integration tests from `~/Documents/Xcode/aTemp`.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -34,6 +34,7 @@
   - Changed app accent styling from blue to graphite black/grey.
   - Fixed all P0 (critical) roadmap items: untrusted-input crash/OOM/hang hardening across bencode, peer-wire, tracker, and DHT paths.
 - **Recent Fixes (Anti-Regression):**
+  - P2: file selection + per-file progress. New `TorrentLayout` (Core) centralizes piece/file geometry: `length(ofPiece:)`, `range(ofPiece:)`/`range(ofFile:)`, `pieceIndices(forFiles:)` (includes boundary pieces a selected file shares with a deselected neighbor), and `completedBytesPerFile(completedPieces:)` (binary-searched, clamped per file). `TorrentDownloader.download` gained `selectedFileIDs:`: it derives `selectablePieces` + a selection-aware `downloadTotal`, verifies/schedules only those pieces, and `TorrentFileWriter.finalize(selectedFileIDs:)` promotes only selected files while deleting deselected boundary `.tor` leftovers. Web-seed acceleration is skipped for partial selections (HTTP per-file ranges can't satisfy shared boundary pieces). `TorrentDownloadProgress` now carries `files: [TorrentFileProgress]` (empty = unchanged) and the `PieceDownloadCoordinator` folds each completed piece's slices into a running per-file tally. Domain: `TorrentItem.FileEntry` (id/path/bytes/selected), metainfo cached per item, `setFileSelected` toggles + restarts an active download (re-verifies from disk). UI: expandable per-file list with checkboxes + per-file progress; deselected files show "Skipped". Tests added: layout piece-selection, per-file byte distribution, selective finalize.
   - P2: removed the last fragile force-unwrap. `DHTClient.makeNodeID()` now builds 20 random bytes via `SystemRandomNumberGenerator` (CSPRNG-backed) instead of `SecRandomCopyBytes(..., $0.baseAddress!)`, dropping the unsafe-pointer force-unwrap and the discarded error code. No `import Security` needed. Added a test asserting two node ids are each 20 bytes and differ.
   - P2: per-wait peer-wire timeouts. `PeerWireClient` now takes `connectTimeout` (default 10s) and `ioTimeout` (default 30s) and wraps `connect`, `send`, and `receiveExactly` in a `withTimeout` helper that races each network wait against `Task.sleep` in a `withThrowingTaskGroup`. When the timer wins it throws `PeerWireError.timedOut` and the group cancels the operation task, whose `onCancel` cancels the `NWConnection` so the parked continuation resumes (no leak). Because every higher-level loop (`readMessage`, `drainUntilUnchoked`, `readPieceBlock`, metadata reads) funnels through `receiveExactly`, a peer that goes silent mid-message is now torn down within the window instead of parking a download slot forever. Added a loopback test (`AcceptedConnections` + silent `NWListener`) asserting `connect()` throws `.timedOut` inside the 0.5s window.
   - P2: PEX inbound (committed `6b23cac`). `TorrentDownloader` consumes BEP 11 peer lists only; never advertises this client as a source.
@@ -47,6 +48,7 @@
 - `.torrent` peer discovery uses HTTP/HTTPS trackers, UDP trackers, DHT, and inbound PEX; magnet metadata discovery uses trackers + DHT (no PEX yet on the magnet path).
 - Downloader uses a small concurrent peer pool with per-wait peer-wire timeouts, but still needs broader integration testing against external assets from `~/Documents/Xcode/aTemp`.
 - Disk deletion currently removes known torrent output paths and partial `.tor` files; unresolved queued rows fall back to a best-effort path based on the displayed item name.
+- File selection: toggling a file mid-download cancels and restarts that item's download (re-verifies on-disk pieces). Web-seed acceleration is disabled for partial selections. Deselected files that received shared-boundary bytes are cleaned up at finalize.
 - Manual app bundling is required because the current project is an SPM executable instead of a native Xcode app target.
 - The user-provided magnet was used only for parser/hash/tracker-shape verification, not media download. Future external test assets must use `~/Documents/Xcode/aTemp`.
 
@@ -58,7 +60,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 29 Swift Testing tests passed (latest add: DHT node id is 20 random non-constant bytes).
+- **Tests:** Success, `swift test -c release`, 32 Swift Testing tests passed (latest adds: layout piece-selection, per-file byte distribution, selective finalize).
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -74,4 +76,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- All P0/P1 done. P2 done: verified-piece caching, `makePeerID` force-unwrap, web-seed `Range`/resume, PEX (inbound-only), per-wait peer-wire timeouts, and the `SecRandomCopyBytes`/`DHTClient.makeNodeID` force-unwrap. Cancellation-teardown hardening test is now covered by the silent-peer timeout test. Next up: P2 — file selection + per-file progress; plus the last hardening test (integration tests from `~/Documents/Xcode/aTemp`).
+- All P0/P1/P2 roadmap items done: verified-piece caching, `makePeerID` force-unwrap, web-seed `Range`/resume, PEX (inbound-only), per-wait peer-wire timeouts, the `SecRandomCopyBytes`/`DHTClient.makeNodeID` force-unwrap, and now file selection + per-file progress (new `TorrentLayout`, selection-aware `download`/`finalize`, `TorrentFileProgress`, domain `FileEntry` + `setFileSelected`, expandable per-file UI). The only remaining roadmap item is the hardening integration tests from `~/Documents/Xcode/aTemp` (needs the user to confirm a sample asset/filename there).

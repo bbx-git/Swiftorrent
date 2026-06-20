@@ -505,6 +505,46 @@ struct CoreParsingTests {
         #expect(elapsed < .seconds(2))
     }
 
+    @Test("Layout maps selected files onto overlapping pieces, including shared boundaries")
+    func layoutSelectsBoundaryPieces() {
+        // a.txt = bytes 0..2 (piece 0), b.txt = bytes 2..6 (pieces 0 and 1).
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8), Data("ef".utf8)])
+        let layout = TorrentLayout(metainfo: metainfo)
+
+        #expect(layout.length(ofPiece: 0) == 4)
+        #expect(layout.length(ofPiece: 1) == 2)
+        #expect(layout.pieceIndices(forFiles: [0]) == [0])
+        #expect(layout.pieceIndices(forFiles: [1]) == [0, 1])
+        #expect(layout.pieceIndices(forFiles: [0, 1]) == [0, 1])
+    }
+
+    @Test("Layout attributes completed-piece bytes to each file")
+    func layoutDistributesBytesPerFile() {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8), Data("ef".utf8)])
+        let layout = TorrentLayout(metainfo: metainfo)
+
+        #expect(layout.completedBytesPerFile(completedPieces: [0]) == [2, 2])
+        #expect(layout.completedBytesPerFile(completedPieces: [1]) == [0, 2])
+        #expect(layout.completedBytesPerFile(completedPieces: [0, 1]) == [2, 4])
+    }
+
+    @Test("Selective finalize keeps chosen files and removes deselected boundary partials")
+    func finalizeSelectedFilesOnly() throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8), Data("ef".utf8)])
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+
+        // Piece 0 spans both files, leaving a small b.txt boundary partial.
+        try writer.write(piece: Data("abcd".utf8), pieceIndex: 0)
+        try writer.finalize(selectedFileIDs: [0])
+
+        #expect(try Data(contentsOf: destination.appendingPathComponent("Root/a.txt")) == Data("ab".utf8))
+        #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/b.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/b.txt.tor").path))
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",
