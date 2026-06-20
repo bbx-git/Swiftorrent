@@ -4,13 +4,14 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Features
 
-- Modern SwiftUI macOS 26 interface with Liquid Glass controls, a sidebar, torrent list, progress rows, and folder picker.
+- Modern SwiftUI macOS 26 interface with blue-tinted Liquid Glass controls, a sidebar, torrent list, progress rows, and folder picker.
 - Default download folder uses `FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)`, so it respects the user's localized system Downloads directory.
 - Opens `.torrent` files from the UI and from app/document open URLs.
 - Accepts `magnet:` URLs from the UI and from app URL opening.
 - Parses bencoded torrent metainfo, computes SHA-1 info hashes from the raw `info` dictionary, reads single-file and multi-file torrents, and extracts tracker tiers.
 - Talks to HTTP and HTTPS trackers with compact peer responses.
-- Resolves magnet metadata through BEP 10 extension negotiation and BEP 9 `ut_metadata` requests when HTTP/HTTPS trackers return peers.
+- Talks to UDP trackers with compact IPv4 peer responses.
+- Resolves magnet metadata through BEP 10 extension negotiation and BEP 9 `ut_metadata` requests when HTTP/HTTPS or UDP trackers return peers.
 - Implements a first-pass peer-wire downloader for `.torrent` metadata: handshake, interested, unchoke handling, block requests, piece receipt, SHA-1 piece verification, and file writing.
 - Performs a free-space check before writing torrent data.
 - Uses Swift Testing for core parser coverage.
@@ -49,11 +50,11 @@ Package the drag-and-drop app bundle:
 Scripts/package_app.sh
 ```
 
-The packaged app is written to `.build/output/Release/Swiftorrent.app`. Copy that bundle to `/Applications` or `~/Applications` to install it.
+The packaged app is written to `.build/output/Release/Swiftorrent.app` and copied to `~/Applications/Swiftorrent.app`.
 
 ## Usage
 
-1. Launch `Swiftorrent.app` from `/Applications`, `~/Applications`, or `.build/output/Release`.
+1. Launch `Swiftorrent.app` from `~/Applications` or `.build/output/Release`.
 2. Use **Open .torrent** to choose a torrent file, or paste a magnet link into the Magnet field.
 3. The default destination is the user's localized Downloads folder.
 4. Use **Choose Folder** to select a different destination before adding a torrent.
@@ -92,14 +93,18 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 ## Protocol Notes
 
 - Upload avoidance is enforced by policy: no listener socket, tracker `port=0`, tracker `uploaded=0`, no piece upload message handling, no seeding loop, and a best-effort stopped announce after completion.
+- UDP tracker support uses BEP 15 connect/announce requests and compact IPv4 peers.
 - Magnet metadata resolution uses the extension-protocol reserved bit, extended handshake message ID `20`, and `ut_metadata` request/data messages.
 - Transmission was used only as protocol/architecture reference. No Transmission source code was copied or translated.
 
 ## Roadmap
 
-- Add peer retry/rotation, multiple peer connections, and piece availability tracking.
-- Add UDP tracker support.
+- Add multiple peer connections and piece availability tracking.
 - Add DHT and PEX so magnets do not depend on HTTP/HTTPS trackers.
+- Add cancellation that stops active peer and tracker work when a row is removed.
+- Add peer-wire read/connect timeouts for every long-running network wait.
+- Add path sanitization for torrent file names and multi-file path components.
 - Add resume data and existing-piece verification.
 - Add file selection and per-file progress.
+- Add tracker URL encoding, compact peer parsing, path sanitization, piece length, and multi-file writer tests.
 - Add integration tests using assets only from `~/Documents/Xcode/aTemp`.

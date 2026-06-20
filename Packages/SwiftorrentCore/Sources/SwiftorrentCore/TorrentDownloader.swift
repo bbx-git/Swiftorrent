@@ -19,6 +19,7 @@ public struct TorrentDownloadProgress: Sendable {
 
 public struct TorrentDownloader: Sendable {
     private let trackerClient: TrackerClient
+    private let maxPeerAttempts = 24
 
     public init(trackerClient: TrackerClient = TrackerClient()) {
         self.trackerClient = trackerClient
@@ -35,28 +36,61 @@ public struct TorrentDownloader: Sendable {
         let peerID = Self.makePeerID()
         await progress(TorrentDownloadProgress(status: "Contacting trackers", downloadedBytes: 0, totalBytes: metainfo.totalSize))
         let peers = try await collectPeers(for: metainfo, peerID: peerID, event: "started")
-        guard let firstPeer = peers.first else {
+        guard !peers.isEmpty else {
             throw TrackerClientError.invalidResponse
         }
 
+        var lastError: Error?
+        for peer in peers.shuffled().prefix(maxPeerAttempts) {
+            do {
+                let downloaded = try await downloadAllPieces(
+                    metainfo: metainfo,
+                    destination: destination,
+                    peer: peer,
+                    peerID: peerID,
+                    progress: progress
+                )
+                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
+                await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+                return
+            } catch {
+                lastError = error
+                await progress(TorrentDownloadProgress(status: "Peer \(peer.host):\(peer.port) failed. Trying another peer.", downloadedBytes: 0, totalBytes: metainfo.totalSize))
+            }
+        }
+
+        throw lastError ?? TrackerClientError.invalidResponse
+    }
+
+    private func downloadAllPieces(
+        metainfo: TorrentMetainfo,
+        destination: URL,
+        peer: PeerEndpoint,
+        peerID: Data,
+        progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
+    ) async throws -> Int64 {
         let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
-        let client = PeerWireClient(endpoint: firstPeer, infoHash: metainfo.infoHash, peerID: peerID)
+        let client = PeerWireClient(endpoint: peer, infoHash: metainfo.infoHash, peerID: peerID)
         defer { Task { await client.close() } }
 
-        try await client.connect()
-        var downloaded: Int64 = 0
+        await progress(TorrentDownloadProgress(status: "Connecting to peer \(peer.host):\(peer.port)", downloadedBytes: 0, totalBytes: metainfo.totalSize))
+        try await withTimeout(seconds: .seconds(20)) {
+            try await client.connect()
+        }
 
+        var downloaded: Int64 = 0
         for pieceIndex in metainfo.pieceHashes.indices {
             let pieceLength = pieceLength(for: pieceIndex, metainfo: metainfo)
             await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
-            let piece = try await client.downloadPiece(index: pieceIndex, length: pieceLength, expectedHash: metainfo.pieceHashes[pieceIndex])
+            let piece = try await withTimeout(seconds: .seconds(60)) {
+                try await client.downloadPiece(index: pieceIndex, length: pieceLength, expectedHash: metainfo.pieceHashes[pieceIndex])
+            }
             try writer.write(piece: piece, pieceIndex: pieceIndex)
             downloaded += Int64(piece.count)
             await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
         }
 
-        _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
-        await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+        return downloaded
     }
 
     private func collectPeers(
@@ -88,7 +122,7 @@ public struct TorrentDownloader: Sendable {
         if peers.isEmpty, let lastError {
             throw lastError
         }
-        return Array(peers)
+        return Array(peers).shuffled()
     }
 
     private func pieceLength(for index: Int, metainfo: TorrentMetainfo) -> Int {

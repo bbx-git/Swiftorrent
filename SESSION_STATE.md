@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Add UDP tracker support so magnets with mostly UDP trackers can resolve peers more reliably.
+- **Next Immediate Step:** Add cancellation that stops active peer and tracker work when a row is removed.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -19,20 +19,21 @@
   - Added modern SwiftUI macOS UI for opening `.torrent`, pasting magnet links, choosing a destination, and showing progress.
   - Added `.torrent` metainfo parsing with raw `info` SHA-1 hashing.
   - Added magnet parser for SHA-1 BTIH hex/Base32 links.
-  - Added HTTP/HTTPS tracker announce support with `uploaded=0`, compact peer parsing, and no listener port.
+  - Added HTTP/HTTPS and UDP tracker announce support with `uploaded=0`, compact peer parsing, and no listener port.
   - Added first-pass peer-wire download path for `.torrent` files.
-  - Added BEP 10/BEP 9 magnet metadata resolution for peers discovered through HTTP/HTTPS trackers.
+  - Added BEP 10/BEP 9 magnet metadata resolution for peers discovered through HTTP/HTTPS or UDP trackers.
   - Added manual `.app` bundling metadata for `.torrent` and `magnet:` open support.
 - **In Progress:**
-  - UDP tracker support is not implemented yet, so UDP-only magnets cannot resolve peers.
+  - Cancellation and resume support are not implemented yet.
 - **Recent Fixes (Anti-Regression):**
-  - Added magnet metadata resolver and connected magnet rows to the normal download path after metadata is fetched.
-  - Added bencode encoder and prefix parser for extension protocol messages.
-  - Fixed Xcode nested local-package module resolution by making the root manifest an umbrella target graph.
+  - Added UDP tracker connect/announce support through Network UDP connections.
+  - Added peer retry/rotation and per-peer connect/piece timeouts for downloads.
+  - Fixed install guidance to copy packaged builds to `~/Applications`, not `/Applications`.
 
 ## Known Issues / Technical Debt
-- Magnet resolution currently depends on HTTP/HTTPS trackers returning peers; UDP trackers, DHT, and PEX are still missing.
-- Downloader uses a minimal single-peer path and needs robust peer rotation, retries, piece availability tracking, resume data, UDP tracker support, and existing-piece verification.
+- Magnet resolution can use HTTP/HTTPS and UDP tracker peers, but DHT and PEX are still missing.
+- Downloader retries peers with basic timeouts, but still needs multiple concurrent peers, piece availability tracking, resume data, cancellation, and existing-piece verification.
+- Torrent file paths still need sanitization before writing.
 - Manual app bundling is required because the current project is an SPM executable instead of a native Xcode app target.
 - The user-provided magnet was used only for parser/hash/tracker-shape verification, not media download. Future external test assets must use `~/Documents/Xcode/aTemp`.
 
@@ -43,9 +44,9 @@
 - **Transmission reference:** Transmission was consulted for protocol concepts only; no code was copied or translated.
 
 ## Build & Run Status
-- **Last Build:** Success, clean Release mode after deleting stale local DerivedData/output app artifacts, via `xcodebuild -scheme Swiftorrent -destination 'platform=macOS,arch=arm64' -configuration Release -derivedDataPath .build/DerivedData SYMROOT=.build/output DSTROOT=.build/install`
+- **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
 - **Tests:** Success, `swift test -c release`, 4 Swift Testing tests passed.
-- **Deployment:** Fresh `Swiftorrent.app` created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched, quit, and copied to `~/Applications/Swiftorrent.app`.
+- **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
 ## Recently Changed Files
@@ -60,4 +61,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- Start with UDP tracker support in `TrackerClient`, then add peer retry/rotation so both magnet metadata and piece downloads avoid depending on a single peer.
+- Start with cancellation support in `TorrentSession`, then add path sanitization tests and resume/existing-piece verification.

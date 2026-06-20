@@ -16,7 +16,7 @@ public enum MagnetMetadataResolverError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .noSupportedTrackers: "No HTTP or HTTPS trackers are available for this magnet link yet."
+        case .noSupportedTrackers: "No supported trackers are available for this magnet link yet."
         case .noPeers: "Trackers did not return any usable peers."
         case .metadataHashMismatch: "Downloaded magnet metadata did not match the magnet info hash."
         }
@@ -38,12 +38,12 @@ public struct MagnetMetadataResolver: Sendable {
     ) async throws -> TorrentMetainfo {
         let trackers = magnet.trackers.filter { url in
             guard let scheme = url.scheme?.lowercased() else { return false }
-            return scheme == "http" || scheme == "https"
+            return scheme == "http" || scheme == "https" || scheme == "udp"
         }
         guard !trackers.isEmpty else { throw MagnetMetadataResolverError.noSupportedTrackers }
 
         let peerID = TorrentDownloader.makePeerID()
-        await progress(MagnetMetadataProgress(status: "Contacting \(trackers.count) HTTP trackers for magnet peers"))
+        await progress(MagnetMetadataProgress(status: "Contacting \(trackers.count) trackers for magnet peers"))
         let peers = try await collectPeers(trackers: trackers, magnet: magnet, peerID: peerID)
         guard !peers.isEmpty else { throw MagnetMetadataResolverError.noPeers }
 

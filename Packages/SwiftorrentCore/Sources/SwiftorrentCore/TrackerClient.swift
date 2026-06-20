@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 public struct PeerEndpoint: Hashable, Sendable {
     public let host: String
@@ -31,11 +32,15 @@ public struct TrackerRequest: Sendable {
 public enum TrackerClientError: Error, LocalizedError {
     case unsupportedScheme(String)
     case invalidResponse
+    case invalidTrackerURL
+    case transactionMismatch
 
     public var errorDescription: String? {
         switch self {
-        case let .unsupportedScheme(scheme): "Only HTTP and HTTPS trackers are supported in this first build, not \(scheme)."
+        case let .unsupportedScheme(scheme): "Unsupported tracker scheme: \(scheme)."
         case .invalidResponse: "Tracker returned an invalid response."
+        case .invalidTrackerURL: "Tracker URL is invalid."
+        case .transactionMismatch: "Tracker returned a response for a different transaction."
         }
     }
 }
@@ -48,8 +53,16 @@ public struct TrackerClient: Sendable {
     }
 
     public func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
-        guard let scheme = request.announceURL.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+        guard let scheme = request.announceURL.scheme?.lowercased() else {
             throw TrackerClientError.unsupportedScheme(request.announceURL.scheme ?? "unknown")
+        }
+
+        if scheme == "udp" {
+            return try await announceUDP(request)
+        }
+
+        guard scheme == "http" || scheme == "https" else {
+            throw TrackerClientError.unsupportedScheme(scheme)
         }
 
         let url = makeAnnounceURL(request)
@@ -84,6 +97,131 @@ public struct TrackerClient: Sendable {
         return URL(string: absolute)!
     }
 
+    private func announceUDP(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
+        guard let host = request.announceURL.host,
+              let portValue = request.announceURL.port,
+              portValue > 0,
+              portValue <= Int(UInt16.max),
+              let port = NWEndpoint.Port(rawValue: UInt16(portValue)) else {
+            throw TrackerClientError.invalidTrackerURL
+        }
+
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: .udp)
+        defer { connection.cancel() }
+        try await waitUntilReady(connection)
+
+        let connectionID = try await udpConnect(connection)
+        return try await udpAnnounce(connection, connectionID: connectionID, request: request)
+    }
+
+    private func waitUntilReady(_ connection: NWConnection) async throws {
+        try await withTimeout(seconds: .seconds(10)) {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        connection.stateUpdateHandler = nil
+                        continuation.resume()
+                    case let .failed(error):
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: error)
+                    case .cancelled:
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: CancellationError())
+                    default:
+                        break
+                    }
+                }
+                connection.start(queue: .global(qos: .utility))
+            }
+        }
+    }
+
+    private func udpConnect(_ connection: NWConnection) async throws -> Int64 {
+        let transactionID = UInt32.random(in: UInt32.min...UInt32.max)
+        var payload = Data()
+        payload.appendUInt64(0x0000_0417_2710_1980)
+        payload.appendUInt32(0)
+        payload.appendUInt32(transactionID)
+
+        try await sendUDP(payload, on: connection)
+        let response = try await receiveUDP(on: connection)
+        guard response.count >= 16, response.readUInt32(at: 0) == 0 else {
+            throw TrackerClientError.invalidResponse
+        }
+        guard response.readUInt32(at: 4) == transactionID else {
+            throw TrackerClientError.transactionMismatch
+        }
+        return Int64(bitPattern: response.readUInt64(at: 8))
+    }
+
+    private func udpAnnounce(_ connection: NWConnection, connectionID: Int64, request: TrackerRequest) async throws -> [PeerEndpoint] {
+        let transactionID = UInt32.random(in: UInt32.min...UInt32.max)
+        var payload = Data()
+        payload.appendInt64(connectionID)
+        payload.appendUInt32(1)
+        payload.appendUInt32(transactionID)
+        payload.append(request.infoHash)
+        payload.append(request.peerID)
+        payload.appendInt64(request.downloaded)
+        payload.appendInt64(max(0, request.left))
+        payload.appendInt64(0)
+        payload.appendUInt32(udpEventCode(request.event))
+        payload.appendUInt32(0)
+        payload.appendUInt32(UInt32.random(in: UInt32.min...UInt32.max))
+        payload.appendInt32(48)
+        payload.appendUInt16(0)
+
+        try await sendUDP(payload, on: connection)
+        let response = try await receiveUDP(on: connection)
+        guard response.count >= 20, response.readUInt32(at: 0) == 1 else {
+            throw TrackerClientError.invalidResponse
+        }
+        guard response.readUInt32(at: 4) == transactionID else {
+            throw TrackerClientError.transactionMismatch
+        }
+        return parseCompactPeers(Data(response.dropFirst(20)))
+    }
+
+    private func udpEventCode(_ event: String?) -> UInt32 {
+        switch event {
+        case "completed": 1
+        case "started": 2
+        case "stopped": 3
+        default: 0
+        }
+    }
+
+    private func sendUDP(_ data: Data, on connection: NWConnection) async throws {
+        try await withTimeout(seconds: .seconds(10)) {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.send(content: data, completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                })
+            }
+        }
+    }
+
+    private func receiveUDP(on connection: NWConnection) async throws -> Data {
+        try await withTimeout(seconds: .seconds(15)) {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                connection.receiveMessage { data, _, _, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else if let data, !data.isEmpty {
+                        continuation.resume(returning: data)
+                    } else {
+                        continuation.resume(throwing: TrackerClientError.invalidResponse)
+                    }
+                }
+            }
+        }
+    }
+
     private func parsePeers(from data: Data) throws -> [PeerEndpoint] {
         let root = try BencodeParser(data: data).parse()
         guard case let .dictionary(dictionary) = root.value else {
@@ -101,6 +239,7 @@ public struct TrackerClient: Sendable {
                       let portValue = peer["port"]?.value.intValue else {
                     return nil
                 }
+                guard portValue > 0, portValue <= Int64(UInt16.max) else { return nil }
                 return PeerEndpoint(host: host, port: UInt16(portValue))
             }
         }
@@ -124,5 +263,42 @@ public struct TrackerClient: Sendable {
             }
             return String(format: "%%%02X", byte)
         }.joined()
+    }
+}
+
+extension Data {
+    mutating func appendUInt64(_ value: UInt64) {
+        append(UInt8((value >> 56) & 0xFF))
+        append(UInt8((value >> 48) & 0xFF))
+        append(UInt8((value >> 40) & 0xFF))
+        append(UInt8((value >> 32) & 0xFF))
+        append(UInt8((value >> 24) & 0xFF))
+        append(UInt8((value >> 16) & 0xFF))
+        append(UInt8((value >> 8) & 0xFF))
+        append(UInt8(value & 0xFF))
+    }
+
+    mutating func appendInt64(_ value: Int64) {
+        appendUInt64(UInt64(bitPattern: value))
+    }
+
+    mutating func appendInt32(_ value: Int32) {
+        appendUInt32(UInt32(bitPattern: value))
+    }
+
+    mutating func appendUInt16(_ value: UInt16) {
+        append(UInt8((value >> 8) & 0xFF))
+        append(UInt8(value & 0xFF))
+    }
+
+    func readUInt64(at offset: Int) -> UInt64 {
+        UInt64(self[offset]) << 56 |
+            UInt64(self[offset + 1]) << 48 |
+            UInt64(self[offset + 2]) << 40 |
+            UInt64(self[offset + 3]) << 32 |
+            UInt64(self[offset + 4]) << 24 |
+            UInt64(self[offset + 5]) << 16 |
+            UInt64(self[offset + 6]) << 8 |
+            UInt64(self[offset + 7])
     }
 }
