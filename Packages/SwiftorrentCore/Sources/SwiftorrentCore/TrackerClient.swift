@@ -82,8 +82,8 @@ public struct TrackerClient: Sendable {
         var absolute = request.announceURL.absoluteString
         absolute += absolute.contains("?") ? "&" : "?"
         absolute += [
-            "info_hash=\(percentEncode(request.infoHash))",
-            "peer_id=\(percentEncode(request.peerID))",
+            "info_hash=\(Self.percentEncode(request.infoHash))",
+            "peer_id=\(Self.percentEncode(request.peerID))",
             "port=0",
             "uploaded=0",
             "downloaded=\(request.downloaded)",
@@ -184,7 +184,7 @@ public struct TrackerClient: Sendable {
         guard response.readUInt32(at: 4) == transactionID else {
             throw TrackerClientError.transactionMismatch
         }
-        return parseCompactPeers(Data(response.dropFirst(20)))
+        return Self.parseCompactPeers(Data(response.dropFirst(20)))
     }
 
     private func udpEventCode(_ event: String?) -> UInt32 {
@@ -235,7 +235,7 @@ public struct TrackerClient: Sendable {
         }
 
         if case let .bytes(compact)? = dictionary["peers"]?.value {
-            return parseCompactPeers(compact)
+            return Self.parseCompactPeers(compact)
         }
 
         if case let .list(peerNodes)? = dictionary["peers"]?.value {
@@ -253,7 +253,7 @@ public struct TrackerClient: Sendable {
         throw TrackerClientError.invalidResponse
     }
 
-    private func parseCompactPeers(_ data: Data) -> [PeerEndpoint] {
+    static func parseCompactPeers(_ data: Data) -> [PeerEndpoint] {
         stride(from: 0, to: data.count - (data.count % 6), by: 6).map { offset in
             let host = "\(data[offset]).\(data[offset + 1]).\(data[offset + 2]).\(data[offset + 3])"
             let port = UInt16(data[offset + 4]) << 8 | UInt16(data[offset + 5])
@@ -261,11 +261,12 @@ public struct TrackerClient: Sendable {
         }
     }
 
-    private func percentEncode(_ data: Data) -> String {
+    static func percentEncode(_ data: Data) -> String {
         data.map { byte in
-            let scalar = UnicodeScalar(byte)
-            if CharacterSet.alphanumerics.contains(scalar) {
-                return String(Character(scalar))
+            if (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte) ||
+                (UInt8(ascii: "A")...UInt8(ascii: "Z")).contains(byte) ||
+                (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(byte) {
+                return String(UnicodeScalar(byte))
             }
             return String(format: "%%%02X", byte)
         }.joined()

@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Add multiple peer connections and piece availability tracking.
+- **Next Immediate Step:** Add DHT and PEX so magnets do not depend on tracker peers.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -26,6 +26,8 @@
   - Added per-row task cancellation so removing a torrent stops active tracker/peer work.
   - Added torrent output path sanitization and parser tests for unsafe paths.
   - Added resume support by verifying existing destination pieces before downloading, skipping valid pieces, and overwriting missing/corrupt pieces.
+  - Added bounded concurrent peer downloads with bitfield/have availability tracking, rarest-first scheduling, and serialized piece writes.
+  - Added tests for tracker percent encoding, compact IPv4 peer parsing, and peer bitfield parsing.
 - **Recent Fixes (Anti-Regression):**
   - Removing a torrent row now cancels the item task and cooperative cancellation checks stop tracker, magnet, and peer loops.
   - Torrent metainfo parsing now sanitizes single-file names and multi-file path components before writing.
@@ -34,7 +36,7 @@
 
 ## Known Issues / Technical Debt
 - Magnet resolution can use HTTP/HTTPS and UDP tracker peers, but DHT and PEX are still missing.
-- Downloader retries peers with basic timeouts, but still needs multiple concurrent peers and piece availability tracking.
+- Downloader uses a small concurrent peer pool with basic timeouts, but still needs broader integration testing against external assets.
 - Manual app bundling is required because the current project is an SPM executable instead of a native Xcode app target.
 - The user-provided magnet was used only for parser/hash/tracker-shape verification, not media download. Future external test assets must use `~/Documents/Xcode/aTemp`.
 
@@ -46,7 +48,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 9 Swift Testing tests passed.
+- **Tests:** Success, `swift test -c release`, 12 Swift Testing tests passed.
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -62,4 +64,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- Start with multiple peer connections and piece availability tracking, then add tracker URL encoding and compact peer parsing tests.
+- Start with DHT/PEX design or add integration tests using assets only from `~/Documents/Xcode/aTemp`.

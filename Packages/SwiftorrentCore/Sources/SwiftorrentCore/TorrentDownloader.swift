@@ -21,6 +21,7 @@ public struct TorrentDownloadProgress: Sendable {
 public struct TorrentDownloader: Sendable {
     private let trackerClient: TrackerClient
     private let maxPeerAttempts = 24
+    private let maxPeerConnections = 4
 
     public init(trackerClient: TrackerClient = TrackerClient()) {
         self.trackerClient = trackerClient
@@ -52,79 +53,180 @@ public struct TorrentDownloader: Sendable {
                 throw TrackerClientError.invalidResponse
             }
 
-            var lastError: Error?
-            for peer in peers.shuffled().prefix(maxPeerAttempts) {
-                try Task.checkCancellation()
-                let verifiedPieces = try writer.verifiedPieces()
-                let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
-                if verifiedBytes >= metainfo.totalSize {
-                    _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped")
-                    await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
-                    return
-                }
-                do {
-                    let downloaded = try await downloadAllPieces(
-                        metainfo: metainfo,
-                        destination: destination,
-                        peer: peer,
-                        peerID: peerID,
-                        verifiedPieces: verifiedPieces,
-                        initialDownloaded: verifiedBytes,
-                        progress: progress
-                    )
-                    _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
-                    await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
-                    return
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    lastError = error
-                    let recoveredBytes = bytesCompleted(for: (try? writer.verifiedPieces()) ?? [], metainfo: metainfo)
-                    await progress(TorrentDownloadProgress(status: "Peer \(peer.host):\(peer.port) failed. Trying another peer.", downloadedBytes: recoveredBytes, totalBytes: metainfo.totalSize))
-                }
+            let verifiedPieces = try writer.verifiedPieces()
+            let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
+            if verifiedBytes >= metainfo.totalSize {
+                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped")
+                await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+                return
             }
 
-            throw lastError ?? TrackerClientError.invalidResponse
+            let downloaded = try await downloadPiecesConcurrently(
+                metainfo: metainfo,
+                destination: destination,
+                peers: Array(peers.shuffled().prefix(maxPeerAttempts)),
+                peerID: peerID,
+                verifiedPieces: verifiedPieces,
+                initialDownloaded: verifiedBytes,
+                progress: progress
+            )
+            _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
+            await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+            return
         }
     }
 
-    private func downloadAllPieces(
+    private func downloadPiecesConcurrently(
         metainfo: TorrentMetainfo,
         destination: URL,
-        peer: PeerEndpoint,
+        peers: [PeerEndpoint],
         peerID: Data,
         verifiedPieces: Set<Int>,
         initialDownloaded: Int64,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws -> Int64 {
-        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
-        let client = PeerWireClient(endpoint: peer, infoHash: metainfo.infoHash, peerID: peerID)
-        defer { Task { await client.close() } }
+        let sessions = try await connectPeerSessions(
+            peers: peers,
+            metainfo: metainfo,
+            peerID: peerID,
+            initialDownloaded: initialDownloaded,
+            progress: progress
+        )
+        defer {
+            for session in sessions {
+                Task { await session.client.close() }
+            }
+        }
 
-        await progress(TorrentDownloadProgress(status: "Connecting to peer \(peer.host):\(peer.port)", downloadedBytes: 0, totalBytes: metainfo.totalSize))
+        guard !sessions.isEmpty else { throw TrackerClientError.invalidResponse }
+
+        let writer = TorrentPieceWriter(writer: TorrentFileWriter(metainfo: metainfo, destination: destination))
+        let coordinator = PieceDownloadCoordinator(
+            pieceLengths: metainfo.pieceHashes.indices.map { pieceLength(for: $0, metainfo: metainfo) },
+            completedPieces: verifiedPieces,
+            initialDownloaded: initialDownloaded,
+            availabilityCounts: availabilityCounts(from: sessions)
+        )
+
+        var lastError: Error?
+        await withTaskGroup(of: Error?.self) { group in
+            for session in sessions {
+                group.addTask {
+                    await progress(TorrentDownloadProgress(status: "Connected to peer \(session.endpoint.host):\(session.endpoint.port)", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+                    while true {
+                        try? Task.checkCancellation()
+                        guard !Task.isCancelled else { return CancellationError() }
+                        guard let pieceIndex = await coordinator.nextPiece(availablePieces: session.availablePieces) else {
+                            return nil
+                        }
+
+                        do {
+                            let length = pieceLength(for: pieceIndex, metainfo: metainfo)
+                            await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: await coordinator.downloadedBytes, totalBytes: metainfo.totalSize))
+                            let piece = try await withTimeout(seconds: .seconds(60)) {
+                                try await session.client.downloadPiece(index: pieceIndex, length: length, expectedHash: metainfo.pieceHashes[pieceIndex])
+                            }
+                            try await writer.write(piece: piece, pieceIndex: pieceIndex)
+                            let downloaded = await coordinator.complete(pieceIndex: pieceIndex)
+                            await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
+                        } catch is CancellationError {
+                            await coordinator.returnPiece(pieceIndex)
+                            return CancellationError()
+                        } catch {
+                            await coordinator.returnPiece(pieceIndex)
+                            await progress(TorrentDownloadProgress(status: "Peer \(session.endpoint.host):\(session.endpoint.port) failed piece \(pieceIndex + 1).", downloadedBytes: await coordinator.downloadedBytes, totalBytes: metainfo.totalSize))
+                            return error
+                        }
+                    }
+                }
+            }
+
+            for await result in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                if let result {
+                    lastError = result
+                }
+            }
+        }
+
+        if await coordinator.isComplete {
+            return await coordinator.downloadedBytes
+        }
+        throw lastError ?? TrackerClientError.invalidResponse
+    }
+
+    private func connectPeerSessions(
+        peers: [PeerEndpoint],
+        metainfo: TorrentMetainfo,
+        peerID: Data,
+        initialDownloaded: Int64,
+        progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
+    ) async throws -> [PeerDownloadSession] {
+        var sessions: [PeerDownloadSession] = []
+        var lastError: Error?
+
+        await withTaskGroup(of: Result<PeerDownloadSession, Error>.self) { group in
+            for peer in peers {
+                group.addTask {
+                    let client = PeerWireClient(endpoint: peer, infoHash: metainfo.infoHash, peerID: peerID)
+                    do {
+                        try Task.checkCancellation()
+                        await progress(TorrentDownloadProgress(status: "Connecting to peer \(peer.host):\(peer.port)", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+                        try await withTimeout(seconds: .seconds(20)) {
+                            try await client.connect()
+                        }
+                        let available = try await withTimeout(seconds: .seconds(10)) {
+                            try await client.readInitialAvailability(pieceCount: metainfo.pieceHashes.count)
+                        }
+                        return .success(PeerDownloadSession(
+                            endpoint: peer,
+                            client: client,
+                            availablePieces: available.isEmpty ? Set(metainfo.pieceHashes.indices) : available
+                        ))
+                    } catch {
+                        await client.close()
+                        return .failure(error)
+                    }
+                }
+            }
+
+            for await result in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                switch result {
+                case let .success(session):
+                    if sessions.count < maxPeerConnections {
+                        sessions.append(session)
+                    } else {
+                        await session.client.close()
+                    }
+                    if sessions.count == maxPeerConnections {
+                        group.cancelAll()
+                    }
+                case let .failure(error):
+                    lastError = error
+                }
+            }
+        }
+
         try Task.checkCancellation()
-        try await withTimeout(seconds: .seconds(20)) {
-            try await client.connect()
+        if sessions.isEmpty, let lastError {
+            throw lastError
         }
+        return sessions
+    }
 
-        var downloaded = initialDownloaded
-        for pieceIndex in metainfo.pieceHashes.indices {
-            try Task.checkCancellation()
-            let pieceLength = pieceLength(for: pieceIndex, metainfo: metainfo)
-            if verifiedPieces.contains(pieceIndex) {
-                await progress(TorrentDownloadProgress(status: "Resuming. Skipping verified piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
-                continue
+    private func availabilityCounts(from sessions: [PeerDownloadSession]) -> [Int: Int] {
+        sessions.reduce(into: [Int: Int]()) { counts, session in
+            for piece in session.availablePieces {
+                counts[piece, default: 0] += 1
             }
-            await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
-            let piece = try await withTimeout(seconds: .seconds(60)) {
-                try await client.downloadPiece(index: pieceIndex, length: pieceLength, expectedHash: metainfo.pieceHashes[pieceIndex])
-            }
-            try writer.write(piece: piece, pieceIndex: pieceIndex)
-            downloaded += Int64(piece.count)
-            await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
         }
-
-        return downloaded
     }
 
     private func collectPeers(
@@ -184,6 +286,80 @@ public struct TorrentDownloader: Sendable {
     public static func makePeerID() -> Data {
         let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)
         return "-SW0001-\(suffix)0000".prefix(20).data(using: .ascii)!
+    }
+}
+
+private struct PeerDownloadSession: Sendable {
+    let endpoint: PeerEndpoint
+    let client: PeerWireClient
+    let availablePieces: Set<Int>
+}
+
+private actor TorrentPieceWriter {
+    private let writer: TorrentFileWriter
+
+    init(writer: TorrentFileWriter) {
+        self.writer = writer
+    }
+
+    func write(piece: Data, pieceIndex: Int) throws {
+        try writer.write(piece: piece, pieceIndex: pieceIndex)
+    }
+}
+
+private actor PieceDownloadCoordinator {
+    private let pieceLengths: [Int]
+    private let availabilityCounts: [Int: Int]
+    private var pendingPieces: Set<Int>
+    private var activePieces = Set<Int>()
+    private var completedPieces: Set<Int>
+    private var completedBytes: Int64
+
+    init(pieceLengths: [Int], completedPieces: Set<Int>, initialDownloaded: Int64, availabilityCounts: [Int: Int]) {
+        self.pieceLengths = pieceLengths
+        self.completedPieces = completedPieces
+        self.completedBytes = initialDownloaded
+        self.availabilityCounts = availabilityCounts
+        self.pendingPieces = Set(pieceLengths.indices).subtracting(completedPieces)
+    }
+
+    var downloadedBytes: Int64 {
+        completedBytes
+    }
+
+    var isComplete: Bool {
+        pendingPieces.isEmpty && activePieces.isEmpty
+    }
+
+    func nextPiece(availablePieces: Set<Int>) -> Int? {
+        let candidates = pendingPieces.intersection(availablePieces)
+        guard let piece = candidates.min(by: { left, right in
+            let leftCount = availabilityCounts[left, default: Int.max]
+            let rightCount = availabilityCounts[right, default: Int.max]
+            if leftCount == rightCount { return left < right }
+            return leftCount < rightCount
+        }) else {
+            return nil
+        }
+        pendingPieces.remove(piece)
+        activePieces.insert(piece)
+        return piece
+    }
+
+    func complete(pieceIndex: Int) -> Int64 {
+        guard activePieces.remove(pieceIndex) != nil, !completedPieces.contains(pieceIndex) else {
+            return completedBytes
+        }
+        completedPieces.insert(pieceIndex)
+        completedBytes += Int64(pieceLengths[pieceIndex])
+        return completedBytes
+    }
+
+    func returnPiece(_ pieceIndex: Int) {
+        guard activePieces.remove(pieceIndex) != nil, !completedPieces.contains(pieceIndex) else {
+            return
+        }
+        pendingPieces.insert(pieceIndex)
     }
 }
 

@@ -40,6 +40,8 @@ public actor PeerWireClient {
     private var peerSupportsExtensions = false
     private var peerMetadataExtensionID: UInt8?
     private var metadataSize: Int?
+    private var availablePieces = Set<Int>()
+    private var availabilityIsKnown = false
 
     public init(endpoint: PeerEndpoint, infoHash: Data, peerID: Data) {
         self.endpoint = endpoint
@@ -76,6 +78,15 @@ public actor PeerWireClient {
         }
         peerSupportsExtensions = (response[25] & 0x10) != 0
         try await sendMessage(id: 2, payload: Data())
+    }
+
+    public func readInitialAvailability(pieceCount: Int) async throws -> Set<Int> {
+        while !availabilityIsKnown && isChoked {
+            try Task.checkCancellation()
+            let message = try await readMessage()
+            handlePeerStateMessage(message, pieceCount: pieceCount)
+        }
+        return availablePieces
     }
 
     public func fetchMetadata(pieceSize: Int = 16 * 1024) async throws -> Data {
@@ -143,9 +154,7 @@ public actor PeerWireClient {
         while isChoked {
             try Task.checkCancellation()
             let message = try await readMessage()
-            if message.id == 1 {
-                isChoked = false
-            }
+            handlePeerStateMessage(message)
         }
     }
 
@@ -159,6 +168,8 @@ public actor PeerWireClient {
                 throw PeerWireError.choked
             case 1:
                 isChoked = false
+            case 4, 5:
+                handlePeerStateMessage(message)
             case 7:
                 guard message.payload.count >= 8 else { throw PeerWireError.unexpectedMessage }
                 let pieceIndex = Int(message.payload.readUInt32(at: 0))
@@ -171,6 +182,38 @@ public actor PeerWireClient {
                 continue
             }
         }
+    }
+
+    private func handlePeerStateMessage(_ message: (id: UInt8, payload: Data), pieceCount: Int? = nil) {
+        switch message.id {
+        case 1:
+            isChoked = false
+        case 4:
+            guard message.payload.count == 4 else { return }
+            availablePieces.insert(Int(message.payload.readUInt32(at: 0)))
+            availabilityIsKnown = true
+        case 5:
+            availablePieces = Self.parseBitfield(message.payload, pieceCount: pieceCount)
+            availabilityIsKnown = true
+        case 20:
+            handleExtendedMessage(message.payload)
+        default:
+            break
+        }
+    }
+
+    static func parseBitfield(_ payload: Data, pieceCount: Int? = nil) -> Set<Int> {
+        var pieces = Set<Int>()
+        for (byteOffset, byte) in payload.enumerated() {
+            for bit in 0..<8 {
+                let pieceIndex = byteOffset * 8 + bit
+                if let pieceCount, pieceIndex >= pieceCount { return pieces }
+                if byte & (0x80 >> UInt8(bit)) != 0 {
+                    pieces.insert(pieceIndex)
+                }
+            }
+        }
+        return pieces
     }
 
     private func sendExtendedHandshake() async throws {

@@ -42,6 +42,34 @@ struct CoreParsingTests {
         #expect(String(data: encoded, encoding: .utf8) == "d8:msg_typei0e5:piecei3ee")
     }
 
+    @Test("Tracker percent encoding escapes binary bytes")
+    func trackerPercentEncoding() {
+        let data = Data([0x00, 0x20, 0x2F, 0x41, 0x7A, 0xFF])
+
+        #expect(TrackerClient.percentEncode(data) == "%00%20%2FAz%FF")
+    }
+
+    @Test("Tracker compact peers parse IPv4 endpoints")
+    func trackerCompactPeers() {
+        let peers = TrackerClient.parseCompactPeers(Data([
+            127, 0, 0, 1, 0x1A, 0xE1,
+            192, 168, 1, 10, 0xC0, 0x00,
+            1, 2, 3
+        ]))
+
+        #expect(peers == [
+            PeerEndpoint(host: "127.0.0.1", port: 6881),
+            PeerEndpoint(host: "192.168.1.10", port: 49152)
+        ])
+    }
+
+    @Test("Peer bitfield parser maps high bits to piece indexes")
+    func peerBitfieldParser() {
+        let pieces = PeerWireClient.parseBitfield(Data([0b1010_0000, 0b0100_0000]), pieceCount: 10)
+
+        #expect(pieces == [0, 2, 9])
+    }
+
     @Test("Torrent parser sanitizes unsafe output paths")
     func torrentPathsAreSanitized() throws {
         var info = Data("d5:filesld6:lengthi1e4:pathl2:..9:file/nameeee4:name4:Root12:piece lengthi1e6:pieces20:".utf8)
