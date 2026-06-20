@@ -219,7 +219,14 @@ public struct TorrentDownloader: Sendable {
                     while true {
                         try? Task.checkCancellation()
                         guard !Task.isCancelled else { return CancellationError() }
-                        guard let pieceIndex = await coordinator.nextPiece(availablePieces: session.availablePieces) else {
+                        // Pull live availability each pass so `have`/`bitfield`
+                        // messages received mid-download refine the set. When the
+                        // peer never declared availability (unchoked first), fall
+                        // back optimistically to all pieces; this self-corrects as
+                        // soon as the peer announces anything.
+                        let (livePieces, isKnown) = await session.client.currentAvailability()
+                        let usablePieces = isKnown ? livePieces : Set(metainfo.pieceHashes.indices)
+                        guard let pieceIndex = await coordinator.nextPiece(availablePieces: usablePieces) else {
                             return nil
                         }
 
@@ -292,6 +299,10 @@ public struct TorrentDownloader: Sendable {
                         let available = try await withTimeout(seconds: .seconds(10)) {
                             try await client.readInitialAvailability(pieceCount: metainfo.pieceHashes.count)
                         }
+                        // Snapshot used only to seed rarest-first counts; the
+                        // live set is queried per piece during the download loop.
+                        // An undeclared (empty) peer counts optimistically as a
+                        // full seed for rarest-first seeding purposes.
                         return .success(PeerDownloadSession(
                             endpoint: peer,
                             client: client,

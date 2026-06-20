@@ -68,7 +68,9 @@ public struct TrackerClient: Sendable {
             throw TrackerClientError.unsupportedScheme(scheme)
         }
 
-        let url = makeAnnounceURL(request)
+        guard let url = makeAnnounceURL(request) else {
+            throw TrackerClientError.invalidTrackerURL
+        }
         var urlRequest = URLRequest(url: url)
         urlRequest.timeoutInterval = 20
         urlRequest.setValue("Swiftorrent/0.1", forHTTPHeaderField: "User-Agent")
@@ -80,24 +82,47 @@ public struct TrackerClient: Sendable {
         return try parsePeers(from: data)
     }
 
-    private func makeAnnounceURL(_ request: TrackerRequest) -> URL {
-        var absolute = request.announceURL.absoluteString
+    private func makeAnnounceURL(_ request: TrackerRequest) -> URL? {
+        Self.makeAnnounceURL(
+            base: request.announceURL.absoluteString,
+            infoHash: request.infoHash,
+            peerID: request.peerID,
+            port: request.port,
+            downloaded: request.downloaded,
+            left: request.left,
+            event: request.event
+        )
+    }
+
+    /// Builds the HTTP(S) announce URL from a base string. Returns `nil` when the
+    /// resulting string is not a valid URL so the caller can skip the tracker
+    /// instead of force-unwrapping.
+    static func makeAnnounceURL(
+        base: String,
+        infoHash: Data,
+        peerID: Data,
+        port: UInt16,
+        downloaded: Int64,
+        left: Int64,
+        event: String?
+    ) -> URL? {
+        var absolute = base
         absolute += absolute.contains("?") ? "&" : "?"
         absolute += [
-            "info_hash=\(Self.percentEncode(request.infoHash))",
-            "peer_id=\(Self.percentEncode(request.peerID))",
-            "port=\(request.port)",
+            "info_hash=\(percentEncode(infoHash))",
+            "peer_id=\(percentEncode(peerID))",
+            "port=\(port)",
             "uploaded=0",
-            "downloaded=\(request.downloaded)",
-            "left=\(request.left)",
+            "downloaded=\(downloaded)",
+            "left=\(left)",
             "compact=1",
             "numwant=48",
             "no_peer_id=1"
         ].joined(separator: "&")
-        if let event = request.event {
+        if let event {
             absolute += "&event=\(event)"
         }
-        return URL(string: absolute)!
+        return URL(string: absolute)
     }
 
     private func announceUDP(_ request: TrackerRequest) async throws -> [PeerEndpoint] {

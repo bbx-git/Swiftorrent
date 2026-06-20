@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Continue P1 robustness: make `TrackerClient.makeAnnounceURL` return optional (no `URL(string:)!` force-unwrap, skip tracker on failure), then address the empty-availability "full seed" heuristic; then PEX.
+- **Next Immediate Step:** All P1 items are done. Start P2: cache verified pieces (`verifiedPieces()` currently re-hashes the whole on-disk dataset up to 3× per `download()`), then HTTP `Range`/resume for web seeds, then PEX (inbound-only).
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -34,10 +34,9 @@
   - Changed app accent styling from blue to graphite black/grey.
   - Fixed all P0 (critical) roadmap items: untrusted-input crash/OOM/hang hardening across bencode, peer-wire, tracker, and DHT paths.
 - **Recent Fixes (Anti-Regression):**
-  - P1: `PeerWireClient.connect` now handles `.waiting` (cancels + fails fast on unreachable/refused peers) and `.cancelled` (resumes with `CancellationError`, no continuation leak); same `.waiting` fail-fast added to `TrackerClient`/`DHTClient` `waitUntilReady`.
-  - P1: structured/awaited peer-client cleanup — `TorrentDownloader.downloadPiecesConcurrently` uses an awaited `closeSessions(_:)` (no fire-and-forget `Task`), and `MagnetMetadataResolver.fetchMetadata` uses do/catch with awaited `close()`.
-  - P0 hardening: all `NWConnection` continuation awaits wrapped in `withTaskCancellationHandler` (`onCancel` cancels the connection) so hostile/non-responsive hosts no longer deadlock timeouts or cancellation.
-  - P0 hardening: bounded peer-supplied sizes — `PeerWireClient.readMessage` caps the length prefix at `maxMessageLength` (1 MB); `fetchMetadata` caps `metadata_size` at `maxMetadataSize` (10 MB).
+  - P1: empty-availability heuristic fixed. `PeerWireClient.currentAvailability()` exposes `(pieces, isKnown)`; the download loop now queries live availability each pass, so `have`/`bitfield` messages received mid-download refine the set. The optimistic "assume full seed" fallback now applies only while the peer is undeclared (unchoked first) and self-corrects once it announces anything. The frozen `PeerDownloadSession.availablePieces` snapshot is now only used to seed rarest-first counts.
+  - P1: `TrackerClient.makeAnnounceURL` now returns `URL?` (no `URL(string:)!` force-unwrap), refactored to a testable `static` helper; `announce` throws `invalidTrackerURL` when the URL can't be built, so the failing tracker is skipped by the per-tracker `catch` in `TorrentDownloader`/`MagnetMetadataResolver` group tasks instead of crashing.
+  - P1: `PeerWireClient.connect` handles `.waiting` (cancels + fails fast on unreachable/refused peers) and `.cancelled` (resumes with `CancellationError`, no continuation leak); same `.waiting` fail-fast added to `TrackerClient`/`DHTClient` `waitUntilReady`.
 
 ## Known Issues / Technical Debt
 - Magnet and `.torrent` peer discovery can use HTTP/HTTPS trackers, UDP trackers, and DHT peer discovery, but PEX is still missing.
@@ -54,7 +53,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 23 Swift Testing tests passed (added bencode-overflow, port-0 filter, and size-cap hardening tests).
+- **Tests:** Success, `swift test -c release`, 24 Swift Testing tests passed (latest add: announce-URL builder query/nil-base test).
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -70,4 +69,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- P0 critical roadmap items are done. Next up: P1 robustness (connect() `.waiting`/`.cancelled` handling + continuation-leak fix, awaited/structured `close()` cleanup, optional `makeAnnounceURL`, empty-availability heuristic), then PEX and the two remaining hardening tests (cancellation teardown timing; integration tests from `~/Documents/Xcode/aTemp`).
+- All P0 and P1 roadmap items are done. Next up: P2 — cache verified pieces (avoid 3× full re-hash per `download()`), HTTP `Range`/resume for web seeds, fragile force-unwraps in `makePeerID`/`SecRandomCopyBytes`, PEX (inbound-only), per-wait peer-wire timeouts, file selection — plus the two remaining hardening tests (cancellation teardown timing; integration tests from `~/Documents/Xcode/aTemp`).

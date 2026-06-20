@@ -86,6 +86,36 @@ struct CoreParsingTests {
         #expect(TrackerClient.percentEncode(data) == "%00%20%2FAz%FF")
     }
 
+    @Test("Tracker announce URL builds query and rejects malformed bases")
+    func trackerAnnounceURL() {
+        let infoHash = Data([0x00, 0xFF, 0x10])
+        let peerID = Data(repeating: 0x41, count: 3)
+
+        let valid = TrackerClient.makeAnnounceURL(
+            base: "http://tracker.example.invalid/announce",
+            infoHash: infoHash,
+            peerID: peerID,
+            port: 6881,
+            downloaded: 0,
+            left: 100,
+            event: "started"
+        )
+        #expect(valid?.absoluteString == "http://tracker.example.invalid/announce?info_hash=%00%FF%10&peer_id=AAA&port=6881&uploaded=0&downloaded=0&left=100&compact=1&numwant=48&no_peer_id=1&event=started")
+
+        // A base whose authority contains a space cannot form a valid URL, so the
+        // builder must return nil instead of force-unwrapping and crashing.
+        let invalid = TrackerClient.makeAnnounceURL(
+            base: "http://bad host.invalid/announce",
+            infoHash: infoHash,
+            peerID: peerID,
+            port: 6881,
+            downloaded: 0,
+            left: 0,
+            event: nil
+        )
+        #expect(invalid == nil)
+    }
+
     @Test("Tracker requests announce a real peer port")
     func trackerRequestPort() {
         let request = TrackerRequest(

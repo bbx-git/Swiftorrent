@@ -104,21 +104,7 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 ## Roadmap
 
-All items preserve the download-only policy (no seeding, uploading, or sharing). PEX, if added, is inbound-only: consume peer lists, never advertise this client as a source.
-
-### P0 — Critical (crash / OOM / hang from untrusted input) — DONE
-
-- [x] Made connections cancellation-aware. Every `NWConnection` continuation await (`PeerWireClient.connect`/`send`/`receiveExactly`, `TrackerClient.waitUntilReady`/`sendUDP`/`receiveUDP`, `DHTClient.waitUntilReady`/`send`/`receive`) is wrapped in `withTaskCancellationHandler` whose `onCancel` calls `connection.cancel()`, so a non-responsive or hostile host no longer blocks the timeout or user cancellation.
-- [x] Bounded peer-supplied lengths to prevent OOM. `PeerWireClient.readMessage` rejects a length prefix above `maxMessageLength` (1 MB) before `receiveExactly`, and `fetchMetadata` rejects a peer-advertised `metadata_size` above `maxMetadataSize` (10 MB), which also bounds the derived `pieceCount`.
-- [x] Guarded the bencode byte-string length against integer overflow (`Bencode.swift` now uses `multipliedReportingOverflow`/`addingReportingOverflow` and throws `invalidByteStringLength` on overflow).
-- [x] Filter `port == 0` in `TrackerClient.parseCompactPeers` and stopped force-unwrapping `NWEndpoint.Port(rawValue:)` in `PeerWireClient.connect` (now throws `connectionFailed` on a port-0 peer).
-
-### P1 — Important (robustness / correctness)
-
-- [x] Fixed the `connect()` continuation leak: `PeerWireClient.connect` now resumes on `.waiting` (fail fast on unreachable/refused peers) and `.cancelled` (no leak when cancelled). The same `.waiting` fail-fast was added to `TrackerClient`/`DHTClient` `waitUntilReady`.
-- [x] Replaced fire-and-forget `Task { await client.close() }` cleanup in `TorrentDownloader.downloadPiecesConcurrently` (via an awaited `closeSessions`) and `MagnetMetadataResolver.fetchMetadata` (do/catch with awaited `close()`) with structured, awaited closes.
-- Stop force-unwrapping `URL(string:)!` in `TrackerClient.makeAnnounceURL`; return optional and skip the tracker on failure.
-- Address the empty-availability heuristic (a peer that unchokes before sending bitfield/have is treated as a full seed); add reject/`have` handling or document it.
+All items preserve the download-only policy (no seeding, uploading, or sharing). PEX, if added, is inbound-only: consume peer lists, never advertise this client as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships.
 
 ### P2 — Performance & polish
 
@@ -131,8 +117,5 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 
 ### Hardening tests
 
-- [x] Bencode length overflow rejected on a crafted byte-string length.
-- [x] `parseCompactPeers` drops port-0 entries.
-- [x] Oversized `metadata_size` / wire-message length caps asserted.
-- [ ] Cancellation tears down a stalled connection within the timeout window.
-- [ ] Integration tests using assets only from `~/Documents/Xcode/aTemp`.
+- Cancellation tears down a stalled connection within the timeout window.
+- Integration tests using assets only from `~/Documents/Xcode/aTemp`.
