@@ -545,6 +545,35 @@ struct CoreParsingTests {
         #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/b.txt.tor").path))
     }
 
+    @Test func flatteningRootDirectoryStripsSharedFolder() {
+        let metainfo = makeMetainfo(pieceLength: 2, pieces: [Data("ab".utf8), Data("cdef".utf8)])
+        #expect(metainfo.createsEnclosingDirectory)
+
+        let flattened = metainfo.flatteningRootDirectory()
+        #expect(flattened.files.map(\.path) == ["a.txt", "b.txt"])
+        #expect(flattened.files.map(\.id) == metainfo.files.map(\.id))
+        #expect(flattened.files.map(\.length) == metainfo.files.map(\.length))
+        // Piece geometry must be untouched so the same bytes still verify.
+        #expect(flattened.pieceHashes == metainfo.pieceHashes)
+        #expect(flattened.infoHash == metainfo.infoHash)
+        #expect(!flattened.createsEnclosingDirectory)
+    }
+
+    @Test func flatteningSingleFileTorrentIsUnchanged() {
+        let metainfo = TorrentMetainfo(
+            name: "movie.mp4",
+            announceURLs: [],
+            files: [TorrentFile(id: 0, path: "movie.mp4", length: 4)],
+            pieceLength: 4,
+            pieceHashes: [Data(Insecure.SHA1.hash(data: Data("abcd".utf8)))],
+            totalSize: 4,
+            infoHash: Data(repeating: 0, count: 20),
+            infoDictionaryData: Data()
+        )
+        #expect(!metainfo.createsEnclosingDirectory)
+        #expect(metainfo.flatteningRootDirectory().files.map(\.path) == ["movie.mp4"])
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",

@@ -38,9 +38,10 @@ public final class TorrentSession {
                     $0.totalBytes = metainfo.totalSize
                     $0.outputRelativePaths = metainfo.files.map(\.path)
                     $0.files = makeFileEntries(from: metainfo, existing: $0.files)
-                    $0.status = "Starting download."
+                    $0.createsEnclosingDirectory = metainfo.createsEnclosingDirectory
+                    $0.status = "Choose files to download."
+                    $0.state = .reviewing
                 }
-                try await runDownload(itemID: item.id, metainfo: metainfo)
             } catch is CancellationError {
                 return
             } catch {
@@ -77,9 +78,10 @@ public final class TorrentSession {
                     $0.totalBytes = metainfo.totalSize
                     $0.outputRelativePaths = metainfo.files.map(\.path)
                     $0.files = makeFileEntries(from: metainfo, existing: $0.files)
-                    $0.status = "Metadata resolved. Starting download."
+                    $0.createsEnclosingDirectory = metainfo.createsEnclosingDirectory
+                    $0.status = "Choose files to download."
+                    $0.state = .reviewing
                 }
-                try await runDownload(itemID: item.id, metainfo: metainfo)
             } catch is CancellationError {
                 return
             } catch {
@@ -130,6 +132,52 @@ public final class TorrentSession {
                     $0.state = .failed
                 }
             }
+        }
+    }
+
+    /// Confirms the user's selection from the add dialog and begins downloading.
+    /// When `createSubfolder` is `false`, multi-file torrents are flattened so
+    /// their files land directly in the destination instead of an enclosing
+    /// `<name>/` folder.
+    public func startDownload(itemID: TorrentItem.ID, createSubfolder: Bool) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              items[index].state == .reviewing,
+              var metainfo = metainfos[itemID] else {
+            return
+        }
+        guard items[index].files.contains(where: \.isSelected) else { return }
+
+        if !createSubfolder {
+            metainfo = metainfo.flatteningRootDirectory()
+            metainfos[itemID] = metainfo
+            items[index].outputRelativePaths = metainfo.files.map(\.path)
+            items[index].files = makeFileEntries(from: metainfo, existing: items[index].files)
+            items[index].createsEnclosingDirectory = false
+        }
+
+        items[index].state = .downloading
+        items[index].status = "Starting download."
+        tasks[itemID] = Task {
+            defer { tasks[itemID] = nil }
+            do {
+                try await runDownload(itemID: itemID, metainfo: metainfo)
+            } catch is CancellationError {
+                return
+            } catch {
+                update(itemID) {
+                    $0.status = error.localizedDescription
+                    $0.state = .failed
+                }
+            }
+        }
+    }
+
+    /// Selects or deselects every file in a torrent at once (the dialog's
+    /// "Select All" / "Deselect All" actions).
+    public func setAllFilesSelected(itemID: TorrentItem.ID, isSelected: Bool) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+        for fileIndex in items[index].files.indices {
+            items[index].files[fileIndex].isSelected = isSelected
         }
     }
 
@@ -224,6 +272,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
 
     public enum State: String, Equatable, Sendable {
         case queued
+        case reviewing
         case downloading
         case complete
         case failed
@@ -265,6 +314,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
     public var totalBytes: Int64
     public var outputRelativePaths: [String]
     public var files: [FileEntry]
+    public var createsEnclosingDirectory: Bool
     public var downloadedBytes: Int64
     public var progress: Double
     public var status: String
@@ -278,6 +328,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
         self.totalBytes = totalBytes
         self.outputRelativePaths = []
         self.files = []
+        self.createsEnclosingDirectory = false
         self.downloadedBytes = 0
         self.progress = 0
         self.status = "Queued"

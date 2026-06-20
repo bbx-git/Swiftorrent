@@ -48,8 +48,37 @@ public struct SwiftorrentRootView: View {
         } message: { item in
             Text("Remove \"\(item.name)\" only from Swiftorrent, or also delete its downloaded and partial files from the drive?")
         }
+        .sheet(item: reviewingBinding) { item in
+            FileSelectionSheet(
+                item: item,
+                setFileSelected: { fileID, isSelected in
+                    session.setFileSelected(itemID: item.id, fileID: fileID, isSelected: isSelected)
+                },
+                setAllSelected: { isSelected in
+                    session.setAllFilesSelected(itemID: item.id, isSelected: isSelected)
+                },
+                start: { createSubfolder in
+                    session.startDownload(itemID: item.id, createSubfolder: createSubfolder)
+                },
+                cancel: {
+                    session.remove(item)
+                }
+            )
+        }
         .tint(.swiftorrentGraphite)
         .frame(minWidth: 940, minHeight: 620)
+    }
+
+    /// Surfaces the torrent awaiting file selection. Dismissing the dialog
+    /// without starting (Esc / close) cancels adding that torrent.
+    private var reviewingBinding: Binding<TorrentItem?> {
+        Binding {
+            session.items.first { $0.state == .reviewing }
+        } set: { newValue in
+            if newValue == nil, let pending = session.items.first(where: { $0.state == .reviewing }) {
+                session.remove(pending)
+            }
+        }
     }
 
     private var removalAlertPresented: Binding<Bool> {
@@ -329,6 +358,7 @@ private struct TorrentRow: View {
     private var icon: String {
         switch item.state {
         case .queued: "clock"
+        case .reviewing: "checklist"
         case .downloading: "arrow.down"
         case .complete: "checkmark.circle.fill"
         case .failed: "exclamationmark.triangle.fill"
@@ -338,6 +368,7 @@ private struct TorrentRow: View {
     private var color: Color {
         switch item.state {
         case .queued: .secondary
+        case .reviewing: .swiftorrentSmoke
         case .downloading: .swiftorrentGreen
         case .complete: .swiftorrentBlue
         case .failed: .swiftorrentRed
@@ -347,6 +378,7 @@ private struct TorrentRow: View {
     private var badgeColor: Color {
         switch item.state {
         case .queued: .swiftorrentSmoke
+        case .reviewing: .swiftorrentSmoke
         case .downloading: .swiftorrentGreen
         case .complete: .swiftorrentBlue
         case .failed: .swiftorrentRed
@@ -355,7 +387,7 @@ private struct TorrentRow: View {
 
     private var badgeForeground: Color {
         switch item.state {
-        case .queued: .primary
+        case .queued, .reviewing: .primary
         case .downloading, .complete, .failed: .white
         }
     }
@@ -393,6 +425,98 @@ private struct FileSelectionRow: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
+    }
+}
+
+private struct FileSelectionSheet: View {
+    let item: TorrentItem
+    let setFileSelected: (Int, Bool) -> Void
+    let setAllSelected: (Bool) -> Void
+    let start: (Bool) -> Void
+    let cancel: () -> Void
+
+    @State private var createSubfolder = true
+
+    private var selectedCount: Int { item.files.filter(\.isSelected).count }
+    private var selectedBytes: Int64 {
+        item.files.filter(\.isSelected).reduce(Int64(0)) { $0 + $1.totalBytes }
+    }
+    private var selectedBytesDescription: String {
+        ByteCountFormatter.string(fromByteCount: selectedBytes, countStyle: .file)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Select Files to Download")
+                    .font(.title3.bold())
+                Text(item.name)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            HStack {
+                Text("\(selectedCount) of \(item.files.count) files · \(selectedBytesDescription)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Select All") { setAllSelected(true) }
+                    .buttonStyle(.link)
+                Button("Deselect All") { setAllSelected(false) }
+                    .buttonStyle(.link)
+            }
+
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(item.files) { file in
+                        HStack(spacing: 10) {
+                            Toggle(isOn: Binding(get: { file.isSelected }, set: { setFileSelected(file.id, $0) })) {
+                                EmptyView()
+                            }
+                            .toggleStyle(.checkbox)
+                            .labelsHidden()
+
+                            Text(file.path)
+                                .font(.caption)
+                                .foregroundStyle(file.isSelected ? .primary : .secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Text(file.totalDescription)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(minHeight: 180, maxHeight: 320)
+            .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
+
+            if item.createsEnclosingDirectory {
+                Toggle("Create a subfolder named \"\(item.name)\"", isOn: $createSubfolder)
+                    .toggleStyle(.checkbox)
+                    .font(.callout)
+            }
+
+            HStack {
+                Button("Cancel", role: .cancel) { cancel() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Download") { start(createSubfolder) }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.swiftorrentGraphite)
+                    .disabled(selectedCount == 0)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
     }
 }
 

@@ -64,6 +64,38 @@ public struct TorrentMetainfo: Equatable, Sendable {
         )
     }
 
+    /// Returns a copy whose multi-file paths have their shared top-level
+    /// directory removed, so the files are written directly into the destination
+    /// instead of an enclosing `<name>/` folder. Piece geometry (lengths, order,
+    /// hashes, info hash) is untouched — only the on-disk output path changes.
+    /// Single-file torrents have no enclosing folder and are returned unchanged.
+    public func flatteningRootDirectory() -> TorrentMetainfo {
+        let flattenedFiles = files.map { file -> TorrentFile in
+            var components = file.path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            guard components.count > 1 else { return file }
+            components.removeFirst()
+            return TorrentFile(id: file.id, path: components.joined(separator: "/"), length: file.length)
+        }
+        guard flattenedFiles != files else { return self }
+        return TorrentMetainfo(
+            name: name,
+            announceURLs: announceURLs,
+            files: flattenedFiles,
+            pieceLength: pieceLength,
+            pieceHashes: pieceHashes,
+            totalSize: totalSize,
+            infoHash: infoHash,
+            infoDictionaryData: infoDictionaryData,
+            webSeedURLs: webSeedURLs
+        )
+    }
+
+    /// Whether this torrent would create an enclosing folder on disk (i.e. its
+    /// files share a top-level directory). Single-file torrents return `false`.
+    public var createsEnclosingDirectory: Bool {
+        files.contains { $0.path.contains("/") }
+    }
+
     private static func uniqueURLs(_ urls: [URL]) -> [URL] {
         Array(Set(urls)).sorted { $0.absoluteString < $1.absoluteString }
     }

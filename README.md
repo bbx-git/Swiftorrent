@@ -16,7 +16,9 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, bounded concurrent peer downloads, rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Bounds every peer-wire network wait with connect and per-operation send/receive timeouts, so a peer that goes silent mid-message is torn down instead of parking a download slot.
 - Discovers additional inbound peers through BEP 11 PEX (consumes peer lists only; never advertises this client as a source).
-- Lets you choose which files in a multi-file torrent to download, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files.
+- Presents a file-selection dialog after a torrent's metadata is read (immediately for `.torrent` files, once resolved for magnets) with per-file checkboxes, Select All / Deselect All, and a running selected-size total, so you pick what to download before any data is fetched. Dismissing the dialog cancels adding the torrent.
+- Offers a per-torrent "Create a subfolder named ..." option in that dialog so multi-file torrents can write their files directly into the destination instead of an enclosing folder.
+- Lets you choose which files in a multi-file torrent to download, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Selection can also be changed mid-download from the expandable file list.
 - Shows per-file download progress in an expandable file list for multi-file torrents.
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed, with a choice to remove only from Swiftorrent or also delete downloaded/partial files from disk.
