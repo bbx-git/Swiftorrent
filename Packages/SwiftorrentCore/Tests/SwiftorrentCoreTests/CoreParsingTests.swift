@@ -42,6 +42,15 @@ struct CoreParsingTests {
         #expect(String(data: encoded, encoding: .utf8) == "d8:msg_typei0e5:piecei3ee")
     }
 
+    @Test("Bencode encoder writes lists")
+    func bencodeEncoderLists() {
+        let encoded = BencodeEncoder.encode([
+            "values": .list([.string("one"), .string("two")])
+        ])
+
+        #expect(String(data: encoded, encoding: .utf8) == "d6:valuesl3:one3:twoee")
+    }
+
     @Test("Tracker percent encoding escapes binary bytes")
     func trackerPercentEncoding() {
         let data = Data([0x00, 0x20, 0x2F, 0x41, 0x7A, 0xFF])
@@ -61,6 +70,45 @@ struct CoreParsingTests {
             PeerEndpoint(host: "127.0.0.1", port: 6881),
             PeerEndpoint(host: "192.168.1.10", port: 49152)
         ])
+    }
+
+    @Test("DHT compact nodes parse IPv4 endpoints")
+    func dhtCompactNodes() {
+        var nodes = Data(repeating: 1, count: 20)
+        nodes.append(contentsOf: [10, 0, 0, 2, 0x1A, 0xE1])
+        nodes.append(Data(repeating: 2, count: 20))
+        nodes.append(contentsOf: [192, 168, 1, 20, 0xC0, 0x00])
+        nodes.append(contentsOf: [1, 2, 3])
+
+        let parsed = DHTClient.parseCompactIPv4Nodes(nodes)
+
+        #expect(parsed == [
+            DHTNodeEndpoint(host: "10.0.0.2", port: 6881, id: Data(repeating: 1, count: 20)),
+            DHTNodeEndpoint(host: "192.168.1.20", port: 49152, id: Data(repeating: 2, count: 20))
+        ])
+    }
+
+    @Test("DHT get_peers response parses values and nodes")
+    func dhtGetPeersResponse() throws {
+        let transactionID = Data("aa".utf8)
+        var compactNodes = Data(repeating: 3, count: 20)
+        compactNodes.append(contentsOf: [8, 8, 8, 8, 0x1A, 0xE1])
+        let response = BencodeEncoder.encode([
+            "r": .dictionary([
+                "id": .bytes(Data(repeating: 4, count: 20)),
+                "nodes": .bytes(compactNodes),
+                "values": .list([
+                    .bytes(Data([127, 0, 0, 1, 0x1A, 0xE1]))
+                ])
+            ]),
+            "t": .bytes(transactionID),
+            "y": .string("r")
+        ])
+
+        let parsed = try DHTClient.parseGetPeersResponse(response, expectedTransactionID: transactionID)
+
+        #expect(parsed.peers == [PeerEndpoint(host: "127.0.0.1", port: 6881)])
+        #expect(parsed.nodes == [DHTNodeEndpoint(host: "8.8.8.8", port: 6881, id: Data(repeating: 3, count: 20))])
     }
 
     @Test("Peer bitfield parser maps high bits to piece indexes")

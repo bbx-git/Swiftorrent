@@ -16,7 +16,7 @@ public enum MagnetMetadataResolverError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .noSupportedTrackers: "No supported trackers are available for this magnet link yet."
+        case .noSupportedTrackers: "No supported trackers or DHT bootstrap nodes are available for this magnet link yet."
         case .noPeers: "Trackers did not return any usable peers."
         case .metadataHashMismatch: "Downloaded magnet metadata did not match the magnet info hash."
         }
@@ -25,10 +25,16 @@ public enum MagnetMetadataResolverError: Error, LocalizedError {
 
 public struct MagnetMetadataResolver: Sendable {
     private let trackerClient: TrackerClient
+    private let dhtClient: DHTClient
     private let parser: TorrentMetainfoParser
 
-    public init(trackerClient: TrackerClient = TrackerClient(), parser: TorrentMetainfoParser = TorrentMetainfoParser()) {
+    public init(
+        trackerClient: TrackerClient = TrackerClient(),
+        dhtClient: DHTClient = DHTClient(),
+        parser: TorrentMetainfoParser = TorrentMetainfoParser()
+    ) {
         self.trackerClient = trackerClient
+        self.dhtClient = dhtClient
         self.parser = parser
     }
 
@@ -41,10 +47,10 @@ public struct MagnetMetadataResolver: Sendable {
             guard let scheme = url.scheme?.lowercased() else { return false }
             return scheme == "http" || scheme == "https" || scheme == "udp"
         }
-        guard !trackers.isEmpty else { throw MagnetMetadataResolverError.noSupportedTrackers }
 
         let peerID = TorrentDownloader.makePeerID()
-        await progress(MagnetMetadataProgress(status: "Contacting \(trackers.count) trackers for magnet peers"))
+        let sourceDescription = trackers.isEmpty ? "DHT" : "\(trackers.count) trackers and DHT"
+        await progress(MagnetMetadataProgress(status: "Contacting \(sourceDescription) for magnet peers"))
         let peers = try await collectPeers(trackers: trackers, magnet: magnet, peerID: peerID)
         guard !peers.isEmpty else { throw MagnetMetadataResolverError.noPeers }
 
@@ -99,6 +105,14 @@ public struct MagnetMetadataResolver: Sendable {
                     } catch {
                         return .failure(error)
                     }
+                }
+            }
+            group.addTask {
+                do {
+                    try Task.checkCancellation()
+                    return .success(try await dhtClient.peers(for: magnet.infoHash))
+                } catch {
+                    return .failure(error)
                 }
             }
 

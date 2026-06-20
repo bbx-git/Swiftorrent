@@ -132,7 +132,7 @@ public struct BencodeParser: Sendable {
         let payloadStart = index
         let payloadEnd = data.index(index, offsetBy: length)
         index = payloadEnd
-        return BencodeNode(value: .bytes(data[payloadStart..<payloadEnd]), range: start..<index)
+        return BencodeNode(value: .bytes(Data(data[payloadStart..<payloadEnd])), range: start..<index)
     }
 
     private mutating func parseIntegerUntilTerminator() throws -> Int64 {
@@ -160,6 +160,7 @@ public indirect enum BencodeEncodableValue: Sendable {
     case integer(Int64)
     case bytes(Data)
     case string(String)
+    case list([BencodeEncodableValue])
     case dictionary([String: BencodeEncodableValue])
 }
 
@@ -180,6 +181,13 @@ public enum BencodeEncoder {
             let data = Data(string.utf8)
             var result = Data("\(data.count):".utf8)
             result.append(data)
+            return result
+        case let .list(values):
+            var result = Data("l".utf8)
+            for value in values {
+                result.append(encode(value))
+            }
+            result.append(UInt8(ascii: "e"))
             return result
         case let .dictionary(dictionary):
             var result = Data("d".utf8)

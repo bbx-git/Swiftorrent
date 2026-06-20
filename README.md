@@ -11,7 +11,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Parses bencoded torrent metainfo, computes SHA-1 info hashes from the raw `info` dictionary, reads single-file and multi-file torrents, and extracts tracker tiers.
 - Talks to HTTP and HTTPS trackers with compact peer responses.
 - Talks to UDP trackers with compact IPv4 peer responses.
-- Resolves magnet metadata through BEP 10 extension negotiation and BEP 9 `ut_metadata` requests when HTTP/HTTPS or UDP trackers return peers.
+- Resolves magnet metadata through BEP 5 DHT `get_peers`, BEP 10 extension negotiation, and BEP 9 `ut_metadata` requests.
 - Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, bounded concurrent peer downloads, rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed.
@@ -20,8 +20,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads now use a small pool of concurrent tracker peers with basic piece availability tracking. The downloader does not yet include DHT, PEX, local peer discovery, encryption, NAT traversal, bandwidth limits, or partial file selection.
-- Magnet links can now fetch metadata from peers discovered through HTTP/HTTPS trackers. UDP-only magnets still need UDP tracker support, DHT, or PEX before they can resolve.
+- `.torrent` downloads now use a small pool of concurrent tracker peers with basic piece availability tracking. The downloader does not yet use DHT, PEX, local peer discovery, encryption, NAT traversal, bandwidth limits, or partial file selection.
+- Magnet links can now fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT. PEX is still missing.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
 ## Requirements
@@ -74,6 +74,7 @@ Swiftorrent/
 │   ├── SwiftorrentCore/
 │   │   ├── Sources/SwiftorrentCore/
 │   │   │   ├── Bencode.swift
+│   │   │   ├── DHTClient.swift
 │   │   │   ├── MagnetLink.swift
 │   │   │   ├── MagnetMetadataResolver.swift
 │   │   │   ├── PeerWireClient.swift
@@ -96,12 +97,13 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 - Upload avoidance is enforced by policy: no listener socket, tracker `port=0`, tracker `uploaded=0`, no piece upload message handling, no seeding loop, and a best-effort stopped announce after completion.
 - UDP tracker support uses BEP 15 connect/announce requests and compact IPv4 peers.
+- DHT support uses BEP 5 `get_peers` queries against public bootstrap nodes and consumes compact IPv4 peers/nodes.
 - Magnet metadata resolution uses the extension-protocol reserved bit, extended handshake message ID `20`, and `ut_metadata` request/data messages.
 - Transmission was used only as protocol/architecture reference. No Transmission source code was copied or translated.
 
 ## Roadmap
 
-- Add DHT and PEX so magnets do not depend on HTTP/HTTPS trackers.
+- Add PEX and use DHT peer discovery for `.torrent` downloads, not just magnet metadata.
 - Add peer-wire read/connect timeouts for every long-running network wait.
 - Add file selection and per-file progress.
 - Add integration tests using assets only from `~/Documents/Xcode/aTemp`.
