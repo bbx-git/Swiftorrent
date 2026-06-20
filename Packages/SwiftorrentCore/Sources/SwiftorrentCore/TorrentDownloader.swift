@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct TorrentDownloadProgress: Sendable {
@@ -32,11 +33,19 @@ public struct TorrentDownloader: Sendable {
     ) async throws {
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        try ensureAvailableCapacity(for: metainfo.totalSize, at: destination)
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+        let initialVerifiedPieces = try writer.verifiedPieces()
+        let initialDownloaded = bytesCompleted(for: initialVerifiedPieces, metainfo: metainfo)
+        try ensureAvailableCapacity(for: metainfo.totalSize - initialDownloaded, at: destination)
+
+        if initialDownloaded >= metainfo.totalSize {
+            await progress(TorrentDownloadProgress(status: "Complete. Existing files verified. No seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+            return
+        }
 
         let peerID = Self.makePeerID()
-        await progress(TorrentDownloadProgress(status: "Contacting trackers", downloadedBytes: 0, totalBytes: metainfo.totalSize))
-        let peers = try await collectPeers(for: metainfo, peerID: peerID, event: "started")
+        await progress(TorrentDownloadProgress(status: "Verified existing data. Contacting trackers", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+        let peers = try await collectPeers(for: metainfo, peerID: peerID, downloaded: initialDownloaded, left: metainfo.totalSize - initialDownloaded, event: "started")
         do {
             try Task.checkCancellation()
             guard !peers.isEmpty else {
@@ -46,12 +55,21 @@ public struct TorrentDownloader: Sendable {
             var lastError: Error?
             for peer in peers.shuffled().prefix(maxPeerAttempts) {
                 try Task.checkCancellation()
+                let verifiedPieces = try writer.verifiedPieces()
+                let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
+                if verifiedBytes >= metainfo.totalSize {
+                    _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped")
+                    await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+                    return
+                }
                 do {
                     let downloaded = try await downloadAllPieces(
                         metainfo: metainfo,
                         destination: destination,
                         peer: peer,
                         peerID: peerID,
+                        verifiedPieces: verifiedPieces,
+                        initialDownloaded: verifiedBytes,
                         progress: progress
                     )
                     _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
@@ -61,7 +79,8 @@ public struct TorrentDownloader: Sendable {
                     throw CancellationError()
                 } catch {
                     lastError = error
-                    await progress(TorrentDownloadProgress(status: "Peer \(peer.host):\(peer.port) failed. Trying another peer.", downloadedBytes: 0, totalBytes: metainfo.totalSize))
+                    let recoveredBytes = bytesCompleted(for: (try? writer.verifiedPieces()) ?? [], metainfo: metainfo)
+                    await progress(TorrentDownloadProgress(status: "Peer \(peer.host):\(peer.port) failed. Trying another peer.", downloadedBytes: recoveredBytes, totalBytes: metainfo.totalSize))
                 }
             }
 
@@ -74,6 +93,8 @@ public struct TorrentDownloader: Sendable {
         destination: URL,
         peer: PeerEndpoint,
         peerID: Data,
+        verifiedPieces: Set<Int>,
+        initialDownloaded: Int64,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws -> Int64 {
         let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
@@ -86,10 +107,14 @@ public struct TorrentDownloader: Sendable {
             try await client.connect()
         }
 
-        var downloaded: Int64 = 0
+        var downloaded = initialDownloaded
         for pieceIndex in metainfo.pieceHashes.indices {
             try Task.checkCancellation()
             let pieceLength = pieceLength(for: pieceIndex, metainfo: metainfo)
+            if verifiedPieces.contains(pieceIndex) {
+                await progress(TorrentDownloadProgress(status: "Resuming. Skipping verified piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
+                continue
+            }
             await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
             let piece = try await withTimeout(seconds: .seconds(60)) {
                 try await client.downloadPiece(index: pieceIndex, length: pieceLength, expectedHash: metainfo.pieceHashes[pieceIndex])
@@ -143,6 +168,12 @@ public struct TorrentDownloader: Sendable {
         return metainfo.pieceLength
     }
 
+    private func bytesCompleted(for pieces: Set<Int>, metainfo: TorrentMetainfo) -> Int64 {
+        pieces.reduce(Int64(0)) { total, pieceIndex in
+            total + Int64(pieceLength(for: pieceIndex, metainfo: metainfo))
+        }
+    }
+
     private func ensureAvailableCapacity(for bytes: Int64, at destination: URL) throws {
         let values = try destination.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         if let capacity = values.volumeAvailableCapacityForImportantUsage, capacity < bytes {
@@ -160,6 +191,19 @@ struct TorrentFileWriter: Sendable {
     let metainfo: TorrentMetainfo
     let destination: URL
 
+    func verifiedPieces() throws -> Set<Int> {
+        var verified = Set<Int>()
+        for pieceIndex in metainfo.pieceHashes.indices {
+            let length = pieceLength(for: pieceIndex)
+            guard let piece = try read(pieceIndex: pieceIndex, length: length),
+                  Data(Insecure.SHA1.hash(data: piece)) == metainfo.pieceHashes[pieceIndex] else {
+                continue
+            }
+            verified.insert(pieceIndex)
+        }
+        return verified
+    }
+
     func write(piece: Data, pieceIndex: Int) throws {
         let pieceStart = Int64(pieceIndex * metainfo.pieceLength)
         var remaining = piece
@@ -176,12 +220,40 @@ struct TorrentFileWriter: Sendable {
             let localEnd = min(offsetInTorrent + Int64(remaining.count), fileEnd)
             let count = Int(localEnd - localStart)
             let sourceOffset = Int(localStart - offsetInTorrent)
-            let chunk = Data(remaining[sourceOffset..<(sourceOffset + count)])
+            let chunkStart = remaining.index(remaining.startIndex, offsetBy: sourceOffset)
+            let chunkEnd = remaining.index(chunkStart, offsetBy: count)
+            let chunk = Data(remaining[chunkStart..<chunkEnd])
             try write(chunk: chunk, to: file, at: localStart - fileStart)
             remaining.removeFirst(sourceOffset + count)
             offsetInTorrent = localEnd
             if remaining.isEmpty { break }
         }
+    }
+
+    func read(pieceIndex: Int, length: Int) throws -> Data? {
+        let pieceStart = Int64(pieceIndex * metainfo.pieceLength)
+        var result = Data()
+        result.reserveCapacity(length)
+        let pieceEnd = pieceStart + Int64(length)
+
+        for file in metainfo.files {
+            let fileStart = metainfo.files.prefix(file.id).reduce(Int64(0)) { $0 + $1.length }
+            let fileEnd = fileStart + file.length
+            guard pieceStart < fileEnd, pieceEnd > fileStart else {
+                continue
+            }
+
+            let localStart = max(pieceStart, fileStart)
+            let localEnd = min(pieceEnd, fileEnd)
+            let count = Int(localEnd - localStart)
+            let chunk = try readChunk(from: file, at: localStart - fileStart, count: count)
+            guard let chunk, chunk.count == count else {
+                return nil
+            }
+            result.append(chunk)
+        }
+
+        return result.count == length ? result : nil
     }
 
     private func write(chunk: Data, to file: TorrentFile, at offset: Int64) throws {
@@ -194,5 +266,24 @@ struct TorrentFileWriter: Sendable {
         defer { try? handle.close() }
         try handle.seek(toOffset: UInt64(offset))
         try handle.write(contentsOf: chunk)
+    }
+
+    private func readChunk(from file: TorrentFile, at offset: Int64, count: Int) throws -> Data? {
+        let url = destination.appendingPathComponent(file.path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(offset))
+        return try handle.read(upToCount: count)
+    }
+
+    private func pieceLength(for index: Int) -> Int {
+        if index == metainfo.pieceHashes.count - 1 {
+            let consumed = Int64(index * metainfo.pieceLength)
+            return Int(metainfo.totalSize - consumed)
+        }
+        return metainfo.pieceLength
     }
 }

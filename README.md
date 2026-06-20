@@ -12,7 +12,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Talks to HTTP and HTTPS trackers with compact peer responses.
 - Talks to UDP trackers with compact IPv4 peer responses.
 - Resolves magnet metadata through BEP 10 extension negotiation and BEP 9 `ut_metadata` requests when HTTP/HTTPS or UDP trackers return peers.
-- Implements a first-pass peer-wire downloader for `.torrent` metadata: handshake, interested, unchoke handling, block requests, piece receipt, SHA-1 piece verification, and file writing.
+- Implements a first-pass peer-wire downloader for `.torrent` metadata: handshake, interested, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed.
 - Sanitizes torrent file names and multi-file path components before writing into the chosen destination.
@@ -20,7 +20,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads are implemented as a first functional pass, but the downloader currently tries tracker peers sequentially through a simple peer-wire path. It does not yet include multiple concurrent peers, resume data, rarest-first selection, DHT, PEX, local peer discovery, encryption, NAT traversal, bandwidth limits, or partial file selection.
+- `.torrent` downloads are implemented as a first functional pass, but the downloader currently tries tracker peers sequentially through a simple peer-wire path. It does not yet include multiple concurrent peers, rarest-first selection, DHT, PEX, local peer discovery, encryption, NAT traversal, bandwidth limits, or partial file selection.
 - Magnet links can now fetch metadata from peers discovered through HTTP/HTTPS trackers. UDP-only magnets still need UDP tracker support, DHT, or PEX before they can resolve.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
@@ -104,7 +104,6 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 - Add multiple peer connections and piece availability tracking.
 - Add DHT and PEX so magnets do not depend on HTTP/HTTPS trackers.
 - Add peer-wire read/connect timeouts for every long-running network wait.
-- Add resume data and existing-piece verification.
 - Add file selection and per-file progress.
-- Add tracker URL encoding, compact peer parsing, piece length, and multi-file writer tests.
+- Add tracker URL encoding and compact peer parsing tests.
 - Add integration tests using assets only from `~/Documents/Xcode/aTemp`.

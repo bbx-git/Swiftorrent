@@ -1,5 +1,6 @@
+import CryptoKit
 import Foundation
-import SwiftorrentCore
+@testable import SwiftorrentCore
 import Testing
 
 @Suite("Core parsing")
@@ -61,5 +62,71 @@ struct CoreParsingTests {
         let metainfo = try TorrentMetainfoParser().parseInfoDictionary(data: info, announceURLs: [])
 
         #expect(metainfo.files.map(\.path) == ["_tmp_evil"])
+    }
+
+    @Test("Torrent parser keeps piece length and hash count")
+    func torrentPieceLengthAndHashes() throws {
+        var info = Data("d6:lengthi5e4:name4:file12:piece lengthi3e6:pieces40:".utf8)
+        info.append(Data(repeating: 1, count: 20))
+        info.append(Data(repeating: 2, count: 20))
+        info.append(UInt8(ascii: "e"))
+
+        let metainfo = try TorrentMetainfoParser().parseInfoDictionary(data: info, announceURLs: [])
+
+        #expect(metainfo.pieceLength == 3)
+        #expect(metainfo.pieceHashes.count == 2)
+        #expect(metainfo.totalSize == 5)
+    }
+
+    @Test("Torrent writer writes and verifies pieces across file boundaries")
+    func torrentWriterVerifiesMultiFilePieces() throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [
+            Data("abcd".utf8),
+            Data("ef".utf8)
+        ])
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+
+        try writer.write(piece: Data("abcd".utf8), pieceIndex: 0)
+
+        #expect(try writer.read(pieceIndex: 0, length: 4) == Data("abcd".utf8))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("Root/a.txt")) == Data("ab".utf8))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("Root/b.txt")) == Data("cd".utf8))
+        #expect(try writer.verifiedPieces() == [0])
+    }
+
+    @Test("Torrent writer ignores corrupt resume pieces")
+    func torrentWriterRejectsCorruptExistingPieces() throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [
+            Data("abcd".utf8),
+            Data("ef".utf8)
+        ])
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+
+        try writer.write(piece: Data("wxyz".utf8), pieceIndex: 0)
+        try writer.write(piece: Data("ef".utf8), pieceIndex: 1)
+
+        #expect(try writer.verifiedPieces() == [1])
+    }
+
+    private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
+        TorrentMetainfo(
+            name: "Root",
+            announceURLs: [],
+            files: [
+                TorrentFile(id: 0, path: "Root/a.txt", length: 2),
+                TorrentFile(id: 1, path: "Root/b.txt", length: 4)
+            ],
+            pieceLength: pieceLength,
+            pieceHashes: pieces.map { Data(Insecure.SHA1.hash(data: $0)) },
+            totalSize: Int64(pieces.reduce(0) { $0 + $1.count }),
+            infoHash: Data(repeating: 0, count: 20),
+            infoDictionaryData: Data()
+        )
     }
 }
