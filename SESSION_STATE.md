@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** PEX (inbound-only) and per-wait peer-wire timeouts are done. Next P2: the remaining `SecRandomCopyBytes` force-unwrap, then file selection + per-file progress. Remaining hardening test: integration tests from `~/Documents/Xcode/aTemp`.
+- **Next Immediate Step:** The `SecRandomCopyBytes` force-unwrap is now removed (DHT node id uses `SystemRandomNumberGenerator`). Next P2: file selection + per-file progress. Remaining hardening test: integration tests from `~/Documents/Xcode/aTemp`.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -34,6 +34,7 @@
   - Changed app accent styling from blue to graphite black/grey.
   - Fixed all P0 (critical) roadmap items: untrusted-input crash/OOM/hang hardening across bencode, peer-wire, tracker, and DHT paths.
 - **Recent Fixes (Anti-Regression):**
+  - P2: removed the last fragile force-unwrap. `DHTClient.makeNodeID()` now builds 20 random bytes via `SystemRandomNumberGenerator` (CSPRNG-backed) instead of `SecRandomCopyBytes(..., $0.baseAddress!)`, dropping the unsafe-pointer force-unwrap and the discarded error code. No `import Security` needed. Added a test asserting two node ids are each 20 bytes and differ.
   - P2: per-wait peer-wire timeouts. `PeerWireClient` now takes `connectTimeout` (default 10s) and `ioTimeout` (default 30s) and wraps `connect`, `send`, and `receiveExactly` in a `withTimeout` helper that races each network wait against `Task.sleep` in a `withThrowingTaskGroup`. When the timer wins it throws `PeerWireError.timedOut` and the group cancels the operation task, whose `onCancel` cancels the `NWConnection` so the parked continuation resumes (no leak). Because every higher-level loop (`readMessage`, `drainUntilUnchoked`, `readPieceBlock`, metadata reads) funnels through `receiveExactly`, a peer that goes silent mid-message is now torn down within the window instead of parking a download slot forever. Added a loopback test (`AcceptedConnections` + silent `NWListener`) asserting `connect()` throws `.timedOut` inside the 0.5s window.
   - P2: PEX inbound (committed `6b23cac`). `TorrentDownloader` consumes BEP 11 peer lists only; never advertises this client as a source.
   - P2: web-seed HTTP `Range`/resume. `TorrentFileWriter.partialFileResumeOffset(for:)` reports how many bytes of a file are already on disk (resumes from a `.tor` partial, truncates an oversized/corrupt partial to 0, or reports full length when a completed final file exists so the fetch is skipped). `downloadWebSeedFile` now sends `Range: bytes=offset-` and seeks to the offset on a `206`, rewrites from 0 on a `200` (server ignored the range), and fails over to the next seed/peers on any other status — so an interrupted web-seed download no longer restarts each file from byte 0. Added a resume-offset test covering fresh/partial/oversized/complete states.
@@ -57,7 +58,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 28 Swift Testing tests passed (latest add: peer-wire timeout teardown against a silent loopback peer).
+- **Tests:** Success, `swift test -c release`, 29 Swift Testing tests passed (latest add: DHT node id is 20 random non-constant bytes).
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -73,4 +74,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- All P0/P1 done. P2 done: verified-piece caching, `makePeerID` force-unwrap, web-seed `Range`/resume, PEX (inbound-only), and per-wait peer-wire timeouts. Cancellation-teardown hardening test is now covered by the silent-peer timeout test. Next up: P2 — remaining `SecRandomCopyBytes` force-unwrap and file selection + per-file progress; plus the last hardening test (integration tests from `~/Documents/Xcode/aTemp`).
+- All P0/P1 done. P2 done: verified-piece caching, `makePeerID` force-unwrap, web-seed `Range`/resume, PEX (inbound-only), per-wait peer-wire timeouts, and the `SecRandomCopyBytes`/`DHTClient.makeNodeID` force-unwrap. Cancellation-teardown hardening test is now covered by the silent-peer timeout test. Next up: P2 — file selection + per-file progress; plus the last hardening test (integration tests from `~/Documents/Xcode/aTemp`).

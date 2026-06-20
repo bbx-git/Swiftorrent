@@ -110,7 +110,6 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 
 ### P2 — Performance & polish
 
-- Reduce the remaining fragile force-unwrap in the `SecRandomCopyBytes` path.
 - Add file selection and per-file progress.
 
 ### Hardening tests

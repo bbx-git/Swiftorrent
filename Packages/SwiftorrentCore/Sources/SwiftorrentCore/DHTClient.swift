@@ -225,9 +225,8 @@ public struct DHTClient: Sendable {
     }
 
     static func makeNodeID() -> Data {
-        var data = Data(count: 20)
-        _ = data.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 20, $0.baseAddress!) }
-        return data
+        var generator = SystemRandomNumberGenerator()
+        return Data((0..<20).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
     }
 
     private static func transactionID() -> Data {

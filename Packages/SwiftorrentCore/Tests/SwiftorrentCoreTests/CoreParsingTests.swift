@@ -369,6 +369,15 @@ struct CoreParsingTests {
         #expect(peerID.starts(with: Data("-SW0001-".utf8)))
     }
 
+    @Test("DHT node id is 20 random bytes and not constant")
+    func makeNodeIDIsTwentyRandomBytes() throws {
+        let first = DHTClient.makeNodeID()
+        let second = DHTClient.makeNodeID()
+        #expect(first.count == 20)
+        #expect(second.count == 20)
+        #expect(first != second)
+    }
+
     @Test("Torrent writer refuses paths outside destination")
     func torrentWriterRefusesEscapedPaths() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
