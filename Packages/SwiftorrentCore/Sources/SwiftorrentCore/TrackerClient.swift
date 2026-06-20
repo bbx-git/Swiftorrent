@@ -15,14 +15,16 @@ public struct TrackerRequest: Sendable {
     public let announceURL: URL
     public let infoHash: Data
     public let peerID: Data
+    public let port: UInt16
     public let downloaded: Int64
     public let left: Int64
     public let event: String?
 
-    public init(announceURL: URL, infoHash: Data, peerID: Data, downloaded: Int64, left: Int64, event: String?) {
+    public init(announceURL: URL, infoHash: Data, peerID: Data, port: UInt16 = 6881, downloaded: Int64, left: Int64, event: String?) {
         self.announceURL = announceURL
         self.infoHash = infoHash
         self.peerID = peerID
+        self.port = port
         self.downloaded = downloaded
         self.left = left
         self.event = event
@@ -84,7 +86,7 @@ public struct TrackerClient: Sendable {
         absolute += [
             "info_hash=\(Self.percentEncode(request.infoHash))",
             "peer_id=\(Self.percentEncode(request.peerID))",
-            "port=0",
+            "port=\(request.port)",
             "uploaded=0",
             "downloaded=\(request.downloaded)",
             "left=\(request.left)",
@@ -174,7 +176,7 @@ public struct TrackerClient: Sendable {
         payload.appendUInt32(0)
         payload.appendUInt32(UInt32.random(in: UInt32.min...UInt32.max))
         payload.appendInt32(48)
-        payload.appendUInt16(0)
+        payload.appendUInt16(request.port)
 
         try await sendUDP(payload, on: connection)
         let response = try await receiveUDP(on: connection)

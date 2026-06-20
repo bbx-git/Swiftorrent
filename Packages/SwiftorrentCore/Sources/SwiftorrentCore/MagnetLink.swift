@@ -4,11 +4,15 @@ public struct MagnetLink: Equatable, Sendable {
     public let infoHash: Data
     public let displayName: String?
     public let trackers: [URL]
+    public let exactSources: [URL]
+    public let webSeeds: [URL]
 
-    public init(infoHash: Data, displayName: String?, trackers: [URL]) {
+    public init(infoHash: Data, displayName: String?, trackers: [URL], exactSources: [URL] = [], webSeeds: [URL] = []) {
         self.infoHash = infoHash
         self.displayName = displayName
         self.trackers = trackers
+        self.exactSources = exactSources
+        self.webSeeds = webSeeds
     }
 }
 
@@ -37,6 +41,8 @@ public struct MagnetLinkParser: Sendable {
 
         var displayName: String?
         var trackers: [URL] = []
+        var exactSources: [URL] = []
+        var webSeeds: [URL] = []
         var infoHash: Data?
 
         for item in components.queryItems ?? [] {
@@ -46,6 +52,14 @@ public struct MagnetLinkParser: Sendable {
             case "tr":
                 if let value = item.value, let url = URL(string: value) {
                     trackers.append(url)
+                }
+            case "xs":
+                if let value = item.value, let url = URL(string: value), url.isHTTPOrHTTPS {
+                    exactSources.append(url)
+                }
+            case "ws":
+                if let value = item.value, let url = URL(string: value), url.isHTTPOrHTTPS {
+                    webSeeds.append(url)
                 }
             case "xt":
                 guard let value = item.value else { continue }
@@ -59,7 +73,7 @@ public struct MagnetLinkParser: Sendable {
         }
 
         guard let infoHash else { throw MagnetLinkError.missingInfoHash }
-        return MagnetLink(infoHash: infoHash, displayName: displayName, trackers: trackers)
+        return MagnetLink(infoHash: infoHash, displayName: displayName, trackers: trackers, exactSources: exactSources, webSeeds: webSeeds)
     }
 
     private func decodeInfoHash(_ text: String) throws -> Data {
@@ -70,6 +84,12 @@ public struct MagnetLinkParser: Sendable {
             return data
         }
         throw MagnetLinkError.unsupportedInfoHash
+    }
+}
+
+private extension URL {
+    var isHTTPOrHTTPS: Bool {
+        scheme?.lowercased() == "http" || scheme?.lowercased() == "https"
     }
 }
 

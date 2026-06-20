@@ -13,12 +13,14 @@ public enum MagnetMetadataResolverError: Error, LocalizedError {
     case noSupportedTrackers
     case noPeers
     case metadataHashMismatch
+    case exactSourceInvalid
 
     public var errorDescription: String? {
         switch self {
         case .noSupportedTrackers: "No supported trackers or DHT bootstrap nodes are available for this magnet link yet."
         case .noPeers: "Trackers did not return any usable peers."
         case .metadataHashMismatch: "Downloaded magnet metadata did not match the magnet info hash."
+        case .exactSourceInvalid: "The exact-source torrent did not match the magnet info hash."
         }
     }
 }
@@ -27,15 +29,18 @@ public struct MagnetMetadataResolver: Sendable {
     private let trackerClient: TrackerClient
     private let dhtClient: DHTClient
     private let parser: TorrentMetainfoParser
+    private let session: URLSession
 
     public init(
         trackerClient: TrackerClient = TrackerClient(),
         dhtClient: DHTClient = DHTClient(),
-        parser: TorrentMetainfoParser = TorrentMetainfoParser()
+        parser: TorrentMetainfoParser = TorrentMetainfoParser(),
+        session: URLSession = .shared
     ) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
         self.parser = parser
+        self.session = session
     }
 
     public func resolve(
@@ -43,6 +48,10 @@ public struct MagnetMetadataResolver: Sendable {
         progress: @Sendable @escaping (MagnetMetadataProgress) async -> Void
     ) async throws -> TorrentMetainfo {
         try Task.checkCancellation()
+        if let metainfo = try await resolveFromExactSources(magnet: magnet, progress: progress) {
+            return metainfo
+        }
+
         let trackers = magnet.trackers.filter { url in
             guard let scheme = url.scheme?.lowercased() else { return false }
             return scheme == "http" || scheme == "https" || scheme == "udp"
@@ -70,6 +79,7 @@ public struct MagnetMetadataResolver: Sendable {
                 let metainfo = try parser.parseInfoDictionary(
                     data: infoData,
                     announceURLs: trackers,
+                    webSeedURLs: magnet.webSeeds,
                     preferredName: magnet.displayName
                 )
                 await progress(MagnetMetadataProgress(status: "Metadata resolved: \(metainfo.name)"))
@@ -82,6 +92,44 @@ public struct MagnetMetadataResolver: Sendable {
         }
 
         throw lastError ?? MagnetMetadataResolverError.noPeers
+    }
+
+    private func resolveFromExactSources(
+        magnet: MagnetLink,
+        progress: @Sendable @escaping (MagnetMetadataProgress) async -> Void
+    ) async throws -> TorrentMetainfo? {
+        var lastError: Error?
+        for source in magnet.exactSources {
+            try Task.checkCancellation()
+            do {
+                await progress(MagnetMetadataProgress(status: "Fetching metadata from exact source"))
+                var request = URLRequest(url: source)
+                request.timeoutInterval = 20
+                let (data, response) = try await session.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse,
+                      (200..<300).contains(httpResponse.statusCode) else {
+                    throw MagnetMetadataResolverError.exactSourceInvalid
+                }
+                let metainfo = try parser.parse(data: data).adding(
+                    announceURLs: magnet.trackers,
+                    webSeedURLs: magnet.webSeeds
+                )
+                guard metainfo.infoHash == magnet.infoHash else {
+                    throw MagnetMetadataResolverError.exactSourceInvalid
+                }
+                await progress(MagnetMetadataProgress(status: "Metadata resolved: \(metainfo.name)"))
+                return metainfo
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+            }
+        }
+
+        if !magnet.exactSources.isEmpty, magnet.trackers.isEmpty {
+            throw lastError ?? MagnetMetadataResolverError.exactSourceInvalid
+        }
+        return nil
     }
 
     private func collectPeers(trackers: [URL], magnet: MagnetLink, peerID: Data) async throws -> [PeerEndpoint] {
@@ -98,7 +146,7 @@ public struct MagnetMetadataResolver: Sendable {
                             infoHash: magnet.infoHash,
                             peerID: peerID,
                             downloaded: 0,
-                            left: Int64.max,
+                            left: 0,
                             event: "started"
                         )
                         return .success(try await trackerClient.announce(request))

@@ -164,29 +164,37 @@ public struct SwiftorrentRootView: View {
                     .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(selection: $selectedItemID) {
-                    ForEach(session.items) { item in
-                        TorrentRow(item: item, isSelected: selectedItemID == item.id) {
-                            requestRemoval(for: item)
-                        }
-                        .tag(item.id)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            selectedItemID = item.id
-                        }
-                        .contextMenu {
-                            Button("Remove Torrent...", role: .destructive) {
-                                selectedItemID = item.id
-                                requestRemoval(for: item)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(session.items) { item in
+                                TorrentRow(item: item, isSelected: selectedItemID == item.id) {
+                                    requestRemoval(for: item)
+                                }
+                                .id(item.id)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    selectedItemID = item.id
+                                }
+                                .contextMenu {
+                                    Button("Remove Torrent...", role: .destructive) {
+                                        selectedItemID = item.id
+                                        requestRemoval(for: item)
+                                    }
+                                }
                             }
                         }
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                        .listRowInsets(EdgeInsets(top: 7, leading: 20, bottom: 7, trailing: 20))
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 18)
+                    }
+                    .scrollContentBackground(.hidden)
+                    .onChange(of: session.items.first?.id) { _, firstID in
+                        guard let firstID else { return }
+                        withAnimation(.snappy(duration: 0.18)) {
+                            proxy.scrollTo(firstID, anchor: .top)
+                        }
                     }
                 }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
                 .onDeleteCommand {
                     requestRemovalForSelection()
                 }
@@ -248,8 +256,8 @@ private struct TorrentRow: View {
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 9)
                         .padding(.vertical, 4)
-                        .foregroundStyle(color)
-                        .glassEffect(.regular.tint(color.opacity(0.18)), in: Capsule())
+                        .foregroundStyle(badgeForeground)
+                        .glassEffect(.regular.tint(badgeColor.opacity(0.55)), in: Capsule())
                 }
 
                 ProgressView(value: item.progress)
@@ -263,6 +271,7 @@ private struct TorrentRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Button(role: .destructive, action: remove) {
                 Image(systemName: "xmark")
@@ -285,9 +294,25 @@ private struct TorrentRow: View {
     private var color: Color {
         switch item.state {
         case .queued: .secondary
-        case .downloading: .swiftorrentGraphite
-        case .complete: .primary
-        case .failed: .secondary
+        case .downloading: .swiftorrentGreen
+        case .complete: .swiftorrentBlue
+        case .failed: .swiftorrentRed
+        }
+    }
+
+    private var badgeColor: Color {
+        switch item.state {
+        case .queued: .swiftorrentSmoke
+        case .downloading: .swiftorrentGreen
+        case .complete: .swiftorrentBlue
+        case .failed: .swiftorrentRed
+        }
+    }
+
+    private var badgeForeground: Color {
+        switch item.state {
+        case .queued: .primary
+        case .downloading, .complete, .failed: .white
         }
     }
 }
@@ -314,6 +339,9 @@ private extension Color {
     static let swiftorrentGraphite = Color(red: 0.18, green: 0.18, blue: 0.19)
     static let swiftorrentSmoke = Color(red: 0.46, green: 0.46, blue: 0.48)
     static let swiftorrentPanel = Color.black.opacity(0.08)
+    static let swiftorrentGreen = Color(red: 0.05, green: 0.58, blue: 0.28)
+    static let swiftorrentBlue = Color(red: 0.08, green: 0.38, blue: 0.82)
+    static let swiftorrentRed = Color(red: 0.82, green: 0.12, blue: 0.12)
 }
 
 extension UTType {

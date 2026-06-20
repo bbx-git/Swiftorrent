@@ -21,17 +21,20 @@ public struct TorrentDownloadProgress: Sendable {
 public struct TorrentDownloader: Sendable {
     private let trackerClient: any TrackerAnnouncing
     private let dhtClient: any DHTPeerFinding
+    private let session: URLSession
     private let maxPeerAttempts = 24
     private let maxPeerConnections = 4
 
-    public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient()) {
+    public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient(), session: URLSession = .shared) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
+        self.session = session
     }
 
-    init(trackerClient: any TrackerAnnouncing, dhtClient: any DHTPeerFinding) {
+    init(trackerClient: any TrackerAnnouncing, dhtClient: any DHTPeerFinding, session: URLSession = .shared) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
+        self.session = session
     }
 
     public func download(
@@ -50,6 +53,28 @@ public struct TorrentDownloader: Sendable {
             try writer.finalize()
             await progress(TorrentDownloadProgress(status: "Complete. Existing files verified. No seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
             return
+        }
+
+        if !metainfo.webSeedURLs.isEmpty {
+            do {
+                try await downloadFromWebSeeds(
+                    metainfo: metainfo,
+                    writer: writer,
+                    initialDownloaded: initialDownloaded,
+                    progress: progress
+                )
+                let verifiedPieces = try writer.verifiedPieces()
+                let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
+                if verifiedBytes >= metainfo.totalSize {
+                    try writer.finalize()
+                    await progress(TorrentDownloadProgress(status: "Complete. Downloaded from web seed. No seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+                    return
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                await progress(TorrentDownloadProgress(status: "Web seed failed. Contacting trackers and DHT", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+            }
         }
 
         let peerID = Self.makePeerID()
@@ -84,6 +109,80 @@ public struct TorrentDownloader: Sendable {
             await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
             return
         }
+    }
+
+    private func downloadFromWebSeeds(
+        metainfo: TorrentMetainfo,
+        writer: TorrentFileWriter,
+        initialDownloaded: Int64,
+        progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
+    ) async throws {
+        var lastError: Error?
+        for webSeedURL in metainfo.webSeedURLs {
+            try Task.checkCancellation()
+            do {
+                var downloadedBytes = initialDownloaded
+                for file in metainfo.files {
+                    try Task.checkCancellation()
+                    let sourceURL = webSeedURL.appendingTorrentRelativePath(file.path)
+                    await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: downloadedBytes, totalBytes: metainfo.totalSize))
+                    downloadedBytes += try await downloadWebSeedFile(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: downloadedBytes) { currentDownloadedBytes in
+                        await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: currentDownloadedBytes, totalBytes: metainfo.totalSize))
+                    }
+                }
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? TrackerClientError.invalidResponse
+    }
+
+    private func downloadWebSeedFile(
+        from sourceURL: URL,
+        file: TorrentFile,
+        writer: TorrentFileWriter,
+        progressDownloadedBytes: Int64,
+        progress: @Sendable @escaping (Int64) async -> Void
+    ) async throws -> Int64 {
+        var request = URLRequest(url: sourceURL)
+        request.timeoutInterval = 30
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode) else {
+            throw TrackerClientError.invalidResponse
+        }
+
+        let partialURL = try writer.preparePartialFile(for: file)
+        let handle = try FileHandle(forWritingTo: partialURL)
+        var fileDownloadedBytes: Int64 = 0
+        var buffer = Data()
+        buffer.reserveCapacity(64 * 1024)
+        do {
+            defer { try? handle.close() }
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                buffer.append(byte)
+                if buffer.count >= 64 * 1024 {
+                    try handle.write(contentsOf: buffer)
+                    fileDownloadedBytes += Int64(buffer.count)
+                    buffer.removeAll(keepingCapacity: true)
+                    await progress(progressDownloadedBytes + fileDownloadedBytes)
+                }
+            }
+            if !buffer.isEmpty {
+                try handle.write(contentsOf: buffer)
+                fileDownloadedBytes += Int64(buffer.count)
+                await progress(progressDownloadedBytes + fileDownloadedBytes)
+            }
+        } catch { throw error }
+
+        guard fileDownloadedBytes == file.length else {
+            throw TrackerClientError.invalidResponse
+        }
+        return fileDownloadedBytes
     }
 
     private func downloadPiecesConcurrently(
@@ -329,6 +428,14 @@ public struct TorrentDownloader: Sendable {
     }
 }
 
+private extension URL {
+    func appendingTorrentRelativePath(_ path: String) -> URL {
+        path.split(separator: "/").reduce(self) { url, component in
+            url.appendingPathComponent(String(component))
+        }
+    }
+}
+
 protocol TrackerAnnouncing: Sendable {
     func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint]
 }
@@ -473,6 +580,16 @@ struct TorrentFileWriter: Sendable {
             }
             try FileManager.default.moveItem(at: partialURL, to: finalURL)
         }
+    }
+
+    func preparePartialFile(for file: TorrentFile) throws -> URL {
+        let partialURL = try outputURL(for: file, partial: true)
+        try FileManager.default.createDirectory(at: partialURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: partialURL.path) {
+            try FileManager.default.removeItem(at: partialURL)
+        }
+        FileManager.default.createFile(atPath: partialURL.path, contents: nil)
+        return partialURL
     }
 
     func read(pieceIndex: Int, length: Int) throws -> Data? {

@@ -22,6 +22,7 @@ public struct TorrentMetainfo: Equatable, Sendable {
     public let totalSize: Int64
     public let infoHash: Data
     public let infoDictionaryData: Data
+    public let webSeedURLs: [URL]
 
     public var displaySize: String {
         ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)
@@ -35,7 +36,8 @@ public struct TorrentMetainfo: Equatable, Sendable {
         pieceHashes: [Data],
         totalSize: Int64,
         infoHash: Data,
-        infoDictionaryData: Data
+        infoDictionaryData: Data,
+        webSeedURLs: [URL] = []
     ) {
         self.name = name
         self.announceURLs = announceURLs
@@ -45,6 +47,25 @@ public struct TorrentMetainfo: Equatable, Sendable {
         self.totalSize = totalSize
         self.infoHash = infoHash
         self.infoDictionaryData = infoDictionaryData
+        self.webSeedURLs = webSeedURLs
+    }
+
+    public func adding(announceURLs additionalAnnounceURLs: [URL] = [], webSeedURLs additionalWebSeedURLs: [URL] = []) -> TorrentMetainfo {
+        TorrentMetainfo(
+            name: name,
+            announceURLs: Self.uniqueURLs(announceURLs + additionalAnnounceURLs),
+            files: files,
+            pieceLength: pieceLength,
+            pieceHashes: pieceHashes,
+            totalSize: totalSize,
+            infoHash: infoHash,
+            infoDictionaryData: infoDictionaryData,
+            webSeedURLs: Self.uniqueURLs(webSeedURLs + additionalWebSeedURLs)
+        )
+    }
+
+    private static func uniqueURLs(_ urls: [URL]) -> [URL] {
+        Array(Set(urls)).sorted { $0.absoluteString < $1.absoluteString }
     }
 }
 
@@ -81,21 +102,29 @@ public struct TorrentMetainfoParser: Sendable {
             throw TorrentMetainfoError.missingInfoDictionary
         }
 
-        return try parseInfoDictionary(infoNode: infoNode, info: info, announceURLs: parseAnnounces(root: root), preferredName: nil, sourceData: data)
+        return try parseInfoDictionary(
+            infoNode: infoNode,
+            info: info,
+            announceURLs: parseAnnounces(root: root),
+            webSeedURLs: parseWebSeeds(root: root),
+            preferredName: nil,
+            sourceData: data
+        )
     }
 
-    public func parseInfoDictionary(data: Data, announceURLs: [URL], preferredName: String? = nil) throws -> TorrentMetainfo {
+    public func parseInfoDictionary(data: Data, announceURLs: [URL], webSeedURLs: [URL] = [], preferredName: String? = nil) throws -> TorrentMetainfo {
         let infoNode = try BencodeParser(data: data).parse()
         guard case let .dictionary(info) = infoNode.value else {
             throw TorrentMetainfoError.missingInfoDictionary
         }
-        return try parseInfoDictionary(infoNode: infoNode, info: info, announceURLs: announceURLs, preferredName: preferredName, sourceData: data)
+        return try parseInfoDictionary(infoNode: infoNode, info: info, announceURLs: announceURLs, webSeedURLs: webSeedURLs, preferredName: preferredName, sourceData: data)
     }
 
     private func parseInfoDictionary(
         infoNode: BencodeNode,
         info: [String: BencodeNode],
         announceURLs: [URL],
+        webSeedURLs: [URL],
         preferredName: String?,
         sourceData: Data
     ) throws -> TorrentMetainfo {
@@ -132,7 +161,8 @@ public struct TorrentMetainfoParser: Sendable {
             pieceHashes: pieces,
             totalSize: totalSize,
             infoHash: Data(digest),
-            infoDictionaryData: infoData
+            infoDictionaryData: infoData,
+            webSeedURLs: webSeedURLs
         )
     }
 
@@ -148,6 +178,21 @@ public struct TorrentMetainfoParser: Sendable {
                     if let text = entry.value.stringValue, let url = URL(string: text) {
                         urls.append(url)
                     }
+                }
+            }
+        }
+        return Array(Set(urls)).sorted { $0.absoluteString < $1.absoluteString }
+    }
+
+    private func parseWebSeeds(root: [String: BencodeNode]) -> [URL] {
+        guard let node = root["url-list"] else { return [] }
+        var urls: [URL] = []
+        if let text = node.value.stringValue, let url = URL(string: text), url.isHTTPOrHTTPS {
+            urls.append(url)
+        } else if case let .list(entries) = node.value {
+            for entry in entries {
+                if let text = entry.value.stringValue, let url = URL(string: text), url.isHTTPOrHTTPS {
+                    urls.append(url)
                 }
             }
         }
@@ -193,5 +238,11 @@ public struct TorrentMetainfoParser: Sendable {
             return nil
         }
         return cleaned
+    }
+}
+
+private extension URL {
+    var isHTTPOrHTTPS: Bool {
+        scheme?.lowercased() == "http" || scheme?.lowercased() == "https"
     }
 }

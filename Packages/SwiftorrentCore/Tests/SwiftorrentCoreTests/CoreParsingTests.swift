@@ -27,10 +27,12 @@ struct CoreParsingTests {
     @Test("Magnet parser keeps HTTP trackers from long links")
     func magnetTrackers() throws {
         let magnet = try MagnetLinkParser().parse(
-            "magnet:?xt=urn:btih:6A8F134C989C1ECF961CED4AC0B32CC5B615B287&dn=Example&tr=udp%3A%2F%2Ftracker.example.invalid%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.example.invalid%3A8080%2Fannounce&tr=https%3A%2F%2Fsecure.example.invalid%2Fannounce"
+            "magnet:?xt=urn:btih:6A8F134C989C1ECF961CED4AC0B32CC5B615B287&dn=Example&tr=udp%3A%2F%2Ftracker.example.invalid%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.example.invalid%3A8080%2Fannounce&tr=https%3A%2F%2Fsecure.example.invalid%2Fannounce&xs=https%3A%2F%2Fexample.invalid%2Fexample.torrent&ws=https%3A%2F%2Fexample.invalid%2Fdownloads%2F"
         )
         #expect(magnet.infoHash.map { String(format: "%02X", $0) }.joined() == "6A8F134C989C1ECF961CED4AC0B32CC5B615B287")
         #expect(magnet.trackers.filter { $0.scheme == "http" || $0.scheme == "https" }.count == 2)
+        #expect(magnet.exactSources == [URL(string: "https://example.invalid/example.torrent")!])
+        #expect(magnet.webSeeds == [URL(string: "https://example.invalid/downloads/")!])
     }
 
     @Test("Bencode encoder sorts dictionary keys")
@@ -56,6 +58,30 @@ struct CoreParsingTests {
         let data = Data([0x00, 0x20, 0x2F, 0x41, 0x7A, 0xFF])
 
         #expect(TrackerClient.percentEncode(data) == "%00%20%2FAz%FF")
+    }
+
+    @Test("Tracker requests announce a real peer port")
+    func trackerRequestPort() {
+        let request = TrackerRequest(
+            announceURL: URL(string: "http://tracker.example.invalid/announce")!,
+            infoHash: Data(repeating: 0, count: 20),
+            peerID: Data(repeating: 1, count: 20),
+            downloaded: 0,
+            left: 0,
+            event: "started"
+        )
+        let customPortRequest = TrackerRequest(
+            announceURL: request.announceURL,
+            infoHash: request.infoHash,
+            peerID: request.peerID,
+            port: 51413,
+            downloaded: 0,
+            left: 0,
+            event: nil
+        )
+
+        #expect(request.port == 6881)
+        #expect(customPortRequest.port == 51413)
     }
 
     @Test("Tracker compact peers parse IPv4 endpoints")
@@ -152,6 +178,17 @@ struct CoreParsingTests {
         #expect(metainfo.pieceLength == 3)
         #expect(metainfo.pieceHashes.count == 2)
         #expect(metainfo.totalSize == 5)
+    }
+
+    @Test("Torrent parser keeps HTTP web seeds")
+    func torrentWebSeeds() throws {
+        var torrent = Data("d8:url-listl30:https://example.invalid/files/28:ftp://example.invalid/files/e4:infod6:lengthi1e4:name4:file12:piece lengthi1e6:pieces20:".utf8)
+        torrent.append(Data(repeating: 0, count: 20))
+        torrent.append(Data("ee".utf8))
+
+        let metainfo = try TorrentMetainfoParser().parse(data: torrent)
+
+        #expect(metainfo.webSeedURLs == [URL(string: "https://example.invalid/files/")!])
     }
 
     @Test("Torrent writer writes and verifies pieces across file boundaries")
