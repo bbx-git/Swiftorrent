@@ -30,36 +30,43 @@ public struct TorrentDownloader: Sendable {
         destination: URL,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws {
+        try Task.checkCancellation()
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         try ensureAvailableCapacity(for: metainfo.totalSize, at: destination)
 
         let peerID = Self.makePeerID()
         await progress(TorrentDownloadProgress(status: "Contacting trackers", downloadedBytes: 0, totalBytes: metainfo.totalSize))
         let peers = try await collectPeers(for: metainfo, peerID: peerID, event: "started")
-        guard !peers.isEmpty else {
-            throw TrackerClientError.invalidResponse
-        }
-
-        var lastError: Error?
-        for peer in peers.shuffled().prefix(maxPeerAttempts) {
-            do {
-                let downloaded = try await downloadAllPieces(
-                    metainfo: metainfo,
-                    destination: destination,
-                    peer: peer,
-                    peerID: peerID,
-                    progress: progress
-                )
-                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
-                await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
-                return
-            } catch {
-                lastError = error
-                await progress(TorrentDownloadProgress(status: "Peer \(peer.host):\(peer.port) failed. Trying another peer.", downloadedBytes: 0, totalBytes: metainfo.totalSize))
+        do {
+            try Task.checkCancellation()
+            guard !peers.isEmpty else {
+                throw TrackerClientError.invalidResponse
             }
-        }
 
-        throw lastError ?? TrackerClientError.invalidResponse
+            var lastError: Error?
+            for peer in peers.shuffled().prefix(maxPeerAttempts) {
+                try Task.checkCancellation()
+                do {
+                    let downloaded = try await downloadAllPieces(
+                        metainfo: metainfo,
+                        destination: destination,
+                        peer: peer,
+                        peerID: peerID,
+                        progress: progress
+                    )
+                    _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
+                    await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
+                    return
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    lastError = error
+                    await progress(TorrentDownloadProgress(status: "Peer \(peer.host):\(peer.port) failed. Trying another peer.", downloadedBytes: 0, totalBytes: metainfo.totalSize))
+                }
+            }
+
+            throw lastError ?? TrackerClientError.invalidResponse
+        }
     }
 
     private func downloadAllPieces(
@@ -74,12 +81,14 @@ public struct TorrentDownloader: Sendable {
         defer { Task { await client.close() } }
 
         await progress(TorrentDownloadProgress(status: "Connecting to peer \(peer.host):\(peer.port)", downloadedBytes: 0, totalBytes: metainfo.totalSize))
+        try Task.checkCancellation()
         try await withTimeout(seconds: .seconds(20)) {
             try await client.connect()
         }
 
         var downloaded: Int64 = 0
         for pieceIndex in metainfo.pieceHashes.indices {
+            try Task.checkCancellation()
             let pieceLength = pieceLength(for: pieceIndex, metainfo: metainfo)
             await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: downloaded, totalBytes: metainfo.totalSize))
             let piece = try await withTimeout(seconds: .seconds(60)) {
@@ -104,6 +113,7 @@ public struct TorrentDownloader: Sendable {
         var lastError: Error?
 
         for url in metainfo.announceURLs {
+            try Task.checkCancellation()
             do {
                 let request = TrackerRequest(
                     announceURL: url,

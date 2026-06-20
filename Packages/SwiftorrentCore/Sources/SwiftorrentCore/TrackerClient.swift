@@ -53,6 +53,7 @@ public struct TrackerClient: Sendable {
     }
 
     public func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
+        try Task.checkCancellation()
         guard let scheme = request.announceURL.scheme?.lowercased() else {
             throw TrackerClientError.unsupportedScheme(request.announceURL.scheme ?? "unknown")
         }
@@ -115,6 +116,7 @@ public struct TrackerClient: Sendable {
     }
 
     private func waitUntilReady(_ connection: NWConnection) async throws {
+        try Task.checkCancellation()
         try await withTimeout(seconds: .seconds(10)) {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 connection.stateUpdateHandler = { state in
@@ -138,6 +140,7 @@ public struct TrackerClient: Sendable {
     }
 
     private func udpConnect(_ connection: NWConnection) async throws -> Int64 {
+        try Task.checkCancellation()
         let transactionID = UInt32.random(in: UInt32.min...UInt32.max)
         var payload = Data()
         payload.appendUInt64(0x0000_0417_2710_1980)
@@ -156,6 +159,7 @@ public struct TrackerClient: Sendable {
     }
 
     private func udpAnnounce(_ connection: NWConnection, connectionID: Int64, request: TrackerRequest) async throws -> [PeerEndpoint] {
+        try Task.checkCancellation()
         let transactionID = UInt32.random(in: UInt32.min...UInt32.max)
         var payload = Data()
         payload.appendInt64(connectionID)
@@ -193,6 +197,7 @@ public struct TrackerClient: Sendable {
     }
 
     private func sendUDP(_ data: Data, on connection: NWConnection) async throws {
+        try Task.checkCancellation()
         try await withTimeout(seconds: .seconds(10)) {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 connection.send(content: data, completion: .contentProcessed { error in
@@ -207,7 +212,8 @@ public struct TrackerClient: Sendable {
     }
 
     private func receiveUDP(on connection: NWConnection) async throws -> Data {
-        try await withTimeout(seconds: .seconds(15)) {
+        try Task.checkCancellation()
+        return try await withTimeout(seconds: .seconds(15)) {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
                 connection.receiveMessage { data, _, _, error in
                     if let error {

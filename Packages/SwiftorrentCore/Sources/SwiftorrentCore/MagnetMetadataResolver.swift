@@ -36,6 +36,7 @@ public struct MagnetMetadataResolver: Sendable {
         magnet: MagnetLink,
         progress: @Sendable @escaping (MagnetMetadataProgress) async -> Void
     ) async throws -> TorrentMetainfo {
+        try Task.checkCancellation()
         let trackers = magnet.trackers.filter { url in
             guard let scheme = url.scheme?.lowercased() else { return false }
             return scheme == "http" || scheme == "https" || scheme == "udp"
@@ -51,6 +52,7 @@ public struct MagnetMetadataResolver: Sendable {
         var lastError: Error?
 
         for peer in peers.prefix(24) {
+            try Task.checkCancellation()
             do {
                 let infoData = try await withTimeout(seconds: .seconds(20)) {
                     try await fetchMetadata(from: peer, magnet: magnet, peerID: peerID)
@@ -66,6 +68,8 @@ public struct MagnetMetadataResolver: Sendable {
                 )
                 await progress(MagnetMetadataProgress(status: "Metadata resolved: \(metainfo.name)"))
                 return metainfo
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 lastError = error
             }
@@ -82,6 +86,7 @@ public struct MagnetMetadataResolver: Sendable {
             for tracker in trackers {
                 group.addTask {
                     do {
+                        try Task.checkCancellation()
                         let request = TrackerRequest(
                             announceURL: tracker,
                             infoHash: magnet.infoHash,
@@ -98,6 +103,10 @@ public struct MagnetMetadataResolver: Sendable {
             }
 
             for await result in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
                 switch result {
                 case let .success(endpoints):
                     peers.formUnion(endpoints)
@@ -107,6 +116,7 @@ public struct MagnetMetadataResolver: Sendable {
             }
         }
 
+        try Task.checkCancellation()
         if peers.isEmpty, let lastError {
             throw lastError
         }
@@ -121,20 +131,29 @@ public struct MagnetMetadataResolver: Sendable {
     }
 }
 
+public enum TimeoutError: Error, LocalizedError {
+    case timedOut
+
+    public var errorDescription: String? {
+        "The network operation timed out."
+    }
+}
+
 public func withTimeout<T: Sendable>(
     seconds: Duration,
     operation: @Sendable @escaping () async throws -> T
 ) async throws -> T {
     try await withThrowingTaskGroup(of: T.self) { group in
         group.addTask {
-            try await operation()
+            try Task.checkCancellation()
+            return try await operation()
         }
         group.addTask {
             try await Task.sleep(for: seconds)
-            throw CancellationError()
+            throw TimeoutError.timedOut
         }
         guard let result = try await group.next() else {
-            throw CancellationError()
+            throw TimeoutError.timedOut
         }
         group.cancelAll()
         return result

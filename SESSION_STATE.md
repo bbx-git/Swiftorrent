@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Add cancellation that stops active peer and tracker work when a row is removed.
+- **Next Immediate Step:** Add resume data and existing-piece verification.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -23,17 +23,18 @@
   - Added first-pass peer-wire download path for `.torrent` files.
   - Added BEP 10/BEP 9 magnet metadata resolution for peers discovered through HTTP/HTTPS or UDP trackers.
   - Added manual `.app` bundling metadata for `.torrent` and `magnet:` open support.
+  - Added per-row task cancellation so removing a torrent stops active tracker/peer work.
+  - Added torrent output path sanitization and parser tests for unsafe paths.
 - **In Progress:**
-  - Cancellation and resume support are not implemented yet.
+  - Resume support is not implemented yet.
 - **Recent Fixes (Anti-Regression):**
-  - Added UDP tracker connect/announce support through Network UDP connections.
-  - Added peer retry/rotation and per-peer connect/piece timeouts for downloads.
-  - Fixed install guidance to copy packaged builds to `~/Applications`, not `/Applications`.
+  - Removing a torrent row now cancels the item task and cooperative cancellation checks stop tracker, magnet, and peer loops.
+  - Torrent metainfo parsing now sanitizes single-file names and multi-file path components before writing.
+  - Fixed piece hash extraction to use `Data` slice indices safely.
 
 ## Known Issues / Technical Debt
 - Magnet resolution can use HTTP/HTTPS and UDP tracker peers, but DHT and PEX are still missing.
-- Downloader retries peers with basic timeouts, but still needs multiple concurrent peers, piece availability tracking, resume data, cancellation, and existing-piece verification.
-- Torrent file paths still need sanitization before writing.
+- Downloader retries peers with basic timeouts, but still needs multiple concurrent peers, piece availability tracking, resume data, and existing-piece verification.
 - Manual app bundling is required because the current project is an SPM executable instead of a native Xcode app target.
 - The user-provided magnet was used only for parser/hash/tracker-shape verification, not media download. Future external test assets must use `~/Documents/Xcode/aTemp`.
 
@@ -45,7 +46,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 4 Swift Testing tests passed.
+- **Tests:** Success, `swift test -c release`, 6 Swift Testing tests passed.
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -61,4 +62,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- Start with cancellation support in `TorrentSession`, then add path sanitization tests and resume/existing-piece verification.
+- Start with resume data and existing-piece verification, then add multi-file writer and piece length tests.

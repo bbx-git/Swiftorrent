@@ -115,8 +115,13 @@ public struct TorrentMetainfoParser: Sendable {
         let totalSize = files.reduce(Int64(0)) { $0 + $1.length }
         let infoData = Data(sourceData[infoNode.range])
         let digest = Insecure.SHA1.hash(data: infoData)
-        let pieces = stride(from: 0, to: pieceBlob.count, by: 20).map {
-            Data(pieceBlob[$0..<($0 + 20)])
+        var pieces: [Data] = []
+        pieces.reserveCapacity(pieceBlob.count / 20)
+        var pieceOffset = pieceBlob.startIndex
+        while pieceOffset < pieceBlob.endIndex {
+            let nextOffset = pieceBlob.index(pieceOffset, offsetBy: 20)
+            pieces.append(Data(pieceBlob[pieceOffset..<nextOffset]))
+            pieceOffset = nextOffset
         }
 
         return TorrentMetainfo(
@@ -151,13 +156,14 @@ public struct TorrentMetainfoParser: Sendable {
 
     private func parseFiles(info: [String: BencodeNode], name: String) throws -> [TorrentFile] {
         if let length = info["length"]?.value.intValue {
-            return [TorrentFile(id: 0, path: name, length: length)]
+            return [TorrentFile(id: 0, path: sanitizePath(components: [name], fallback: "download"), length: length)]
         }
 
         guard case let .list(fileNodes)? = info["files"]?.value else {
             throw TorrentMetainfoError.missingLength
         }
 
+        let rootName = sanitizePathComponent(name) ?? "download"
         return try fileNodes.enumerated().map { index, node in
             guard case let .dictionary(fileDictionary) = node.value,
                   let length = fileDictionary["length"]?.value.intValue,
@@ -165,7 +171,27 @@ public struct TorrentMetainfoParser: Sendable {
                 throw TorrentMetainfoError.missingLength
             }
             let components = pathNodes.compactMap(\.value.stringValue)
-            return TorrentFile(id: index, path: ([name] + components).joined(separator: "/"), length: length)
+            let filePath = sanitizePath(components: components, fallback: "file-\(index)")
+            return TorrentFile(id: index, path: ([rootName, filePath]).joined(separator: "/"), length: length)
         }
+    }
+
+    private func sanitizePath(components: [String], fallback: String) -> String {
+        let sanitized = components.compactMap(sanitizePathComponent)
+        guard !sanitized.isEmpty else { return fallback }
+        return sanitized.joined(separator: "/")
+    }
+
+    private func sanitizePathComponent(_ component: String) -> String? {
+        let cleaned = component
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              cleaned != ".",
+              cleaned != ".." else {
+            return nil
+        }
+        return cleaned
     }
 }

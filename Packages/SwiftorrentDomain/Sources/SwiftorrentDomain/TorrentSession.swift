@@ -12,6 +12,7 @@ public final class TorrentSession {
     private let magnetParser = MagnetLinkParser()
     private let magnetResolver = MagnetMetadataResolver()
     private let downloader = TorrentDownloader()
+    private var tasks: [TorrentItem.ID: Task<Void, Never>] = [:]
 
     public init(destination: URL = DefaultDownloadDirectory.url()) {
         self.destination = destination
@@ -22,28 +23,44 @@ public final class TorrentSession {
     }
 
     public func addTorrentFile(_ url: URL) {
-        Task {
+        let item = TorrentItem(name: url.lastPathComponent, source: .torrentFile(url), destination: destination, totalBytes: 0)
+        items.insert(item, at: 0)
+        tasks[item.id] = Task {
+            defer { tasks[item.id] = nil }
             do {
                 let data = try Data(contentsOf: url)
+                try Task.checkCancellation()
                 let metainfo = try metainfoParser.parse(data: data)
-                let item = TorrentItem(name: metainfo.name, source: .torrentFile(url), destination: destination, totalBytes: metainfo.totalSize)
-                items.insert(item, at: 0)
+                update(item.id) {
+                    $0.name = metainfo.name
+                    $0.totalBytes = metainfo.totalSize
+                    $0.status = "Starting download."
+                }
                 try await start(itemID: item.id, metainfo: metainfo)
+            } catch is CancellationError {
+                return
             } catch {
-                items.insert(TorrentItem.failed(name: url.lastPathComponent, message: error.localizedDescription, destination: destination), at: 0)
+                update(item.id) {
+                    $0.status = error.localizedDescription
+                    $0.state = .failed
+                }
             }
         }
     }
 
     public func addMagnet(_ text: String) {
-        Task {
-            var pendingItemID: TorrentItem.ID?
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let item = TorrentItem(name: "Magnet link", source: .magnet(trimmedText), destination: destination, totalBytes: 0)
+        items.insert(item, at: 0)
+        tasks[item.id] = Task {
+            defer { tasks[item.id] = nil }
             do {
-                let magnet = try magnetParser.parse(text)
+                let magnet = try magnetParser.parse(trimmedText)
                 let name = magnet.displayName ?? "Magnet \(magnet.infoHash.map { String(format: "%02x", $0) }.joined().prefix(8))"
-                let item = TorrentItem(name: name, source: .magnet(text), destination: destination, totalBytes: 0)
-                pendingItemID = item.id
-                items.insert(item, at: 0)
+                update(item.id) {
+                    $0.name = name
+                    $0.status = "Resolving metadata."
+                }
                 let metainfo = try await magnetResolver.resolve(magnet: magnet) { [weak self] progress in
                     await self?.update(item.id) {
                         $0.status = progress.status
@@ -56,20 +73,20 @@ public final class TorrentSession {
                     $0.status = "Metadata resolved. Starting download."
                 }
                 try await start(itemID: item.id, metainfo: metainfo)
+            } catch is CancellationError {
+                return
             } catch {
-                if let pendingItemID {
-                    update(pendingItemID) {
-                        $0.status = error.localizedDescription
-                        $0.state = .failed
-                    }
-                } else {
-                    items.insert(TorrentItem.failed(name: "Magnet link", message: error.localizedDescription, destination: destination), at: 0)
+                update(item.id) {
+                    $0.status = error.localizedDescription
+                    $0.state = .failed
                 }
             }
         }
     }
 
     public func remove(_ item: TorrentItem) {
+        tasks[item.id]?.cancel()
+        tasks[item.id] = nil
         items.removeAll { $0.id == item.id }
     }
 

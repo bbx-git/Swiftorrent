@@ -40,4 +40,26 @@ struct CoreParsingTests {
         ])
         #expect(String(data: encoded, encoding: .utf8) == "d8:msg_typei0e5:piecei3ee")
     }
+
+    @Test("Torrent parser sanitizes unsafe output paths")
+    func torrentPathsAreSanitized() throws {
+        var info = Data("d5:filesld6:lengthi1e4:pathl2:..9:file/nameeee4:name4:Root12:piece lengthi1e6:pieces20:".utf8)
+        info.append(Data(repeating: 0, count: 20))
+        info.append(UInt8(ascii: "e"))
+
+        let metainfo = try TorrentMetainfoParser().parseInfoDictionary(data: info, announceURLs: [])
+
+        #expect(metainfo.files.map(\.path) == ["Root/file_name"])
+    }
+
+    @Test("Torrent parser keeps single-file paths relative")
+    func singleFilePathIsRelative() throws {
+        var info = Data("d6:lengthi1e4:name9:/tmp/evil12:piece lengthi1e6:pieces20:".utf8)
+        info.append(Data(repeating: 0, count: 20))
+        info.append(UInt8(ascii: "e"))
+
+        let metainfo = try TorrentMetainfoParser().parseInfoDictionary(data: info, announceURLs: [])
+
+        #expect(metainfo.files.map(\.path) == ["_tmp_evil"])
+    }
 }

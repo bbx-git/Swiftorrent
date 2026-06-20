@@ -48,6 +48,7 @@ public actor PeerWireClient {
     }
 
     public func connect() async throws {
+        try Task.checkCancellation()
         let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: .tcp)
         self.connection = connection
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -78,6 +79,7 @@ public actor PeerWireClient {
     }
 
     public func fetchMetadata(pieceSize: Int = 16 * 1024) async throws -> Data {
+        try Task.checkCancellation()
         guard peerSupportsExtensions else { throw PeerWireError.extensionProtocolUnavailable }
         try await sendExtendedHandshake()
         try await readUntilMetadataHandshake()
@@ -90,6 +92,7 @@ public actor PeerWireClient {
         metadata.reserveCapacity(metadataSize)
 
         for piece in 0..<pieceCount {
+            try Task.checkCancellation()
             try await requestMetadataPiece(piece, extensionID: extensionID)
             let response = try await readMetadataPiece(expectedPiece: piece, extensionID: extensionID)
             metadata.append(response)
@@ -100,10 +103,12 @@ public actor PeerWireClient {
     }
 
     public func downloadPiece(index: Int, length: Int, expectedHash: Data, blockSize: Int = 16 * 1024) async throws -> Data {
+        try Task.checkCancellation()
         var piece = Data(count: length)
         var downloaded = 0
 
         while downloaded < length {
+            try Task.checkCancellation()
             if isChoked {
                 try await drainUntilUnchoked()
             }
@@ -136,6 +141,7 @@ public actor PeerWireClient {
 
     private func drainUntilUnchoked() async throws {
         while isChoked {
+            try Task.checkCancellation()
             let message = try await readMessage()
             if message.id == 1 {
                 isChoked = false
@@ -145,6 +151,7 @@ public actor PeerWireClient {
 
     private func readPieceBlock(expectedIndex: Int) async throws -> PieceBlock {
         while true {
+            try Task.checkCancellation()
             let message = try await readMessage()
             switch message.id {
             case 0:
@@ -176,6 +183,7 @@ public actor PeerWireClient {
 
     private func readUntilMetadataHandshake() async throws {
         while peerMetadataExtensionID == nil || metadataSize == nil {
+            try Task.checkCancellation()
             let message = try await readMessage()
             if message.id == 20 {
                 handleExtendedMessage(message.payload)
@@ -193,6 +201,7 @@ public actor PeerWireClient {
 
     private func readMetadataPiece(expectedPiece: Int, extensionID: UInt8) async throws -> Data {
         while true {
+            try Task.checkCancellation()
             let message = try await readMessage()
             guard message.id == 20 else { continue }
             guard let extendedID = message.payload.first else { throw PeerWireError.unexpectedMessage }
@@ -261,6 +270,7 @@ public actor PeerWireClient {
     }
 
     private func send(_ data: Data) async throws {
+        try Task.checkCancellation()
         guard let connection else { throw PeerWireError.disconnected }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
@@ -276,6 +286,7 @@ public actor PeerWireClient {
     private func receiveExactly(_ count: Int) async throws -> Data {
         var result = Data()
         while result.count < count {
+            try Task.checkCancellation()
             guard let connection else { throw PeerWireError.disconnected }
             let chunk = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: count - result.count) { data, _, isComplete, error in

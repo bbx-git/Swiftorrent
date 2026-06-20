@@ -124,12 +124,6 @@ public struct SwiftorrentRootView: View {
 
     private var header: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Downloads")
-                    .font(.largeTitle.bold())
-                Text("A pure Swift BitTorrent client with upload disabled.")
-                    .foregroundStyle(.secondary)
-            }
             Spacer()
             Metric(title: "Active", value: "\(session.items.filter { $0.state == .downloading }.count)")
             Metric(title: "Done", value: "\(session.items.filter { $0.state == .complete }.count)")
