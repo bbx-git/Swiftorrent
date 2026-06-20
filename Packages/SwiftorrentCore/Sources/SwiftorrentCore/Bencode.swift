@@ -120,7 +120,12 @@ public struct BencodeParser: Sendable {
             guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else {
                 throw BencodeError.invalidByteStringLength
             }
-            length = length * 10 + Int(byte - UInt8(ascii: "0"))
+            let digit = Int(byte - UInt8(ascii: "0"))
+            let (scaled, scaledOverflow) = length.multipliedReportingOverflow(by: 10)
+            guard !scaledOverflow else { throw BencodeError.invalidByteStringLength }
+            let (next, addOverflow) = scaled.addingReportingOverflow(digit)
+            guard !addOverflow else { throw BencodeError.invalidByteStringLength }
+            length = next
             data.formIndex(after: &index)
         }
 

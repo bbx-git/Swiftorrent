@@ -32,6 +32,11 @@ public enum PeerWireError: Error, LocalizedError {
 }
 
 public actor PeerWireClient {
+    /// Upper bound on a peer-advertised wire-message length, guarding against OOM from hostile peers.
+    static let maxMessageLength = 1024 * 1024
+    /// Upper bound on peer-advertised `metadata_size`, guarding against OOM from hostile peers.
+    static let maxMetadataSize = 10 * 1024 * 1024
+
     private let endpoint: PeerEndpoint
     private let infoHash: Data
     private let peerID: Data
@@ -51,22 +56,29 @@ public actor PeerWireClient {
 
     public func connect() async throws {
         try Task.checkCancellation()
-        let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: .tcp)
+        guard let port = NWEndpoint.Port(rawValue: endpoint.port) else {
+            throw PeerWireError.connectionFailed
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: port, using: .tcp)
         self.connection = connection
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    continuation.resume()
-                    connection.stateUpdateHandler = nil
-                case let .failed(error):
-                    continuation.resume(throwing: error)
-                    connection.stateUpdateHandler = nil
-                default:
-                    break
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        continuation.resume()
+                        connection.stateUpdateHandler = nil
+                    case let .failed(error):
+                        continuation.resume(throwing: error)
+                        connection.stateUpdateHandler = nil
+                    default:
+                        break
+                    }
                 }
+                connection.start(queue: .global(qos: .utility))
             }
-            connection.start(queue: .global(qos: .utility))
+        } onCancel: {
+            connection.cancel()
         }
         try await send(handshake())
         let response = try await receiveExactly(68)
@@ -95,6 +107,9 @@ public actor PeerWireClient {
         try await sendExtendedHandshake()
         try await readUntilMetadataHandshake()
         guard let extensionID = peerMetadataExtensionID, let metadataSize else {
+            throw PeerWireError.metadataUnavailable
+        }
+        guard metadataSize <= Self.maxMetadataSize else {
             throw PeerWireError.metadataUnavailable
         }
 
@@ -288,6 +303,7 @@ public actor PeerWireClient {
             let lengthData = try await receiveExactly(4)
             let length = Int(lengthData.readUInt32(at: 0))
             if length == 0 { continue }
+            guard length <= Self.maxMessageLength else { throw PeerWireError.unexpectedMessage }
             let body = try await receiveExactly(length)
             guard let id = body.first else { throw PeerWireError.unexpectedMessage }
             return (id, Data(body.dropFirst()))
@@ -315,14 +331,18 @@ public actor PeerWireClient {
     private func send(_ data: Data) async throws {
         try Task.checkCancellation()
         guard let connection else { throw PeerWireError.disconnected }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            })
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.send(content: data, completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                })
+            }
+        } onCancel: {
+            connection.cancel()
         }
     }
 
@@ -331,18 +351,22 @@ public actor PeerWireClient {
         while result.count < count {
             try Task.checkCancellation()
             guard let connection else { throw PeerWireError.disconnected }
-            let chunk = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                connection.receive(minimumIncompleteLength: 1, maximumLength: count - result.count) { data, _, isComplete, error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else if let data, !data.isEmpty {
-                        continuation.resume(returning: data)
-                    } else if isComplete {
-                        continuation.resume(throwing: PeerWireError.disconnected)
-                    } else {
-                        continuation.resume(throwing: PeerWireError.disconnected)
+            let chunk = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                    connection.receive(minimumIncompleteLength: 1, maximumLength: count - result.count) { data, _, isComplete, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else if let data, !data.isEmpty {
+                            continuation.resume(returning: data)
+                        } else if isComplete {
+                            continuation.resume(throwing: PeerWireError.disconnected)
+                        } else {
+                            continuation.resume(throwing: PeerWireError.disconnected)
+                        }
                     }
                 }
+            } onCancel: {
+                connection.cancel()
             }
             result.append(chunk)
         }

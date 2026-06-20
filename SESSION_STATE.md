@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Add PEX peer discovery.
+- **Next Immediate Step:** Start P1 robustness items (connect() `.waiting`/`.cancelled` handling, structured close cleanup, optional `makeAnnounceURL`), then PEX.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -32,11 +32,12 @@
   - Added BEP 5 DHT peer discovery to `.torrent` downloads, merged with tracker peers before the existing concurrent piece scheduler runs.
   - Added torrent-list removal confirmation from right-click, row remove button, and Delete/Backspace command; users can remove only from Swiftorrent or also delete downloaded/partial files from disk.
   - Changed app accent styling from blue to graphite black/grey.
+  - Fixed all P0 (critical) roadmap items: untrusted-input crash/OOM/hang hardening across bencode, peer-wire, tracker, and DHT paths.
 - **Recent Fixes (Anti-Regression):**
+  - P0 hardening: all `NWConnection` continuation awaits wrapped in `withTaskCancellationHandler` (`onCancel` cancels the connection) so hostile/non-responsive hosts no longer deadlock timeouts or cancellation.
+  - P0 hardening: bounded peer-supplied sizes — `PeerWireClient.readMessage` caps the length prefix at `maxMessageLength` (1 MB); `fetchMetadata` caps `metadata_size` at `maxMetadataSize` (10 MB).
+  - P0 hardening: `Bencode` byte-string length parsing uses overflow-reporting arithmetic; `parseCompactPeers` drops port-0 peers; `PeerWireClient.connect` no longer force-unwraps `NWEndpoint.Port` (throws on port 0).
   - Removing a torrent row now cancels the item task and cooperative cancellation checks stop tracker, magnet, and peer loops.
-  - Torrent metainfo parsing now sanitizes single-file names and multi-file path components before writing.
-  - Fixed piece hash extraction to use `Data` slice indices safely.
-  - Fixed multi-file piece writing so `Data` slice indices remain valid when a piece crosses file boundaries.
 
 ## Known Issues / Technical Debt
 - Magnet and `.torrent` peer discovery can use HTTP/HTTPS trackers, UDP trackers, and DHT peer discovery, but PEX is still missing.
@@ -53,7 +54,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 18 Swift Testing tests passed.
+- **Tests:** Success, `swift test -c release`, 23 Swift Testing tests passed (added bencode-overflow, port-0 filter, and size-cap hardening tests).
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -69,4 +70,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- Start with PEX, peer-wire read/connect timeouts, or integration tests using assets only from `~/Documents/Xcode/aTemp`.
+- P0 critical roadmap items are done. Next up: P1 robustness (connect() `.waiting`/`.cancelled` handling + continuation-leak fix, awaited/structured `close()` cleanup, optional `makeAnnounceURL`, empty-availability heuristic), then PEX and the two remaining hardening tests (cancellation teardown timing; integration tests from `~/Documents/Xcode/aTemp`).

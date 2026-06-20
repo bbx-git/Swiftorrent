@@ -17,6 +17,32 @@ struct CoreParsingTests {
         #expect(Data(data[info.range]) == Data("d4:name4:teste".utf8))
     }
 
+    @Test("Bencode parser rejects overflowing byte-string length")
+    func bencodeRejectsOverflowingLength() {
+        // A length field of all 9s far exceeds Int.max and must not trap.
+        let data = Data("99999999999999999999999999:payload".utf8)
+
+        #expect(throws: BencodeError.invalidByteStringLength) {
+            try BencodeParser(data: data).parse()
+        }
+    }
+
+    @Test("Tracker compact peers drop port-0 entries")
+    func trackerCompactPeersDropPortZero() {
+        let peers = TrackerClient.parseCompactPeers(Data([
+            127, 0, 0, 1, 0x00, 0x00,
+            192, 168, 1, 10, 0x1A, 0xE1
+        ]))
+
+        #expect(peers == [PeerEndpoint(host: "192.168.1.10", port: 6881)])
+    }
+
+    @Test("Peer wire caps guard against hostile sizes")
+    func peerWireSizeCaps() {
+        #expect(PeerWireClient.maxMessageLength == 1024 * 1024)
+        #expect(PeerWireClient.maxMetadataSize == 10 * 1024 * 1024)
+    }
+
     @Test("Magnet parser accepts hex BTIH")
     func magnetHex() throws {
         let magnet = try MagnetLinkParser().parse("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Example")

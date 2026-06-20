@@ -106,12 +106,12 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 All items preserve the download-only policy (no seeding, uploading, or sharing). PEX, if added, is inbound-only: consume peer lists, never advertise this client as a source.
 
-### P0 — Critical (crash / OOM / hang from untrusted input)
+### P0 — Critical (crash / OOM / hang from untrusted input) — DONE
 
-- Make connections cancellation-aware. `withTimeout` cannot interrupt the bare `withCheckedThrowingContinuation` wrappers over `NWConnection` (`PeerWireClient.receiveExactly`, `TrackerClient.receiveUDP`, `DHTClient.receive`), so a non-responsive or hostile host deadlocks the timeout and blocks user cancellation. Wrap each connection await in `withTaskCancellationHandler` whose `onCancel` calls `connection.cancel()`.
-- Bound peer-supplied lengths to prevent OOM. Cap `PeerWireClient.readMessage`'s 4-byte length prefix (e.g. ≤ 1 MB) before `receiveExactly`, and cap the peer-advertised `metadata_size`/derived `pieceCount` in `fetchMetadata` (e.g. ≤ 10 MB).
-- Guard the bencode byte-string length against integer overflow (`Bencode.swift`: `length = length*10 + …` can trap on a crafted `.torrent`). Use overflow-reporting arithmetic or cap to remaining bytes.
-- Filter `port == 0` in `TrackerClient.parseCompactPeers` (the dict and DHT parsers already do) and stop force-unwrapping `NWEndpoint.Port(rawValue:)` in `PeerWireClient.connect`, which currently crashes on a port-0 peer.
+- [x] Made connections cancellation-aware. Every `NWConnection` continuation await (`PeerWireClient.connect`/`send`/`receiveExactly`, `TrackerClient.waitUntilReady`/`sendUDP`/`receiveUDP`, `DHTClient.waitUntilReady`/`send`/`receive`) is wrapped in `withTaskCancellationHandler` whose `onCancel` calls `connection.cancel()`, so a non-responsive or hostile host no longer blocks the timeout or user cancellation.
+- [x] Bounded peer-supplied lengths to prevent OOM. `PeerWireClient.readMessage` rejects a length prefix above `maxMessageLength` (1 MB) before `receiveExactly`, and `fetchMetadata` rejects a peer-advertised `metadata_size` above `maxMetadataSize` (10 MB), which also bounds the derived `pieceCount`.
+- [x] Guarded the bencode byte-string length against integer overflow (`Bencode.swift` now uses `multipliedReportingOverflow`/`addingReportingOverflow` and throws `invalidByteStringLength` on overflow).
+- [x] Filter `port == 0` in `TrackerClient.parseCompactPeers` and stopped force-unwrapping `NWEndpoint.Port(rawValue:)` in `PeerWireClient.connect` (now throws `connectionFailed` on a port-0 peer).
 
 ### P1 — Important (robustness / correctness)
 
@@ -129,10 +129,10 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 - Add peer-wire read/connect timeouts for every long-running network wait.
 - Add file selection and per-file progress.
 
-### Hardening tests to add
+### Hardening tests
 
-- Bencode length overflow rejected on a crafted `.torrent`.
-- `parseCompactPeers` drops port-0 entries.
-- Oversized `metadata_size` / wire-message length rejected.
-- Cancellation tears down a stalled connection within the timeout window.
-- Integration tests using assets only from `~/Documents/Xcode/aTemp`.
+- [x] Bencode length overflow rejected on a crafted byte-string length.
+- [x] `parseCompactPeers` drops port-0 entries.
+- [x] Oversized `metadata_size` / wire-message length caps asserted.
+- [ ] Cancellation tears down a stalled connection within the timeout window.
+- [ ] Integration tests using assets only from `~/Documents/Xcode/aTemp`.

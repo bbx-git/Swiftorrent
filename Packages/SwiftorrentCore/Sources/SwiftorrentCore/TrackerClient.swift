@@ -120,23 +120,27 @@ public struct TrackerClient: Sendable {
     private func waitUntilReady(_ connection: NWConnection) async throws {
         try Task.checkCancellation()
         try await withTimeout(seconds: .seconds(10)) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.stateUpdateHandler = { state in
-                    switch state {
-                    case .ready:
-                        connection.stateUpdateHandler = nil
-                        continuation.resume()
-                    case let .failed(error):
-                        connection.stateUpdateHandler = nil
-                        continuation.resume(throwing: error)
-                    case .cancelled:
-                        connection.stateUpdateHandler = nil
-                        continuation.resume(throwing: CancellationError())
-                    default:
-                        break
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    connection.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            connection.stateUpdateHandler = nil
+                            continuation.resume()
+                        case let .failed(error):
+                            connection.stateUpdateHandler = nil
+                            continuation.resume(throwing: error)
+                        case .cancelled:
+                            connection.stateUpdateHandler = nil
+                            continuation.resume(throwing: CancellationError())
+                        default:
+                            break
+                        }
                     }
+                    connection.start(queue: .global(qos: .utility))
                 }
-                connection.start(queue: .global(qos: .utility))
+            } onCancel: {
+                connection.cancel()
             }
         }
     }
@@ -201,14 +205,18 @@ public struct TrackerClient: Sendable {
     private func sendUDP(_ data: Data, on connection: NWConnection) async throws {
         try Task.checkCancellation()
         try await withTimeout(seconds: .seconds(10)) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.send(content: data, completion: .contentProcessed { error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
-                    }
-                })
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    connection.send(content: data, completion: .contentProcessed { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    })
+                }
+            } onCancel: {
+                connection.cancel()
             }
         }
     }
@@ -216,16 +224,20 @@ public struct TrackerClient: Sendable {
     private func receiveUDP(on connection: NWConnection) async throws -> Data {
         try Task.checkCancellation()
         return try await withTimeout(seconds: .seconds(15)) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                connection.receiveMessage { data, _, _, error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else if let data, !data.isEmpty {
-                        continuation.resume(returning: data)
-                    } else {
-                        continuation.resume(throwing: TrackerClientError.invalidResponse)
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                    connection.receiveMessage { data, _, _, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else if let data, !data.isEmpty {
+                            continuation.resume(returning: data)
+                        } else {
+                            continuation.resume(throwing: TrackerClientError.invalidResponse)
+                        }
                     }
                 }
+            } onCancel: {
+                connection.cancel()
             }
         }
     }
@@ -256,9 +268,10 @@ public struct TrackerClient: Sendable {
     }
 
     static func parseCompactPeers(_ data: Data) -> [PeerEndpoint] {
-        stride(from: 0, to: data.count - (data.count % 6), by: 6).map { offset in
+        stride(from: 0, to: data.count - (data.count % 6), by: 6).compactMap { offset in
             let host = "\(data[offset]).\(data[offset + 1]).\(data[offset + 2]).\(data[offset + 3])"
             let port = UInt16(data[offset + 4]) << 8 | UInt16(data[offset + 5])
+            guard port > 0 else { return nil }
             return PeerEndpoint(host: host, port: port)
         }
     }

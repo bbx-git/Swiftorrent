@@ -114,23 +114,27 @@ public struct DHTClient: Sendable {
     private func waitUntilReady(_ connection: NWConnection) async throws {
         try Task.checkCancellation()
         try await withTimeout(seconds: .seconds(5)) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.stateUpdateHandler = { state in
-                    switch state {
-                    case .ready:
-                        connection.stateUpdateHandler = nil
-                        continuation.resume()
-                    case let .failed(error):
-                        connection.stateUpdateHandler = nil
-                        continuation.resume(throwing: error)
-                    case .cancelled:
-                        connection.stateUpdateHandler = nil
-                        continuation.resume(throwing: CancellationError())
-                    default:
-                        break
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    connection.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            connection.stateUpdateHandler = nil
+                            continuation.resume()
+                        case let .failed(error):
+                            connection.stateUpdateHandler = nil
+                            continuation.resume(throwing: error)
+                        case .cancelled:
+                            connection.stateUpdateHandler = nil
+                            continuation.resume(throwing: CancellationError())
+                        default:
+                            break
+                        }
                     }
+                    connection.start(queue: .global(qos: .utility))
                 }
-                connection.start(queue: .global(qos: .utility))
+            } onCancel: {
+                connection.cancel()
             }
         }
     }
@@ -138,14 +142,18 @@ public struct DHTClient: Sendable {
     private func send(_ data: Data, on connection: NWConnection) async throws {
         try Task.checkCancellation()
         try await withTimeout(seconds: .seconds(5)) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.send(content: data, completion: .contentProcessed { error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
-                    }
-                })
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    connection.send(content: data, completion: .contentProcessed { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    })
+                }
+            } onCancel: {
+                connection.cancel()
             }
         }
     }
@@ -153,16 +161,20 @@ public struct DHTClient: Sendable {
     private func receive(on connection: NWConnection) async throws -> Data {
         try Task.checkCancellation()
         return try await withTimeout(seconds: .seconds(7)) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                connection.receiveMessage { data, _, _, error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else if let data, !data.isEmpty {
-                        continuation.resume(returning: data)
-                    } else {
-                        continuation.resume(throwing: DHTClientError.invalidResponse)
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                    connection.receiveMessage { data, _, _, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else if let data, !data.isEmpty {
+                            continuation.resume(returning: data)
+                        } else {
+                            continuation.resume(throwing: DHTClientError.invalidResponse)
+                        }
                     }
                 }
+            } onCancel: {
+                connection.cancel()
             }
         }
     }
