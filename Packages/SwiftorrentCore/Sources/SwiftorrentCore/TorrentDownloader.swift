@@ -154,21 +154,43 @@ public struct TorrentDownloader: Sendable {
         progressDownloadedBytes: Int64,
         progress: @Sendable @escaping (Int64) async -> Void
     ) async throws -> Int64 {
+        let (partialURL, resumeOffset) = try writer.partialFileResumeOffset(for: file)
+        // Already fully present from a prior run; nothing to fetch.
+        if resumeOffset >= file.length {
+            return file.length
+        }
+
         var request = URLRequest(url: sourceURL)
         request.timeoutInterval = 30
+        if resumeOffset > 0 {
+            request.setValue("bytes=\(resumeOffset)-", forHTTPHeaderField: "Range")
+        }
         let (bytes, response) = try await session.bytes(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode) else {
+        guard let httpResponse = response as? HTTPURLResponse else {
             throw TrackerClientError.invalidResponse
         }
 
-        let partialURL = try writer.preparePartialFile(for: file)
+        // Honor the server's decision: 206 means our range was accepted, so we
+        // append; 200 means the range was ignored and the whole body follows, so
+        // we rewrite from the start. Anything else is treated as a failure and
+        // the caller falls through to the next web seed / peers.
+        let writeOffset: Int64
+        switch httpResponse.statusCode {
+        case 206:
+            writeOffset = resumeOffset
+        case 200:
+            writeOffset = 0
+        default:
+            throw TrackerClientError.invalidResponse
+        }
+
         let handle = try FileHandle(forWritingTo: partialURL)
-        var fileDownloadedBytes: Int64 = 0
+        var fileDownloadedBytes: Int64 = writeOffset
         var buffer = Data()
         buffer.reserveCapacity(64 * 1024)
         do {
             defer { try? handle.close() }
+            try handle.seek(toOffset: UInt64(writeOffset))
             for try await byte in bytes {
                 try Task.checkCancellation()
                 buffer.append(byte)
@@ -186,10 +208,12 @@ public struct TorrentDownloader: Sendable {
             }
         } catch { throw error }
 
+        // `fileDownloadedBytes` started at `writeOffset`, so it now reflects the
+        // whole file present on disk, including any resumed prefix.
         guard fileDownloadedBytes == file.length else {
             throw TrackerClientError.invalidResponse
         }
-        return fileDownloadedBytes
+        return file.length
     }
 
     private func downloadPiecesConcurrently(
@@ -627,6 +651,44 @@ struct TorrentFileWriter: Sendable {
         }
         FileManager.default.createFile(atPath: partialURL.path, contents: nil)
         return partialURL
+    }
+
+    /// Determines where an interrupted web-seed download of `file` should resume.
+    /// Returns the URL to append to and the byte offset already on disk, so the
+    /// caller can issue an HTTP `Range: bytes=offset-` request instead of
+    /// refetching the whole file. Behavior by existing state:
+    /// - Partial `.tor` present and not oversized → resume from its length.
+    /// - Partial present but larger than `file.length` (corrupt) → truncate, start at 0.
+    /// - No partial but a completed final file → report `file.length` so the
+    ///   caller can skip the fetch entirely (no wasteful copy).
+    /// - Nothing present → fresh empty partial, start at 0.
+    func partialFileResumeOffset(for file: TorrentFile) throws -> (url: URL, offset: Int64) {
+        let partialURL = try outputURL(for: file, partial: true)
+        let finalURL = try outputURL(for: file, partial: false)
+        try FileManager.default.createDirectory(at: partialURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        if FileManager.default.fileExists(atPath: partialURL.path) {
+            let size = try fileSize(at: partialURL)
+            if size > file.length {
+                try FileManager.default.removeItem(at: partialURL)
+                FileManager.default.createFile(atPath: partialURL.path, contents: nil)
+                return (partialURL, 0)
+            }
+            return (partialURL, size)
+        }
+
+        if FileManager.default.fileExists(atPath: finalURL.path),
+           try fileSize(at: finalURL) >= file.length {
+            return (finalURL, file.length)
+        }
+
+        FileManager.default.createFile(atPath: partialURL.path, contents: nil)
+        return (partialURL, 0)
+    }
+
+    private func fileSize(at url: URL) throws -> Int64 {
+        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+        return Int64(values.fileSize ?? 0)
     }
 
     func read(pieceIndex: Int, length: Int) throws -> Data? {

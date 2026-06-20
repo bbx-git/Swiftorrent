@@ -314,6 +314,52 @@ struct CoreParsingTests {
         #expect(try writer.verifiedPieces(among: [0, 1]) == writer.verifiedPieces())
     }
 
+    @Test("Web-seed resume offset reflects on-disk partial state")
+    func webSeedResumeOffset() throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        // Single 8-byte file in its own piece keeps the math independent of
+        // cross-file piece boundaries.
+        let metainfo = TorrentMetainfo(
+            name: "Root",
+            announceURLs: [],
+            files: [TorrentFile(id: 0, path: "Root/a.bin", length: 8)],
+            pieceLength: 8,
+            pieceHashes: [Data(Insecure.SHA1.hash(data: Data(repeating: 0, count: 8)))],
+            totalSize: 8,
+            infoHash: Data(repeating: 0, count: 20),
+            infoDictionaryData: Data()
+        )
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+        let file = metainfo.files[0]
+        let partialURL = destination.appendingPathComponent("Root/a.bin.tor")
+        let finalURL = destination.appendingPathComponent("Root/a.bin")
+
+        // No file yet → fresh empty partial, offset 0.
+        let fresh = try writer.partialFileResumeOffset(for: file)
+        #expect(fresh.offset == 0)
+        #expect(fresh.url == partialURL)
+        #expect(FileManager.default.fileExists(atPath: partialURL.path))
+
+        // Partial with 3 bytes → resume from 3.
+        try Data([1, 2, 3]).write(to: partialURL)
+        #expect(try writer.partialFileResumeOffset(for: file).offset == 3)
+
+        // Oversized partial → truncated back to 0.
+        try Data(repeating: 9, count: 12).write(to: partialURL)
+        let oversized = try writer.partialFileResumeOffset(for: file)
+        #expect(oversized.offset == 0)
+        #expect(try Data(contentsOf: partialURL).isEmpty)
+
+        // Only a completed final file → report full length so the fetch is skipped.
+        try FileManager.default.removeItem(at: partialURL)
+        try Data(repeating: 7, count: 8).write(to: finalURL)
+        let complete = try writer.partialFileResumeOffset(for: file)
+        #expect(complete.offset == 8)
+        #expect(complete.url == finalURL)
+    }
+
     @Test("Peer id is exactly 20 ASCII bytes with the client prefix")
     func makePeerIDIsTwentyASCIIBytes() throws {
         let peerID = TorrentDownloader.makePeerID()
