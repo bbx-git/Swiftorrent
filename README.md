@@ -104,7 +104,35 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 ## Roadmap
 
-- Add PEX.
+All items preserve the download-only policy (no seeding, uploading, or sharing). PEX, if added, is inbound-only: consume peer lists, never advertise this client as a source.
+
+### P0 — Critical (crash / OOM / hang from untrusted input)
+
+- Make connections cancellation-aware. `withTimeout` cannot interrupt the bare `withCheckedThrowingContinuation` wrappers over `NWConnection` (`PeerWireClient.receiveExactly`, `TrackerClient.receiveUDP`, `DHTClient.receive`), so a non-responsive or hostile host deadlocks the timeout and blocks user cancellation. Wrap each connection await in `withTaskCancellationHandler` whose `onCancel` calls `connection.cancel()`.
+- Bound peer-supplied lengths to prevent OOM. Cap `PeerWireClient.readMessage`'s 4-byte length prefix (e.g. ≤ 1 MB) before `receiveExactly`, and cap the peer-advertised `metadata_size`/derived `pieceCount` in `fetchMetadata` (e.g. ≤ 10 MB).
+- Guard the bencode byte-string length against integer overflow (`Bencode.swift`: `length = length*10 + …` can trap on a crafted `.torrent`). Use overflow-reporting arithmetic or cap to remaining bytes.
+- Filter `port == 0` in `TrackerClient.parseCompactPeers` (the dict and DHT parsers already do) and stop force-unwrapping `NWEndpoint.Port(rawValue:)` in `PeerWireClient.connect`, which currently crashes on a port-0 peer.
+
+### P1 — Important (robustness / correctness)
+
+- Fix the `connect()` continuation leak: handle `.waiting` and `.cancelled` `NWConnection` states, not just `.ready`/`.failed`.
+- Replace fire-and-forget `Task { await client.close() }` cleanup in `TorrentDownloader` and `MagnetMetadataResolver` with an awaited/structured close.
+- Stop force-unwrapping `URL(string:)!` in `TrackerClient.makeAnnounceURL`; return optional and skip the tracker on failure.
+- Address the empty-availability heuristic (a peer that unchokes before sending bitfield/have is treated as a full seed); add reject/`have` handling or document it.
+
+### P2 — Performance & polish
+
+- Cache verified pieces; `verifiedPieces()` re-hashes the whole on-disk dataset and runs up to 3× per `download()`.
+- Add HTTP `Range`/resume support to web-seed downloads (currently GETs whole files; mid-file failure restarts the file).
+- Reduce fragile force-unwraps in `makePeerID` and the `SecRandomCopyBytes` path.
+- Add PEX (inbound peer discovery only).
 - Add peer-wire read/connect timeouts for every long-running network wait.
 - Add file selection and per-file progress.
-- Add integration tests using assets only from `~/Documents/Xcode/aTemp`.
+
+### Hardening tests to add
+
+- Bencode length overflow rejected on a crafted `.torrent`.
+- `parseCompactPeers` drops port-0 entries.
+- Oversized `metadata_size` / wire-message length rejected.
+- Cancellation tears down a stalled connection within the timeout window.
+- Integration tests using assets only from `~/Documents/Xcode/aTemp`.
