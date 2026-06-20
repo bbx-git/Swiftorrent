@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Add PEX and consider using DHT peer discovery for `.torrent` downloads, not just magnet metadata.
+- **Next Immediate Step:** Add PEX peer discovery.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -29,6 +29,9 @@
   - Added bounded concurrent peer downloads with bitfield/have availability tracking, rarest-first scheduling, and serialized piece writes.
   - Added tests for tracker percent encoding, compact IPv4 peer parsing, and peer bitfield parsing.
   - Added BEP 5 DHT `get_peers` discovery for magnet metadata resolution, including compact IPv4 node/peer parsing tests.
+  - Added BEP 5 DHT peer discovery to `.torrent` downloads, merged with tracker peers before the existing concurrent piece scheduler runs.
+  - Added torrent-list removal confirmation from right-click, row remove button, and Delete/Backspace command; users can remove only from Swiftorrent or also delete downloaded/partial files from disk.
+  - Changed app accent styling from blue to graphite black/grey.
 - **Recent Fixes (Anti-Regression):**
   - Removing a torrent row now cancels the item task and cooperative cancellation checks stop tracker, magnet, and peer loops.
   - Torrent metainfo parsing now sanitizes single-file names and multi-file path components before writing.
@@ -36,9 +39,9 @@
   - Fixed multi-file piece writing so `Data` slice indices remain valid when a piece crosses file boundaries.
 
 ## Known Issues / Technical Debt
-- Magnet resolution can use HTTP/HTTPS trackers, UDP trackers, and DHT peer discovery, but PEX is still missing.
-- `.torrent` downloads still use tracker peers only; DHT peer discovery is currently wired into magnet metadata resolution.
+- Magnet and `.torrent` peer discovery can use HTTP/HTTPS trackers, UDP trackers, and DHT peer discovery, but PEX is still missing.
 - Downloader uses a small concurrent peer pool with basic timeouts, but still needs broader integration testing against external assets.
+- Disk deletion currently removes known torrent output paths and partial `.tor` files; unresolved queued rows fall back to a best-effort path based on the displayed item name.
 - Manual app bundling is required because the current project is an SPM executable instead of a native Xcode app target.
 - The user-provided magnet was used only for parser/hash/tracker-shape verification, not media download. Future external test assets must use `~/Documents/Xcode/aTemp`.
 
@@ -50,7 +53,7 @@
 
 ## Build & Run Status
 - **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 15 Swift Testing tests passed.
+- **Tests:** Success, `swift test -c release`, 18 Swift Testing tests passed.
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -66,4 +69,4 @@
 - `SESSION_STATE.md`
 
 ## Handoff for Next Context
-- Start with PEX, DHT peer discovery for `.torrent` downloads, or integration tests using assets only from `~/Documents/Xcode/aTemp`.
+- Start with PEX, peer-wire read/connect timeouts, or integration tests using assets only from `~/Documents/Xcode/aTemp`.

@@ -19,12 +19,19 @@ public struct TorrentDownloadProgress: Sendable {
 }
 
 public struct TorrentDownloader: Sendable {
-    private let trackerClient: TrackerClient
+    private let trackerClient: any TrackerAnnouncing
+    private let dhtClient: any DHTPeerFinding
     private let maxPeerAttempts = 24
     private let maxPeerConnections = 4
 
-    public init(trackerClient: TrackerClient = TrackerClient()) {
+    public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient()) {
         self.trackerClient = trackerClient
+        self.dhtClient = dhtClient
+    }
+
+    init(trackerClient: any TrackerAnnouncing, dhtClient: any DHTPeerFinding) {
+        self.trackerClient = trackerClient
+        self.dhtClient = dhtClient
     }
 
     public func download(
@@ -46,7 +53,7 @@ public struct TorrentDownloader: Sendable {
         }
 
         let peerID = Self.makePeerID()
-        await progress(TorrentDownloadProgress(status: "Verified existing data. Contacting trackers", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
+        await progress(TorrentDownloadProgress(status: "Verified existing data. Contacting trackers and DHT", downloadedBytes: initialDownloaded, totalBytes: metainfo.totalSize))
         let peers = try await collectPeers(for: metainfo, peerID: peerID, downloaded: initialDownloaded, left: metainfo.totalSize - initialDownloaded, event: "started")
         do {
             try Task.checkCancellation()
@@ -58,7 +65,7 @@ public struct TorrentDownloader: Sendable {
             let verifiedBytes = bytesCompleted(for: verifiedPieces, metainfo: metainfo)
             if verifiedBytes >= metainfo.totalSize {
                 try writer.finalize()
-                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped")
+                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped", includeDHT: false)
                 await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
                 return
             }
@@ -73,7 +80,7 @@ public struct TorrentDownloader: Sendable {
                 progress: progress
             )
             try writer.finalize()
-            _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped")
+            _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped", includeDHT: false)
             await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: metainfo.totalSize, totalBytes: metainfo.totalSize))
             return
         }
@@ -232,33 +239,63 @@ public struct TorrentDownloader: Sendable {
         }
     }
 
-    private func collectPeers(
+    func collectPeers(
         for metainfo: TorrentMetainfo,
         peerID: Data,
         downloaded: Int64 = 0,
         left: Int64? = nil,
-        event: String?
+        event: String?,
+        includeDHT: Bool = true
     ) async throws -> [PeerEndpoint] {
         var peers: Set<PeerEndpoint> = []
         var lastError: Error?
 
-        for url in metainfo.announceURLs {
-            try Task.checkCancellation()
-            do {
-                let request = TrackerRequest(
-                    announceURL: url,
-                    infoHash: metainfo.infoHash,
-                    peerID: peerID,
-                    downloaded: downloaded,
-                    left: left ?? metainfo.totalSize,
-                    event: event
-                )
-                peers.formUnion(try await trackerClient.announce(request))
-            } catch {
-                lastError = error
+        await withTaskGroup(of: Result<[PeerEndpoint], Error>.self) { group in
+            for url in metainfo.announceURLs {
+                group.addTask {
+                    do {
+                        try Task.checkCancellation()
+                        let request = TrackerRequest(
+                            announceURL: url,
+                            infoHash: metainfo.infoHash,
+                            peerID: peerID,
+                            downloaded: downloaded,
+                            left: left ?? metainfo.totalSize,
+                            event: event
+                        )
+                        return .success(try await trackerClient.announce(request))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+
+            if includeDHT {
+                group.addTask {
+                    do {
+                        try Task.checkCancellation()
+                        return .success(try await dhtClient.peers(for: metainfo.infoHash))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+
+            for await result in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                switch result {
+                case let .success(endpoints):
+                    peers.formUnion(endpoints)
+                case let .failure(error):
+                    lastError = error
+                }
             }
         }
 
+        try Task.checkCancellation()
         if peers.isEmpty, let lastError {
             throw lastError
         }
@@ -291,6 +328,18 @@ public struct TorrentDownloader: Sendable {
         return "-SW0001-\(suffix)0000".prefix(20).data(using: .ascii)!
     }
 }
+
+protocol TrackerAnnouncing: Sendable {
+    func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint]
+}
+
+extension TrackerClient: TrackerAnnouncing {}
+
+protocol DHTPeerFinding: Sendable {
+    func peers(for infoHash: Data) async throws -> [PeerEndpoint]
+}
+
+extension DHTClient: DHTPeerFinding {}
 
 private struct PeerDownloadSession: Sendable {
     let endpoint: PeerEndpoint

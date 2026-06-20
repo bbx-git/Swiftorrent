@@ -224,10 +224,50 @@ struct CoreParsingTests {
         #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("escaped.txt.tor").path))
     }
 
+    @Test("Torrent downloader merges tracker and DHT peers")
+    func torrentDownloaderMergesTrackerAndDHTPeers() async throws {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8)])
+        let trackerPeer = PeerEndpoint(host: "192.0.2.10", port: 6881)
+        let sharedPeer = PeerEndpoint(host: "192.0.2.11", port: 6882)
+        let dhtPeer = PeerEndpoint(host: "192.0.2.12", port: 6883)
+        let downloader = TorrentDownloader(
+            trackerClient: MockTrackerAnnouncer(peers: [trackerPeer, sharedPeer]),
+            dhtClient: MockDHTPeerFinder(peers: [sharedPeer, dhtPeer])
+        )
+
+        let peers = try await downloader.collectPeers(
+            for: metainfo,
+            peerID: Data(repeating: 1, count: 20),
+            event: "started"
+        )
+
+        #expect(Set(peers) == [trackerPeer, sharedPeer, dhtPeer])
+    }
+
+    @Test("Torrent downloader skips DHT for stopped announces")
+    func torrentDownloaderSkipsDHTForStoppedAnnounce() async throws {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8)])
+        let trackerPeer = PeerEndpoint(host: "192.0.2.20", port: 6881)
+        let dhtPeer = PeerEndpoint(host: "192.0.2.21", port: 6882)
+        let downloader = TorrentDownloader(
+            trackerClient: MockTrackerAnnouncer(peers: [trackerPeer]),
+            dhtClient: MockDHTPeerFinder(peers: [dhtPeer])
+        )
+
+        let peers = try await downloader.collectPeers(
+            for: metainfo,
+            peerID: Data(repeating: 1, count: 20),
+            event: "stopped",
+            includeDHT: false
+        )
+
+        #expect(peers == [trackerPeer])
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",
-            announceURLs: [],
+            announceURLs: [URL(string: "http://tracker.example.invalid/announce")!],
             files: [
                 TorrentFile(id: 0, path: "Root/a.txt", length: 2),
                 TorrentFile(id: 1, path: "Root/b.txt", length: 4)
@@ -238,5 +278,21 @@ struct CoreParsingTests {
             infoHash: Data(repeating: 0, count: 20),
             infoDictionaryData: Data()
         )
+    }
+}
+
+private struct MockTrackerAnnouncer: TrackerAnnouncing {
+    let peers: [PeerEndpoint]
+
+    func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
+        peers
+    }
+}
+
+private struct MockDHTPeerFinder: DHTPeerFinding {
+    let peers: [PeerEndpoint]
+
+    func peers(for infoHash: Data) async throws -> [PeerEndpoint] {
+        peers
     }
 }

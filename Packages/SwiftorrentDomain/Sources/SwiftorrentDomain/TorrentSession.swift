@@ -34,6 +34,7 @@ public final class TorrentSession {
                 update(item.id) {
                     $0.name = metainfo.name
                     $0.totalBytes = metainfo.totalSize
+                    $0.outputRelativePaths = metainfo.files.map(\.path)
                     $0.status = "Starting download."
                 }
                 try await start(itemID: item.id, metainfo: metainfo)
@@ -70,6 +71,7 @@ public final class TorrentSession {
                 update(item.id) {
                     $0.name = metainfo.name
                     $0.totalBytes = metainfo.totalSize
+                    $0.outputRelativePaths = metainfo.files.map(\.path)
                     $0.status = "Metadata resolved. Starting download."
                 }
                 try await start(itemID: item.id, metainfo: metainfo)
@@ -84,10 +86,49 @@ public final class TorrentSession {
         }
     }
 
-    public func remove(_ item: TorrentItem) {
+    public func remove(_ item: TorrentItem, deleteFiles: Bool = false) {
         tasks[item.id]?.cancel()
         tasks[item.id] = nil
+        if deleteFiles {
+            removeFiles(for: item)
+        }
         items.removeAll { $0.id == item.id }
+    }
+
+    private func removeFiles(for item: TorrentItem) {
+        let destination = item.destination.standardizedFileURL
+        let relativePaths = item.outputRelativePaths.isEmpty ? [item.name] : item.outputRelativePaths
+        for relativePath in relativePaths {
+            let finalURL = destination.appendingPathComponent(relativePath).standardizedFileURL
+            let partialURL = finalURL.appendingPathExtension("tor").standardizedFileURL
+            removeFileIfContained(partialURL, in: destination)
+            removeFileIfContained(finalURL, in: destination)
+        }
+        pruneEmptyDirectories(for: relativePaths, in: destination)
+    }
+
+    private func removeFileIfContained(_ url: URL, in destination: URL) {
+        let destinationPath = destination.path
+        let path = url.path
+        guard path == destinationPath || path.hasPrefix(destinationPath + "/") else { return }
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func pruneEmptyDirectories(for relativePaths: [String], in destination: URL) {
+        let directories = Set(relativePaths.map { path in
+            destination.appendingPathComponent(path).deletingLastPathComponent().standardizedFileURL
+        })
+        for directory in directories.sorted(by: { $0.path.count > $1.path.count }) {
+            var current = directory
+            while current.path.hasPrefix(destination.path + "/"), current != destination {
+                guard let contents = try? FileManager.default.contentsOfDirectory(atPath: current.path), contents.isEmpty else {
+                    break
+                }
+                try? FileManager.default.removeItem(at: current)
+                current.deleteLastPathComponent()
+            }
+        }
     }
 
     private func start(itemID: TorrentItem.ID, metainfo: TorrentMetainfo) async throws {
@@ -130,6 +171,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
     public var source: Source
     public var destination: URL
     public var totalBytes: Int64
+    public var outputRelativePaths: [String]
     public var downloadedBytes: Int64
     public var progress: Double
     public var status: String
@@ -141,6 +183,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
         self.source = source
         self.destination = destination
         self.totalBytes = totalBytes
+        self.outputRelativePaths = []
         self.downloadedBytes = 0
         self.progress = 0
         self.status = "Queued"

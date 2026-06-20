@@ -6,6 +6,8 @@ public struct SwiftorrentRootView: View {
     @State private var session = TorrentSession()
     @State private var magnetText = ""
     @State private var importerPresented = false
+    @State private var selectedItemID: TorrentItem.ID?
+    @State private var pendingRemovalItem: TorrentItem?
 
     public init() {}
 
@@ -33,8 +35,31 @@ public struct SwiftorrentRootView: View {
                 session.addMagnet(url.absoluteString)
             }
         }
-        .tint(.swiftorrentBlue)
+        .alert("Remove Torrent?", isPresented: removalAlertPresented, presenting: pendingRemovalItem) { item in
+            Button("Remove from Program", role: .destructive) {
+                remove(item, deleteFiles: false)
+            }
+            Button("Remove and Delete Files", role: .destructive) {
+                remove(item, deleteFiles: true)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingRemovalItem = nil
+            }
+        } message: { item in
+            Text("Remove \"\(item.name)\" only from Swiftorrent, or also delete its downloaded and partial files from the drive?")
+        }
+        .tint(.swiftorrentGraphite)
         .frame(minWidth: 940, minHeight: 620)
+    }
+
+    private var removalAlertPresented: Binding<Bool> {
+        Binding {
+            pendingRemovalItem != nil
+        } set: { isPresented in
+            if !isPresented {
+                pendingRemovalItem = nil
+            }
+        }
     }
 
     private var appBackground: some View {
@@ -42,8 +67,8 @@ public struct SwiftorrentRootView: View {
             Color(nsColor: .windowBackgroundColor)
             LinearGradient(
                 colors: [
-                    Color.swiftorrentBlue.opacity(0.16),
-                    Color.cyan.opacity(0.06),
+                    Color.black.opacity(0.14),
+                    Color.swiftorrentSmoke.opacity(0.10),
                     Color.clear
                 ],
                 startPoint: .topLeading,
@@ -51,7 +76,7 @@ public struct SwiftorrentRootView: View {
             )
             RadialGradient(
                 colors: [
-                    Color.swiftorrentBlue.opacity(0.16),
+                    Color.swiftorrentGraphite.opacity(0.14),
                     Color.clear
                 ],
                 center: .topTrailing,
@@ -74,7 +99,7 @@ public struct SwiftorrentRootView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.glassProminent)
-            .tint(.swiftorrentBlue)
+            .tint(.swiftorrentGraphite)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Magnet")
@@ -87,10 +112,10 @@ public struct SwiftorrentRootView: View {
                     magnetText = ""
                 }
                 .disabled(magnetText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .buttonStyle(.glass(.regular.tint(.swiftorrentBlue.opacity(0.16)).interactive()))
+                .buttonStyle(.glass(.regular.tint(.swiftorrentGraphite.opacity(0.16)).interactive()))
             }
             .padding(14)
-            .glassEffect(.regular.tint(.swiftorrentBlue.opacity(0.14)), in: RoundedRectangle(cornerRadius: 8))
+            .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
 
             Divider()
 
@@ -106,10 +131,10 @@ public struct SwiftorrentRootView: View {
                 } label: {
                     Label("Choose Folder", systemImage: "folder")
                 }
-                .buttonStyle(.glass(.regular.tint(.swiftorrentBlue.opacity(0.16)).interactive()))
+                .buttonStyle(.glass(.regular.tint(.swiftorrentGraphite.opacity(0.16)).interactive()))
             }
             .padding(14)
-            .glassEffect(.regular.tint(.swiftorrentBlue.opacity(0.14)), in: RoundedRectangle(cornerRadius: 8))
+            .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
 
             Spacer()
 
@@ -118,7 +143,7 @@ public struct SwiftorrentRootView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(20)
-        .background(Color.swiftorrentBlue.opacity(0.05))
+        .background(Color.black.opacity(0.045))
         .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 340)
     }
 
@@ -136,13 +161,24 @@ public struct SwiftorrentRootView: View {
             if session.items.isEmpty {
                 ContentUnavailableView("No torrents yet", systemImage: "tray", description: Text("Open a .torrent file or paste a magnet link to begin."))
                     .padding(32)
-                    .glassEffect(.regular.tint(.swiftorrentBlue.opacity(0.10)), in: RoundedRectangle(cornerRadius: 8))
+                    .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List {
+                List(selection: $selectedItemID) {
                     ForEach(session.items) { item in
-                        TorrentRow(item: item) {
-                            session.remove(item)
+                        TorrentRow(item: item, isSelected: selectedItemID == item.id) {
+                            requestRemoval(for: item)
+                        }
+                        .tag(item.id)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            selectedItemID = item.id
+                        }
+                        .contextMenu {
+                            Button("Remove Torrent...", role: .destructive) {
+                                selectedItemID = item.id
+                                requestRemoval(for: item)
+                            }
                         }
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
@@ -151,8 +187,32 @@ public struct SwiftorrentRootView: View {
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
+                .onDeleteCommand {
+                    requestRemovalForSelection()
+                }
             }
         }
+    }
+
+    private func requestRemovalForSelection() {
+        guard let selectedItemID,
+              let item = session.items.first(where: { $0.id == selectedItemID }) else {
+            return
+        }
+        requestRemoval(for: item)
+    }
+
+    private func requestRemoval(for item: TorrentItem) {
+        selectedItemID = item.id
+        pendingRemovalItem = item
+    }
+
+    private func remove(_ item: TorrentItem, deleteFiles: Bool) {
+        session.remove(item, deleteFiles: deleteFiles)
+        if selectedItemID == item.id {
+            selectedItemID = nil
+        }
+        pendingRemovalItem = nil
     }
 
     private func chooseFolder() {
@@ -169,6 +229,7 @@ public struct SwiftorrentRootView: View {
 
 private struct TorrentRow: View {
     let item: TorrentItem
+    let isSelected: Bool
     let remove: () -> Void
 
     var body: some View {
@@ -206,10 +267,10 @@ private struct TorrentRow: View {
             Button(role: .destructive, action: remove) {
                 Image(systemName: "xmark")
             }
-            .buttonStyle(.glass(.regular.tint(.red.opacity(0.10)).interactive()))
+            .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.12)).interactive()))
         }
         .padding(14)
-        .glassEffect(.regular.tint(.swiftorrentBlue.opacity(0.10)), in: RoundedRectangle(cornerRadius: 8))
+        .glassEffect(.regular.tint(isSelected ? Color.swiftorrentGraphite.opacity(0.18) : Color.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var icon: String {
@@ -224,9 +285,9 @@ private struct TorrentRow: View {
     private var color: Color {
         switch item.state {
         case .queued: .secondary
-        case .downloading: .accentColor
-        case .complete: .green
-        case .failed: .red
+        case .downloading: .swiftorrentGraphite
+        case .complete: .primary
+        case .failed: .secondary
         }
     }
 }
@@ -245,12 +306,14 @@ private struct Metric: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .glassEffect(.regular.tint(.swiftorrentBlue.opacity(0.14)), in: RoundedRectangle(cornerRadius: 8))
+        .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
 private extension Color {
-    static let swiftorrentBlue = Color(red: 0.18, green: 0.43, blue: 0.82)
+    static let swiftorrentGraphite = Color(red: 0.18, green: 0.18, blue: 0.19)
+    static let swiftorrentSmoke = Color(red: 0.46, green: 0.46, blue: 0.48)
+    static let swiftorrentPanel = Color.black.opacity(0.08)
 }
 
 extension UTType {
