@@ -115,8 +115,8 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 
 ### P1 — Important (robustness / correctness)
 
-- Fix the `connect()` continuation leak: handle `.waiting` and `.cancelled` `NWConnection` states, not just `.ready`/`.failed`.
-- Replace fire-and-forget `Task { await client.close() }` cleanup in `TorrentDownloader` and `MagnetMetadataResolver` with an awaited/structured close.
+- [x] Fixed the `connect()` continuation leak: `PeerWireClient.connect` now resumes on `.waiting` (fail fast on unreachable/refused peers) and `.cancelled` (no leak when cancelled). The same `.waiting` fail-fast was added to `TrackerClient`/`DHTClient` `waitUntilReady`.
+- [x] Replaced fire-and-forget `Task { await client.close() }` cleanup in `TorrentDownloader.downloadPiecesConcurrently` (via an awaited `closeSessions`) and `MagnetMetadataResolver.fetchMetadata` (do/catch with awaited `close()`) with structured, awaited closes.
 - Stop force-unwrapping `URL(string:)!` in `TrackerClient.makeAnnounceURL`; return optional and skip the tracker on failure.
 - Address the empty-availability heuristic (a peer that unchokes before sending bitfield/have is treated as a full seed); add reject/`have` handling or document it.
 

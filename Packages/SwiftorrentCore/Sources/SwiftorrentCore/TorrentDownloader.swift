@@ -201,12 +201,6 @@ public struct TorrentDownloader: Sendable {
             initialDownloaded: initialDownloaded,
             progress: progress
         )
-        defer {
-            for session in sessions {
-                Task { await session.client.close() }
-            }
-        }
-
         guard !sessions.isEmpty else { throw TrackerClientError.invalidResponse }
 
         let writer = TorrentPieceWriter(writer: TorrentFileWriter(metainfo: metainfo, destination: destination))
@@ -261,10 +255,18 @@ public struct TorrentDownloader: Sendable {
             }
         }
 
-        if await coordinator.isComplete {
-            return await coordinator.downloadedBytes
+        let downloadedBytes = await coordinator.isComplete ? await coordinator.downloadedBytes : nil
+        await closeSessions(sessions)
+        if let downloadedBytes {
+            return downloadedBytes
         }
         throw lastError ?? TrackerClientError.invalidResponse
+    }
+
+    private func closeSessions(_ sessions: [PeerDownloadSession]) async {
+        for session in sessions {
+            await session.client.close()
+        }
     }
 
     private func connectPeerSessions(

@@ -66,11 +66,22 @@ public actor PeerWireClient {
                 connection.stateUpdateHandler = { state in
                     switch state {
                     case .ready:
+                        connection.stateUpdateHandler = nil
                         continuation.resume()
-                        connection.stateUpdateHandler = nil
                     case let .failed(error):
-                        continuation.resume(throwing: error)
                         connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: error)
+                    case let .waiting(error):
+                        // Without waitForConnectivity, NWConnection parks unreachable or
+                        // refused peers in `.waiting` indefinitely. Fail fast instead.
+                        connection.stateUpdateHandler = nil
+                        connection.cancel()
+                        continuation.resume(throwing: error)
+                    case .cancelled:
+                        // Reached when `onCancel` (or `.waiting` above) cancels the
+                        // connection; resume so the continuation never leaks.
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: CancellationError())
                     default:
                         break
                     }

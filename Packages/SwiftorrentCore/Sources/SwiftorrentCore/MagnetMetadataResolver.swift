@@ -187,9 +187,15 @@ public struct MagnetMetadataResolver: Sendable {
 
     private func fetchMetadata(from peer: PeerEndpoint, magnet: MagnetLink, peerID: Data) async throws -> Data {
         let client = PeerWireClient(endpoint: peer, infoHash: magnet.infoHash, peerID: peerID)
-        defer { Task { await client.close() } }
-        try await client.connect()
-        return try await client.fetchMetadata()
+        do {
+            try await client.connect()
+            let metadata = try await client.fetchMetadata()
+            await client.close()
+            return metadata
+        } catch {
+            await client.close()
+            throw error
+        }
     }
 }
 

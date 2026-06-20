@@ -130,6 +130,10 @@ public struct TrackerClient: Sendable {
                         case let .failed(error):
                             connection.stateUpdateHandler = nil
                             continuation.resume(throwing: error)
+                        case let .waiting(error):
+                            connection.stateUpdateHandler = nil
+                            connection.cancel()
+                            continuation.resume(throwing: error)
                         case .cancelled:
                             connection.stateUpdateHandler = nil
                             continuation.resume(throwing: CancellationError())

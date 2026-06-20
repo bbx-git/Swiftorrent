@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Start P1 robustness items (connect() `.waiting`/`.cancelled` handling, structured close cleanup, optional `makeAnnounceURL`), then PEX.
+- **Next Immediate Step:** Continue P1 robustness: make `TrackerClient.makeAnnounceURL` return optional (no `URL(string:)!` force-unwrap, skip tracker on failure), then address the empty-availability "full seed" heuristic; then PEX.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -34,10 +34,10 @@
   - Changed app accent styling from blue to graphite black/grey.
   - Fixed all P0 (critical) roadmap items: untrusted-input crash/OOM/hang hardening across bencode, peer-wire, tracker, and DHT paths.
 - **Recent Fixes (Anti-Regression):**
+  - P1: `PeerWireClient.connect` now handles `.waiting` (cancels + fails fast on unreachable/refused peers) and `.cancelled` (resumes with `CancellationError`, no continuation leak); same `.waiting` fail-fast added to `TrackerClient`/`DHTClient` `waitUntilReady`.
+  - P1: structured/awaited peer-client cleanup — `TorrentDownloader.downloadPiecesConcurrently` uses an awaited `closeSessions(_:)` (no fire-and-forget `Task`), and `MagnetMetadataResolver.fetchMetadata` uses do/catch with awaited `close()`.
   - P0 hardening: all `NWConnection` continuation awaits wrapped in `withTaskCancellationHandler` (`onCancel` cancels the connection) so hostile/non-responsive hosts no longer deadlock timeouts or cancellation.
   - P0 hardening: bounded peer-supplied sizes — `PeerWireClient.readMessage` caps the length prefix at `maxMessageLength` (1 MB); `fetchMetadata` caps `metadata_size` at `maxMetadataSize` (10 MB).
-  - P0 hardening: `Bencode` byte-string length parsing uses overflow-reporting arithmetic; `parseCompactPeers` drops port-0 peers; `PeerWireClient.connect` no longer force-unwraps `NWEndpoint.Port` (throws on port 0).
-  - Removing a torrent row now cancels the item task and cooperative cancellation checks stop tracker, magnet, and peer loops.
 
 ## Known Issues / Technical Debt
 - Magnet and `.torrent` peer discovery can use HTTP/HTTPS trackers, UDP trackers, and DHT peer discovery, but PEX is still missing.
