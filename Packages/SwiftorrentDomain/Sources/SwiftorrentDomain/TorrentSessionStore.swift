@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftorrentCore
 
 /// On-disk snapshot of the confirmed torrent list, used to restore the session
@@ -50,6 +51,7 @@ struct PersistedItem: Codable, Sendable, Equatable {
 /// only happen once at launch.
 actor TorrentSessionStore {
     private let fileURL: URL
+    private static let logger = Logger(subsystem: "Swiftorrent", category: "Persistence")
 
     init(fileURL: URL = TorrentSessionStore.defaultURL()) {
         self.fileURL = fileURL
@@ -67,13 +69,24 @@ actor TorrentSessionStore {
     /// saved yet or the file is unreadable/corrupt (a bad file is ignored rather
     /// than crashing the launch).
     nonisolated func load() -> PersistedSession? {
+        // A missing file just means "no session saved yet"; only a present but
+        // undecodable file is worth surfacing.
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(PersistedSession.self, from: data)
+        do {
+            return try JSONDecoder().decode(PersistedSession.self, from: data)
+        } catch {
+            Self.logger.error("Failed to decode session at \(self.fileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
     }
 
     func save(_ snapshot: PersistedSession) {
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(snapshot)
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            Self.logger.error("Failed to persist session to \(self.fileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
     }
 }

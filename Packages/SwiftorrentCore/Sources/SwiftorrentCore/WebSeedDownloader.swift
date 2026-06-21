@@ -223,7 +223,7 @@ struct WebSeedDownloader: Sendable {
                 fileDownloadedBytes += Int64(buffer.count)
                 await progress(progressDownloadedBytes + fileDownloadedBytes)
             }
-        } catch { throw error }
+        }
 
         // `fileDownloadedBytes` started at `writeOffset`, so it now reflects the
         // whole file present on disk, including any resumed prefix.

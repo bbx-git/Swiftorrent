@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 import SwiftorrentCore
 
 @MainActor
@@ -26,6 +27,7 @@ public final class TorrentSession {
         }
     }
 
+    @ObservationIgnored private let logger = Logger(subsystem: "Swiftorrent", category: "Session")
     private let metainfoParser = TorrentMetainfoParser()
     private let magnetParser = MagnetLinkParser()
     private let magnetResolver = MagnetMetadataResolver()
@@ -379,8 +381,15 @@ public final class TorrentSession {
     }
 
     private func removeFiles(for item: TorrentItem) {
+        // Only delete paths we actually resolved. An unresolved/queued row has no
+        // `outputRelativePaths`, and guessing from `item.name` risks deleting an
+        // unrelated file that happens to share the display name.
+        let relativePaths = item.outputRelativePaths
+        guard !relativePaths.isEmpty else {
+            logger.notice("Skipping disk deletion for unresolved row \"\(item.name, privacy: .public)\": no resolved output paths")
+            return
+        }
         let destination = item.destination.standardizedFileURL
-        let relativePaths = item.outputRelativePaths.isEmpty ? [item.name] : item.outputRelativePaths
         for relativePath in relativePaths {
             let finalURL = destination.appendingPathComponent(relativePath).standardizedFileURL
             let partialURL = finalURL.appendingPathExtension("tor").standardizedFileURL
@@ -395,7 +404,11 @@ public final class TorrentSession {
         let path = url.path
         guard path == destinationPath || path.hasPrefix(destinationPath + "/") else { return }
         guard FileManager.default.fileExists(atPath: path) else { return }
-        try? FileManager.default.removeItem(at: url)
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            logger.error("Failed to delete \(path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private func pruneEmptyDirectories(for relativePaths: [String], in destination: URL) {
@@ -495,12 +508,16 @@ public final class TorrentSession {
     private func restoreItem(_ persisted: PersistedItem) -> (TorrentItem, TorrentMetainfo)? {
         let announceURLs = persisted.announceURLs.compactMap { URL(string: $0) }
         let webSeedURLs = persisted.webSeedURLs.compactMap { URL(string: $0) }
-        guard let metainfo = try? metainfoParser.parseInfoDictionary(
-            data: persisted.infoDictionaryData,
-            announceURLs: announceURLs,
-            webSeedURLs: webSeedURLs,
-            preferredName: persisted.name
-        ) else {
+        let metainfo: TorrentMetainfo
+        do {
+            metainfo = try metainfoParser.parseInfoDictionary(
+                data: persisted.infoDictionaryData,
+                announceURLs: announceURLs,
+                webSeedURLs: webSeedURLs,
+                preferredName: persisted.name
+            )
+        } catch {
+            logger.error("Dropping restored row \"\(persisted.name, privacy: .public)\": stored info dict failed to parse: \(error.localizedDescription, privacy: .public)")
             return nil
         }
 

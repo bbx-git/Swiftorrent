@@ -366,7 +366,7 @@ public actor PeerWireClient {
     private func handshake() -> Data {
         var data = Data()
         data.append(19)
-        data.append("BitTorrent protocol".data(using: .ascii)!)
+        data.append(Data("BitTorrent protocol".utf8))
         data.append(Data([0, 0, 0, 0, 0, 0x10, 0, 0]))
         data.append(infoHash)
         data.append(peerID)
