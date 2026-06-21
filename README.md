@@ -118,7 +118,3 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 ### P2 — Performance & polish
 
 - (No open P2 items — file selection and per-file progress now ship; see **Features**.)
-
-### Hardening tests
-
-- Integration tests using assets only from `~/Documents/Xcode/aTemp`.

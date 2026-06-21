@@ -4,11 +4,11 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** Add dialog now holds torrents in a pending list (only added to the visible list after Download is clicked), partial selections download via web seeds, and "no subfolder" strips the output path only (web-seed URLs intact). Only remaining roadmap item: hardening integration tests from `~/Documents/Xcode/aTemp`.
+- **Next Immediate Step:** Core download stack was just split into one-responsibility-per-file modules (see Recent Fixes); behavior unchanged, 35 tests green, Release app redeployed. No roadmap items currently open (the aTemp integration-test item was dropped). Candidate next work: bandwidth/rate limiting, or magnet-path PEX.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
-- **Core:** `SwiftorrentCore` for bencode, metainfo, magnet parsing, magnet metadata resolution, trackers, peer-wire, downloader, file writer.
+- **Core:** `SwiftorrentCore` for bencode, metainfo, magnet parsing, magnet metadata resolution, trackers, peer-wire, and downloading. The download stack is split one-responsibility-per-file: `TorrentDownloader` (thin orchestrator), `WebSeedDownloader` (HTTP/BEP-19), `PeerSwarmDownloader` (peer-wire pool), `PieceDownloadCoordinator` (rarest-first scheduling/accounting actor), `TorrentFileWriter` (disk I/O + verify/finalize), `FileProgressMapper`, and `TorrentDownloadProgress`/`TorrentFileProgress` (progress types).
 - **Domain:** `SwiftorrentDomain` for `@Observable` torrent session state and default Downloads folder behavior.
 - **Features:** `SwiftorrentFeatures` for SwiftUI root UI.
 - **Tests:** `SwiftorrentCoreTests` using Swift Testing.
@@ -34,6 +34,7 @@
   - Changed app accent styling from blue to graphite black/grey.
   - Fixed all P0 (critical) roadmap items: untrusted-input crash/OOM/hang hardening across bencode, peer-wire, tracker, and DHT paths.
 - **Recent Fixes (Anti-Regression):**
+  - Refactor (god-file split): the 1024-line `TorrentDownloader.swift` was decomposed into focused files with no behavior change (build clean, all 35 tests pass). `TorrentDownloader` is now a thin orchestrator (`download`, `collectPeers`, capacity/peer-id helpers, `TrackerAnnouncing`/`DHTPeerFinding` protocols). Web-seed logic moved to `WebSeedDownloader` (`downloadAll`/`downloadSelected` over a shared `stream` driver, `fetchRange`, boundary-neighbor slices, `appendingTorrentRelativePath`). Concurrent peer download moved to `PeerSwarmDownloader` (`download` = old `downloadPiecesConcurrently`, `connectPeerSessions`, plus the now-private `PeerDownloadSession`/`TorrentPieceWriter`). `PieceDownloadCoordinator` and `TorrentFileWriter` each got their own file. New `FileProgressMapper` (`metainfo` + `selection`) replaces the old private `fileProgress(...)` and is shared by both download paths so per-file progress stays identical. Progress types live in `TorrentDownloadProgress.swift`. No public API changed; `swift build -c release` clean and Release app redeployed.
   - Feature/UI (per-file delete): the expandable per-row file list now deletes files from disk instead of toggling download selection. `FileSelectionRow` → `FileRow`: the checkbox is replaced by a destructive `trash` SF Symbol button that raises a "Delete File?" confirmation alert (Delete/Cancel) warning the file is permanently removed from the drive. New `TorrentSession.deleteFile(itemID:fileID:)` removes the file's final + `.tor` partial (reusing `removeFileIfContained`/`pruneEmptyDirectories`, indexed via `outputRelativePaths` so the strip-root choice is honored), sets the entry `isSelected = false` / `downloadedBytes = 0`, and `recomputeTotals` re-derives the row's byte/progress totals over the remaining selected files (a complete torrent stays complete over its smaller selection; the "N of M files" label drops by one). A live download is relaunched via `launchDownloadTask` so its scheduler drops the file; idle torrents just lose it. Mid-download selection toggling from the row list is gone (the add dialog still has selection checkboxes); `session.setFileSelected` is still used by the add dialog only. The expandable list shows only selected files (`ForEach(item.files.filter(\.isSelected))`), so skipped/deleted files don't appear; each `FileRow` puts the red (`.foregroundStyle(.red)`) `trash` button at the leading edge, before the file name.
   - Feature/UI (transparency pass): made the app a translucent Liquid Glass window. New `WindowEffects.swift` (Features) adds `VisualEffectBackground` (an `NSVisualEffectView`, `.underWindowBackground` material, `.behindWindow` blending) and a `TransparentWindowConfigurator`/`.transparentWindow()` modifier that sets the hosting `NSWindow` `isOpaque = false`, `backgroundColor = .clear`, transparent/hidden titlebar, and `.fullSizeContentView`. `appBackground` now returns `VisualEffectBackground` instead of opaque `windowBackgroundColor`, so the detail pane shows the blurred desktop and tracks the macOS Liquid Glass opacity slider / Reduce Transparency. The app scene gained `.windowStyle(.hiddenTitleBar)` so no "Swiftorrent" title bar is drawn. Sidebar keeps its system vibrant material (with the existing ~4.5% tint) so it stays subtly distinct rather than fully see-through.
   - Feature/UI (previous): four user-requested UI changes. (1) Removed the gradient behind the torrent list — `appBackground` is now a flat `Color(nsColor: .windowBackgroundColor)`. (2) Added a combined download-speed statistic: `TorrentSession.downloadSpeed` (bytes/s) is sampled once a second by `startSpeedSampler()` from the delta of `totalDownloadedBytes` (completed/removed torrents naturally stop counting; transient drops clamp to 0); surfaced via `downloadSpeedDescription` and a new "Speed" `Metric` in the header (Metric now takes an optional SF Symbol). (3) Per-torrent pause/resume: new `TorrentItem.State.paused`, `TorrentSession.pause(itemID:)` (cancels the task, keeps on-disk progress) and `resume(itemID:)` (re-verifies + restarts via shared `launchDownloadTask(itemID:metainfo:)`, which now also backs `startDownload`/`setFileSelected`). `TorrentRow` shows a `pause.fill`/`play.fill` SF Symbol button for downloading/paused rows. (4) Brightened progress bars: new `Color.swiftorrentProgress` (vivid green) tints the row and per-file `ProgressView`s so progress stands out.
@@ -64,8 +65,8 @@
 - **Transmission reference:** Transmission was consulted for protocol concepts only; no code was copied or translated.
 
 ## Build & Run Status
-- **Last Build:** Success, Release mode via `Scripts/package_app.sh`.
-- **Tests:** Success, `swift test -c release`, 35 Swift Testing tests passed (latest adds: writer strips root directory to destination root, flatten-root-directory strip + geometry preservation, single-file flatten no-op).
+- **Last Build:** Success, Release mode via `Scripts/package_app.sh`; app reinstalled to `~/Applications/Swiftorrent.app` after the download-stack file split.
+- **Tests:** Success, `swift test -c release`, 35 Swift Testing tests passed (unchanged by the refactor — no test edits needed; `TorrentFileWriter` API preserved).
 - **Deployment:** Fresh `Swiftorrent.app` should always be created from `.build/output/Release/Swiftorrent`, ad hoc signed, verified, launched if needed, quit, and copied to `~/Applications/Swiftorrent.app`. Do not copy builds to `/Applications`.
 - **Test Assets:** No external test assets used; standard directory remains `~/Documents/Xcode/aTemp`.
 
@@ -73,7 +74,14 @@
 - `Package.swift`
 - `App/Resources/Info.plist`
 - `App/Sources/SwiftorrentApp/SwiftorrentApp.swift`
-- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/*.swift`
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/TorrentDownloader.swift` (slimmed to orchestrator)
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/WebSeedDownloader.swift` (new)
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/PeerSwarmDownloader.swift` (new)
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/PieceDownloadCoordinator.swift` (new)
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/TorrentFileWriter.swift` (new)
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/FileProgressMapper.swift` (new)
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/TorrentDownloadProgress.swift` (new)
+- `Packages/SwiftorrentCore/Sources/SwiftorrentCore/*.swift` (other Core sources)
 - `Packages/SwiftorrentDomain/Sources/SwiftorrentDomain/TorrentSession.swift`
 - `Packages/SwiftorrentFeatures/Sources/SwiftorrentFeatures/SwiftorrentRootView.swift`
 - `Packages/SwiftorrentFeatures/Sources/SwiftorrentFeatures/WindowEffects.swift`
