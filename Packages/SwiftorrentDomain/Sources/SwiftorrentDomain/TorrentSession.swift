@@ -73,13 +73,27 @@ public final class TorrentSession {
     /// negative.
     private func startSpeedSampler() {
         speedSampler = Task { [weak self] in
-            var previous: Int64 = 0
+            let clock = ContinuousClock()
+            // Trailing window of (time, cumulative bytes) samples. Reporting the
+            // delta across the whole window — divided by the *actual* elapsed time
+            // rather than assuming an exact 1s tick — smooths the lumpiness of
+            // piece-granular accounting (bytes land only when a whole piece
+            // verifies), so the readout tracks the true rate instead of swinging
+            // between a near-zero dip and a one-piece spike.
+            var samples: [(time: ContinuousClock.Instant, bytes: Int64)] = []
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
+                let now = clock.now
                 let current = self.totalDownloadedBytes
-                self.downloadSpeed = max(0, current - previous)
-                previous = current
+                samples.append((now, current))
+                // Keep ~4 seconds of history (the most recent 4 one-second ticks).
+                if samples.count > 4 { samples.removeFirst() }
+                let oldest = samples[0]
+                let span = oldest.time.duration(to: now)
+                let seconds = Double(span.components.seconds) + Double(span.components.attoseconds) / 1e18
+                let delta = max(0, current - oldest.bytes)
+                self.downloadSpeed = seconds > 0 ? Int64(Double(delta) / seconds) : 0
                 // Checkpoint progress to disk every ~10s so a crash mid-download
                 // loses at most a few seconds of progress (resume re-verifies the
                 // actual on-disk bytes regardless).
@@ -415,6 +429,11 @@ public final class TorrentSession {
     /// final state must be saved). Routine ticks are persisted by the periodic
     /// checkpoint instead of on every update.
     private func applyDownloadProgress(_ progress: TorrentDownloadProgress, to itemID: TorrentItem.ID) {
+        // Cancellation is cooperative, so a paused torrent's download task can emit
+        // one final tick after `pause()` has already set `.paused`. Drop ticks for
+        // anything that isn't actively downloading, otherwise the late tick reverts
+        // the row to `.downloading` and rewinds the progress bar to its value.
+        guard items.first(where: { $0.id == itemID })?.state == .downloading else { return }
         var justCompleted = false
         update(itemID) { item in
             let wasComplete = item.state == .complete

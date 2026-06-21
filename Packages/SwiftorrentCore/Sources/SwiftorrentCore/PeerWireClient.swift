@@ -167,7 +167,12 @@ public actor PeerWireClient {
         return Data(metadata.prefix(metadataSize))
     }
 
-    public func downloadPiece(index: Int, length: Int, expectedHash: Data, blockSize: Int = 16 * 1024) async throws -> Data {
+    /// Downloads a piece block by block. `onBlock` is awaited after each 16 KB
+    /// block arrives, carrying that block's byte count — the caller uses it to
+    /// charge the shared rate limiter at block granularity, so the throttle holds
+    /// the combined cap smoothly rather than letting a whole piece burst through
+    /// before any pacing is applied.
+    public func downloadPiece(index: Int, length: Int, expectedHash: Data, blockSize: Int = 16 * 1024, onBlock: (@Sendable (Int) async -> Void)? = nil) async throws -> Data {
         try Task.checkCancellation()
         var piece = Data(count: length)
         var downloaded = 0
@@ -191,6 +196,7 @@ public actor PeerWireClient {
             }
             piece.replaceSubrange(block.begin..<(block.begin + block.data.count), with: block.data)
             downloaded += block.data.count
+            await onBlock?(block.data.count)
         }
 
         guard Data(Insecure.SHA1.hash(data: piece)) == expectedHash else {

@@ -594,12 +594,14 @@ private struct SpeedLimitControl: View {
         case kilobytes, megabytes
         var id: String { rawValue }
         var label: String { self == .kilobytes ? "KB/s" : "MB/s" }
-        var multiplier: Int { self == .kilobytes ? 1024 : 1024 * 1024 }
+        // Decimal (1000-based) to match the `.file` ByteCountFormatter display,
+        // so a typed "50 KB/s" reads back as exactly "50 KB/s".
+        var multiplier: Int { self == .kilobytes ? 1_000 : 1_000_000 }
     }
 
     private static let presets: [Int] = [
-        128 * 1024, 256 * 1024, 512 * 1024,
-        1024 * 1024, 2 * 1024 * 1024, 5 * 1024 * 1024, 10 * 1024 * 1024
+        128 * 1_000, 256 * 1_000, 512 * 1_000,
+        1_000_000, 2_000_000, 5_000_000, 10_000_000
     ]
 
     static func label(forBytesPerSecond bytes: Int) -> String {
@@ -656,13 +658,6 @@ private struct SpeedLimitControl: View {
                 }
                 .labelsHidden()
                 .fixedSize()
-            }
-            HStack {
-                Button("Unlimited") {
-                    limit = nil
-                    showingCustom = false
-                }
-                Spacer()
                 Button("Set", action: applyCustom)
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
@@ -671,7 +666,7 @@ private struct SpeedLimitControl: View {
             }
         }
         .padding(16)
-        .frame(width: 260)
+        .frame(width: 300)
     }
 
     /// Parses the typed value (accepting a comma or dot decimal) into bytes per
@@ -697,12 +692,12 @@ private struct SpeedLimitControl: View {
             customValue = ""
             return
         }
-        if limit % (1024 * 1024) == 0 {
+        if limit % 1_000_000 == 0 {
             customUnit = .megabytes
-            customValue = String(limit / (1024 * 1024))
+            customValue = String(limit / 1_000_000)
         } else {
             customUnit = .kilobytes
-            customValue = String(format: "%g", Double(limit) / 1024.0)
+            customValue = String(format: "%g", Double(limit) / 1_000.0)
         }
     }
 }

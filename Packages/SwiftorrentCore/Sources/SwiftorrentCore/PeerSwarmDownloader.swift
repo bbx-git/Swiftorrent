@@ -64,11 +64,22 @@ struct PeerSwarmDownloader: Sendable {
                         do {
                             let length = layout.length(ofPiece: pieceIndex)
                             await progress(TorrentDownloadProgress(status: "Downloading piece \(pieceIndex + 1) of \(metainfo.pieceHashes.count)", downloadedBytes: await coordinator.downloadedBytes, totalBytes: downloadTotal))
+                            let limiter = rateLimiter
                             let piece = try await withTimeout(seconds: .seconds(60)) {
-                                try await session.client.downloadPiece(index: pieceIndex, length: length, expectedHash: metainfo.pieceHashes[pieceIndex])
+                                try await session.client.downloadPiece(index: pieceIndex, length: length, expectedHash: metainfo.pieceHashes[pieceIndex]) { blockBytes in
+                                    // Pace at block granularity so the shared cap
+                                    // holds smoothly instead of a whole piece
+                                    // arriving full-speed and then sleeping.
+                                    await limiter?.consume(blockBytes)
+                                    // Report bytes as they land (coalesced) so the
+                                    // speed readout tracks the true rate instead of
+                                    // jumping a whole piece at a time.
+                                    if let live = await coordinator.recordInflight(pieceIndex: pieceIndex, bytes: blockBytes) {
+                                        await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: live, totalBytes: downloadTotal))
+                                    }
+                                }
                             }
                             try await writer.write(piece: piece, pieceIndex: pieceIndex)
-                            await rateLimiter?.consume(piece.count)
                             let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
                             await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: downloaded, totalBytes: downloadTotal, files: mapper.snapshot(perFileBytes: perFileBytes)))
                         } catch is CancellationError {
