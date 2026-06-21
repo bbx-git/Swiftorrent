@@ -12,6 +12,9 @@ public final class TorrentSession {
     /// list once the user clicks Download.
     public private(set) var pendingItems: [TorrentItem] = []
     public var destination: URL
+    /// Combined download speed across all torrents, in bytes per second. Sampled
+    /// once a second from the change in total bytes on disk.
+    public private(set) var downloadSpeed: Int64 = 0
 
     private let metainfoParser = TorrentMetainfoParser()
     private let magnetParser = MagnetLinkParser()
@@ -19,9 +22,38 @@ public final class TorrentSession {
     private let downloader = TorrentDownloader()
     private var tasks: [TorrentItem.ID: Task<Void, Never>] = [:]
     private var metainfos: [TorrentItem.ID: TorrentMetainfo] = [:]
+    private var speedSampler: Task<Void, Never>?
 
     public init(destination: URL = DefaultDownloadDirectory.url()) {
         self.destination = destination
+        startSpeedSampler()
+    }
+
+    /// Total bytes downloaded across every torrent currently in the list.
+    private var totalDownloadedBytes: Int64 {
+        items.reduce(Int64(0)) { $0 + $1.downloadedBytes }
+    }
+
+    /// Combined download speed formatted for display, e.g. "1.2 MB/s".
+    public var downloadSpeedDescription: String {
+        ByteCountFormatter.string(fromByteCount: downloadSpeed, countStyle: .file) + "/s"
+    }
+
+    /// Samples the combined download rate once a second. Using the delta of total
+    /// bytes on disk means completed or removed torrents naturally stop counting,
+    /// and a transient drop (a removed torrent) clamps to zero rather than going
+    /// negative.
+    private func startSpeedSampler() {
+        speedSampler = Task { [weak self] in
+            var previous: Int64 = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self else { return }
+                let current = self.totalDownloadedBytes
+                self.downloadSpeed = max(0, current - previous)
+                previous = current
+            }
+        }
     }
 
     public func chooseDestination(_ url: URL) {
@@ -128,6 +160,39 @@ public final class TorrentSession {
         item.status = "Starting download."
         items.insert(item, at: 0)
 
+        launchDownloadTask(itemID: itemID, metainfo: metainfo)
+    }
+
+    /// Cancels the running download task while keeping the torrent (and its
+    /// on-disk progress) in the list, so it can be resumed later.
+    public func pause(itemID: TorrentItem.ID) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              items[index].state == .downloading else {
+            return
+        }
+        tasks[itemID]?.cancel()
+        tasks[itemID] = nil
+        items[index].state = .paused
+        items[index].status = "Paused."
+    }
+
+    /// Restarts a paused torrent. On-disk pieces are re-verified, so the download
+    /// picks up where it left off.
+    public func resume(itemID: TorrentItem.ID) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              items[index].state == .paused,
+              let metainfo = metainfos[itemID] else {
+            return
+        }
+        items[index].state = .downloading
+        items[index].status = "Resuming download."
+        launchDownloadTask(itemID: itemID, metainfo: metainfo)
+    }
+
+    /// Spawns the download task for a torrent already in `items`, routing
+    /// failures into the item's `failed` state. Shared by start, resume, and
+    /// file-selection relaunch so they stay in lockstep.
+    private func launchDownloadTask(itemID: TorrentItem.ID, metainfo: TorrentMetainfo) {
         tasks[itemID] = Task {
             defer { tasks[itemID] = nil }
             do {
@@ -167,19 +232,7 @@ public final class TorrentSession {
         items[index].state = .downloading
         items[index].status = "Applying file selection."
         tasks[itemID]?.cancel()
-        tasks[itemID] = Task {
-            defer { tasks[itemID] = nil }
-            do {
-                try await runDownload(itemID: itemID, metainfo: metainfo)
-            } catch is CancellationError {
-                return
-            } catch {
-                update(itemID) {
-                    $0.status = error.localizedDescription
-                    $0.state = .failed
-                }
-            }
-        }
+        launchDownloadTask(itemID: itemID, metainfo: metainfo)
     }
 
     /// Selects or deselects every file in a torrent at once (the dialog's
@@ -317,6 +370,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
         case queued
         case reviewing
         case downloading
+        case paused
         case complete
         case failed
     }

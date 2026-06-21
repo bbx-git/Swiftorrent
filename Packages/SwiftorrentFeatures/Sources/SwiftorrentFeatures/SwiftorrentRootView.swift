@@ -93,27 +93,7 @@ public struct SwiftorrentRootView: View {
     }
 
     private var appBackground: some View {
-        ZStack {
-            Color(nsColor: .windowBackgroundColor)
-            LinearGradient(
-                colors: [
-                    Color.black.opacity(0.14),
-                    Color.swiftorrentSmoke.opacity(0.10),
-                    Color.clear
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            RadialGradient(
-                colors: [
-                    Color.swiftorrentGraphite.opacity(0.14),
-                    Color.clear
-                ],
-                center: .topTrailing,
-                startRadius: 40,
-                endRadius: 520
-            )
-        }
+        Color(nsColor: .windowBackgroundColor)
     }
 
     private var sidebar: some View {
@@ -180,8 +160,9 @@ public struct SwiftorrentRootView: View {
     private var header: some View {
         HStack {
             Spacer()
-            Metric(title: "Active", value: "\(session.items.filter { $0.state == .downloading }.count)")
-            Metric(title: "Done", value: "\(session.items.filter { $0.state == .complete }.count)")
+            Metric(title: "Speed", value: session.downloadSpeedDescription, systemImage: "arrow.down.circle")
+            Metric(title: "Active", value: "\(session.items.filter { $0.state == .downloading }.count)", systemImage: "arrow.down.to.line")
+            Metric(title: "Done", value: "\(session.items.filter { $0.state == .complete }.count)", systemImage: "checkmark.circle")
         }
         .padding(28)
     }
@@ -203,6 +184,12 @@ public struct SwiftorrentRootView: View {
                                     isSelected: selectedItemID == item.id,
                                     setFileSelected: { fileID, isSelected in
                                         session.setFileSelected(itemID: item.id, fileID: fileID, isSelected: isSelected)
+                                    },
+                                    pause: {
+                                        session.pause(itemID: item.id)
+                                    },
+                                    resume: {
+                                        session.resume(itemID: item.id)
                                     },
                                     remove: {
                                         requestRemoval(for: item)
@@ -276,10 +263,13 @@ private struct TorrentRow: View {
     let item: TorrentItem
     let isSelected: Bool
     let setFileSelected: (Int, Bool) -> Void
+    let pause: () -> Void
+    let resume: () -> Void
     let remove: () -> Void
     @State private var showFiles = false
 
     private var hasFileList: Bool { item.files.count > 1 }
+    private var canPauseOrResume: Bool { item.state == .downloading || item.state == .paused }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -304,6 +294,7 @@ private struct TorrentRow: View {
 
                     ProgressView(value: item.progress)
                         .progressViewStyle(.linear)
+                        .tint(.swiftorrentProgress)
 
                     HStack {
                         Text(item.status)
@@ -326,10 +317,19 @@ private struct TorrentRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+                if canPauseOrResume {
+                    Button(action: item.state == .downloading ? pause : resume) {
+                        Image(systemName: item.state == .downloading ? "pause.fill" : "play.fill")
+                    }
+                    .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.12)).interactive()))
+                    .help(item.state == .downloading ? "Pause" : "Resume")
+                }
+
                 Button(role: .destructive, action: remove) {
                     Image(systemName: "xmark")
                 }
                 .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.12)).interactive()))
+                .help("Remove")
             }
 
             if hasFileList, showFiles {
@@ -361,6 +361,7 @@ private struct TorrentRow: View {
         case .queued: "clock"
         case .reviewing: "checklist"
         case .downloading: "arrow.down"
+        case .paused: "pause.circle.fill"
         case .complete: "checkmark.circle.fill"
         case .failed: "exclamationmark.triangle.fill"
         }
@@ -371,6 +372,7 @@ private struct TorrentRow: View {
         case .queued: .secondary
         case .reviewing: .swiftorrentSmoke
         case .downloading: .swiftorrentGreen
+        case .paused: .swiftorrentSmoke
         case .complete: .swiftorrentBlue
         case .failed: .swiftorrentRed
         }
@@ -381,6 +383,7 @@ private struct TorrentRow: View {
         case .queued: .swiftorrentSmoke
         case .reviewing: .swiftorrentSmoke
         case .downloading: .swiftorrentGreen
+        case .paused: .swiftorrentSmoke
         case .complete: .swiftorrentBlue
         case .failed: .swiftorrentRed
         }
@@ -388,7 +391,7 @@ private struct TorrentRow: View {
 
     private var badgeForeground: Color {
         switch item.state {
-        case .queued, .reviewing: .primary
+        case .queued, .reviewing, .paused: .primary
         case .downloading, .complete, .failed: .white
         }
     }
@@ -417,6 +420,7 @@ private struct FileSelectionRow: View {
                     ProgressView(value: file.fraction)
                         .progressViewStyle(.linear)
                         .controlSize(.mini)
+                        .tint(.swiftorrentProgress)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -567,14 +571,22 @@ private struct FileSelectionSheet: View {
 private struct Metric: View {
     let title: String
     let value: String
+    var systemImage: String? = nil
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 2) {
             Text(value)
                 .font(.title2.bold())
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Label {
+                Text(title)
+            } icon: {
+                if let systemImage {
+                    Image(systemName: systemImage)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -587,6 +599,8 @@ private extension Color {
     static let swiftorrentSmoke = Color(red: 0.46, green: 0.46, blue: 0.48)
     static let swiftorrentPanel = Color.black.opacity(0.08)
     static let swiftorrentGreen = Color(red: 0.05, green: 0.58, blue: 0.28)
+    /// Vivid progress-bar fill so download progress stands out against the panel.
+    static let swiftorrentProgress = Color(red: 0.18, green: 0.80, blue: 0.44)
     static let swiftorrentBlue = Color(red: 0.08, green: 0.38, blue: 0.82)
     static let swiftorrentRed = Color(red: 0.82, green: 0.12, blue: 0.12)
 }

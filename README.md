@@ -20,6 +20,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Offers a per-torrent "Create a subfolder named ..." option in that dialog so multi-file torrents can write their files directly into the destination instead of an enclosing folder. This affects only the on-disk output path; the torrent-relative paths used for web-seed URLs and the piece map are unchanged.
 - Lets you choose which files in a multi-file torrent to download, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Partial selections download via web seeds when available (selected files are streamed whole and the deselected-neighbor slice of each shared boundary piece is range-fetched so it verifies) as well as via peers. Selection can also be changed mid-download from the expandable file list.
 - Shows per-file download progress in an expandable file list for multi-file torrents.
+- Displays a live combined download-speed statistic (bytes/s across all torrents) alongside active/done counts in the header.
+- Lets you pause and resume any active torrent from an SF Symbol button on its row; pausing keeps on-disk progress and resuming re-verifies existing pieces before continuing.
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed, with a choice to remove only from Swiftorrent or also delete downloaded/partial files from disk.
 - Sanitizes torrent file names and multi-file path components before writing into the chosen destination.
