@@ -67,6 +67,7 @@ public struct SwiftorrentRootView: View {
         }
         .tint(.swiftorrentGraphite)
         .frame(minWidth: 940, minHeight: 620)
+        .transparentWindow()
     }
 
     /// Surfaces the torrent currently in the add dialog (resolving metadata or
@@ -93,7 +94,10 @@ public struct SwiftorrentRootView: View {
     }
 
     private var appBackground: some View {
-        Color(nsColor: .windowBackgroundColor)
+        // Behind-window glass instead of a solid fill so the detail pane is
+        // translucent and tracks the system Liquid Glass opacity slider.
+        VisualEffectBackground(material: .underWindowBackground)
+            .ignoresSafeArea()
     }
 
     private var sidebar: some View {
@@ -182,8 +186,8 @@ public struct SwiftorrentRootView: View {
                                 TorrentRow(
                                     item: item,
                                     isSelected: selectedItemID == item.id,
-                                    setFileSelected: { fileID, isSelected in
-                                        session.setFileSelected(itemID: item.id, fileID: fileID, isSelected: isSelected)
+                                    deleteFile: { fileID in
+                                        session.deleteFile(itemID: item.id, fileID: fileID)
                                     },
                                     pause: {
                                         session.pause(itemID: item.id)
@@ -262,7 +266,7 @@ public struct SwiftorrentRootView: View {
 private struct TorrentRow: View {
     let item: TorrentItem
     let isSelected: Bool
-    let setFileSelected: (Int, Bool) -> Void
+    let deleteFile: (Int) -> Void
     let pause: () -> Void
     let resume: () -> Void
     let remove: () -> Void
@@ -346,9 +350,9 @@ private struct TorrentRow: View {
 
     private var fileList: some View {
         VStack(spacing: 6) {
-            ForEach(item.files) { file in
-                FileSelectionRow(file: file) { isSelected in
-                    setFileSelected(file.id, isSelected)
+            ForEach(item.files.filter(\.isSelected)) { file in
+                FileRow(file: file) {
+                    deleteFile(file.id)
                 }
             }
         }
@@ -397,35 +401,42 @@ private struct TorrentRow: View {
     }
 }
 
-private struct FileSelectionRow: View {
+private struct FileRow: View {
     let file: TorrentItem.FileEntry
-    let setSelected: (Bool) -> Void
+    let delete: () -> Void
+    @State private var confirmingDelete = false
 
     var body: some View {
         HStack(spacing: 10) {
-            Toggle(isOn: Binding(get: { file.isSelected }, set: { setSelected($0) })) {
-                EmptyView()
+            Button(role: .destructive) {
+                confirmingDelete = true
+            } label: {
+                Image(systemName: "trash")
             }
-            .toggleStyle(.checkbox)
-            .labelsHidden()
+            .buttonStyle(.borderless)
+            .foregroundStyle(.red)
+            .help("Delete this file from the drive")
+            .alert("Delete File?", isPresented: $confirmingDelete) {
+                Button("Delete", role: .destructive, action: delete)
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("\"\(file.name)\" will be permanently removed from your drive. This cannot be undone.")
+            }
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(file.name)
                     .font(.caption)
-                    .foregroundStyle(file.isSelected ? .primary : .secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
 
-                if file.isSelected {
-                    ProgressView(value: file.fraction)
-                        .progressViewStyle(.linear)
-                        .controlSize(.mini)
-                        .tint(.swiftorrentProgress)
-                }
+                ProgressView(value: file.fraction)
+                    .progressViewStyle(.linear)
+                    .controlSize(.mini)
+                    .tint(.swiftorrentProgress)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(file.isSelected ? "\(Int(file.fraction * 100))% · \(file.totalDescription)" : "Skipped")
+            Text("\(Int(file.fraction * 100))% · \(file.totalDescription)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()

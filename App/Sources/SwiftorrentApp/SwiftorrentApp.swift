@@ -7,6 +7,7 @@ struct SwiftorrentApp: App {
         WindowGroup {
             SwiftorrentRootView()
         }
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }

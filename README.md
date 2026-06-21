@@ -5,6 +5,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 ## Features
 
 - Modern SwiftUI macOS 26 interface with graphite Liquid Glass controls, a sidebar, torrent list, progress rows, and folder picker.
+- Translucent Liquid Glass window: the title bar is hidden and the window is non-opaque with behind-window materials, so the app shows the blurred desktop and tracks the system Liquid Glass opacity slider / Reduce Transparency setting.
 - Default download folder uses `FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)`, so it respects the user's localized system Downloads directory.
 - Opens `.torrent` files from the UI and from app/document open URLs.
 - Accepts `magnet:` URLs from the UI and from app URL opening.
@@ -18,8 +19,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Discovers additional inbound peers through BEP 11 PEX (consumes peer lists only; never advertises this client as a source).
 - Presents an add dialog the moment you open a `.torrent` or paste a magnet: it shows a resolving spinner while metadata loads, then per-file checkboxes, Select All / Deselect All, and a running selected-size total, so you pick what to download before any data is fetched. The torrent only appears in the list after you click **Download**; dismissing the dialog cancels adding it entirely (nothing is written to disk).
 - Offers a per-torrent "Create a subfolder named ..." option in that dialog so multi-file torrents can write their files directly into the destination instead of an enclosing folder. This affects only the on-disk output path; the torrent-relative paths used for web-seed URLs and the piece map are unchanged.
-- Lets you choose which files in a multi-file torrent to download, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Partial selections download via web seeds when available (selected files are streamed whole and the deselected-neighbor slice of each shared boundary piece is range-fetched so it verifies) as well as via peers. Selection can also be changed mid-download from the expandable file list.
-- Shows per-file download progress in an expandable file list for multi-file torrents.
+- Lets you choose which files in a multi-file torrent to download from the add dialog, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Partial selections download via web seeds when available (selected files are streamed whole and the deselected-neighbor slice of each shared boundary piece is range-fetched so it verifies) as well as via peers.
+- Shows per-file download progress in an expandable file list for multi-file torrents, with a per-file trash button (and a confirmation warning) that permanently deletes that file from the drive and drops it from the torrent's selection.
 - Displays a live combined download-speed statistic (bytes/s across all torrents) alongside active/done counts in the header.
 - Lets you pause and resume any active torrent from an SF Symbol button on its row; pausing keeps on-disk progress and resuming re-verifies existing pieces before continuing.
 - Performs a free-space check before writing torrent data.

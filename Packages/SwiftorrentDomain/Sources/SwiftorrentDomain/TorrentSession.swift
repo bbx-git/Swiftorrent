@@ -250,6 +250,54 @@ public final class TorrentSession {
         }
     }
 
+    /// Permanently deletes one file of a torrent from disk (its final file and
+    /// any `.tor` partial), then drops it from the selection so it isn't
+    /// refetched. A running download is relaunched to stop fetching it; an idle
+    /// torrent (complete/paused/failed) just loses the file. The torrent's other
+    /// files are untouched.
+    public func deleteFile(itemID: TorrentItem.ID, fileID: Int) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              let fileIndex = items[index].files.firstIndex(where: { $0.id == fileID }) else {
+            return
+        }
+        deleteFileFromDisk(items[index].files[fileIndex], in: items[index])
+        items[index].files[fileIndex].isSelected = false
+        items[index].files[fileIndex].downloadedBytes = 0
+        recomputeTotals(itemIndex: index)
+
+        // A live download must be relaunched so its piece scheduler drops the
+        // now-deselected file; idle torrents simply keep the smaller selection.
+        if items[index].state == .downloading, let metainfo = metainfos[itemID] {
+            items[index].status = "Applying file selection."
+            tasks[itemID]?.cancel()
+            launchDownloadTask(itemID: itemID, metainfo: metainfo)
+        }
+    }
+
+    private func deleteFileFromDisk(_ file: TorrentItem.FileEntry, in item: TorrentItem) {
+        let destination = item.destination.standardizedFileURL
+        // `outputRelativePaths` already accounts for the strip-root choice and is
+        // indexed by file id; fall back to the torrent-relative path if missing.
+        let relativePath = file.id < item.outputRelativePaths.count ? item.outputRelativePaths[file.id] : file.path
+        let finalURL = destination.appendingPathComponent(relativePath).standardizedFileURL
+        let partialURL = finalURL.appendingPathExtension("tor").standardizedFileURL
+        removeFileIfContained(partialURL, in: destination)
+        removeFileIfContained(finalURL, in: destination)
+        pruneEmptyDirectories(for: [relativePath], in: destination)
+    }
+
+    /// Re-derives the item's byte/progress totals from its currently selected
+    /// files, so deleting a file leaves the row consistent (e.g. a complete
+    /// torrent stays complete over its remaining selection).
+    private func recomputeTotals(itemIndex: Int) {
+        let selected = items[itemIndex].files.filter(\.isSelected)
+        let downloaded = selected.reduce(Int64(0)) { $0 + $1.downloadedBytes }
+        let total = selected.reduce(Int64(0)) { $0 + $1.totalBytes }
+        items[itemIndex].downloadedBytes = downloaded
+        items[itemIndex].totalBytes = total
+        items[itemIndex].progress = total > 0 ? min(1, Double(downloaded) / Double(total)) : 0
+    }
+
     private func applyResolvedMetadata(_ metainfo: TorrentMetainfo, to id: TorrentItem.ID) {
         update(id) {
             $0.name = metainfo.name
