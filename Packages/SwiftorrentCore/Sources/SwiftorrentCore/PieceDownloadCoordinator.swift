@@ -6,7 +6,11 @@ import Foundation
 /// pieces to the pending set so another peer can retry them.
 actor PieceDownloadCoordinator {
     private let layout: TorrentLayout
-    private let availabilityCounts: [Int: Int]
+    /// Per-piece availability across the peers seen so far, used only to order
+    /// rarest-first piece selection. Mutable because the swarm is dynamic: workers
+    /// fold in each freshly connected peer via `addAvailability` so the ordering
+    /// keeps refining as peers join and leave.
+    private var availabilityCounts: [Int: Int]
     private var pendingPieces: Set<Int>
     private var activePieces = Set<Int>()
     private var completedPieces: Set<Int>
@@ -48,6 +52,15 @@ actor PieceDownloadCoordinator {
 
     var isComplete: Bool {
         pendingPieces.isEmpty && activePieces.isEmpty
+    }
+
+    /// Folds a newly connected peer's available pieces into the rarest-first
+    /// counts. Called as the worker pool replaces dead peers so piece ordering
+    /// reflects the live swarm rather than just the peers seen at startup.
+    func addAvailability(_ pieces: Set<Int>) {
+        for piece in pieces {
+            availabilityCounts[piece, default: 0] += 1
+        }
     }
 
     func nextPiece(availablePieces: Set<Int>) -> Int? {

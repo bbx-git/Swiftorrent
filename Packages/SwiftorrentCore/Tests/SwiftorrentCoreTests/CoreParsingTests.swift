@@ -640,6 +640,40 @@ struct CoreParsingTests {
         #expect(elapsed < .milliseconds(50))
     }
 
+    @Test("Coordinator folds added availability into rarest-first ordering")
+    func coordinatorAddAvailabilityOrdersRarestFirst() async {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8), Data("ef".utf8)])
+        let layout = TorrentLayout(metainfo: metainfo)
+        let coordinator = PieceDownloadCoordinator(
+            layout: layout,
+            selectablePieces: [0, 1],
+            completedPieces: [],
+            initialDownloaded: 0,
+            availabilityCounts: [:]
+        )
+        // Two peers hold piece 0, only one holds piece 1, so piece 1 is rarer and
+        // must be handed out first even though it has the higher index.
+        await coordinator.addAvailability([0, 1])
+        await coordinator.addAvailability([0])
+        #expect(await coordinator.nextPiece(availablePieces: [0, 1]) == 1)
+        #expect(await coordinator.nextPiece(availablePieces: [0, 1]) == 0)
+    }
+
+    @Test("Peer supply hands out each peer once then drains to nil")
+    func peerSupplyDrainsWithoutDuplicates() async {
+        let peers = [
+            PeerEndpoint(host: "192.0.2.1", port: 1),
+            PeerEndpoint(host: "192.0.2.2", port: 2),
+            PeerEndpoint(host: "192.0.2.3", port: 3)
+        ]
+        let supply = PeerSupply(peers: peers)
+        var handed: [PeerEndpoint] = []
+        while let peer = await supply.next() { handed.append(peer) }
+        #expect(handed == peers)
+        #expect(Set(handed).count == peers.count)
+        #expect(await supply.next() == nil)
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",

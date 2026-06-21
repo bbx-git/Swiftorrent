@@ -66,6 +66,15 @@ Scripts/package_app.sh
 
 The packaged app is written to `.build/output/Release/Swiftorrent.app` and copied to `~/Applications/Swiftorrent.app`.
 
+### Live download smoke test
+
+`big-buck-bunny.torrent` in the repository root is a well-seeded public-domain
+torrent kept for end-to-end download testing (real tracker/DHT/peer swarm).
+Open it in the packaged app to verify the download path against a live swarm —
+e.g. that the peer pool replenishes and the transfer completes and verifies
+without seeding. (The unit tests cover parsing/layout/coordinator logic only;
+the astronomy media in `~/Documents/Xcode/aTemp` are not torrents.)
+
 ## Usage
 
 1. Launch `Swiftorrent.app` from `~/Applications` or `.build/output/Release`.
