@@ -14,7 +14,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Talks to UDP trackers with compact IPv4 peer responses.
 - Resolves magnet metadata through BEP 5 DHT `get_peers`, BEP 10 extension negotiation, and BEP 9 `ut_metadata` requests.
 - Discovers `.torrent` download peers through HTTP/HTTPS trackers, UDP trackers, and BEP 5 DHT `get_peers`.
-- Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, bounded concurrent peer downloads, rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
+- Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, a self-replenishing pool of concurrent peer downloads (workers draw from a shared peer reserve and replace any peer that dies or runs dry, so the swarm refills toward full instead of bleeding out), rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Bounds every peer-wire network wait with connect and per-operation send/receive timeouts, so a peer that goes silent mid-message is torn down instead of parking a download slot.
 - Discovers additional inbound peers through BEP 11 PEX (consumes peer lists only; never advertises this client as a source).
 - Presents an add dialog the moment you open a `.torrent` or paste a magnet: it shows a resolving spinner while metadata loads, then per-file checkboxes, Select All / Deselect All, and a running selected-size total, so you pick what to download before any data is fetched. The torrent only appears in the list after you click **Download**; dismissing the dialog cancels adding it entirely (nothing is written to disk).
@@ -32,7 +32,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, encryption, or NAT traversal.
+- `.torrent` downloads use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, encryption, NAT traversal, uTP, or endgame mode.
 - Magnet links can fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
@@ -124,8 +124,17 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 ## Roadmap
 
-All items preserve the download-only policy (no seeding, uploading, or sharing). PEX, if added, is inbound-only: consume peer lists, never advertise this client as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships.
+All items preserve the download-only policy (no seeding, uploading, or sharing). PEX, if added, is inbound-only: consume peer lists, never advertise this client as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships. (Peer-pool replenishment shipped and is validated against a live swarm — see **Features**.)
 
-### P2 — Performance & polish
+### Robustness & polish (next)
 
-- (No open P2 items — file selection and per-file progress now ship; see **Features**.)
+- Harden best-effort file deletion for unresolved/queued rows (skip disk deletion when no resolved output paths exist instead of guessing the display name).
+- Add structured logging (`os.Logger`) so currently-swallowed persistence and file-deletion failures are observable.
+- Minor cleanups: drop a redundant rethrow in the web-seed writer; replace an avoidable force-unwrap in the peer handshake.
+
+### Larger, optional
+
+- Endgame mode (re-request the last in-flight pieces across peers so the tail doesn't stall).
+- BEP 11 PEX on the magnet metadata path (already present on the `.torrent` path).
+- uTP transport and/or MSE/PE stream encryption for networks that throttle plain BitTorrent TCP.
+- Migrate to a native Xcode app target to drop the manual `.app` bundling step.
