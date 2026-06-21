@@ -7,6 +7,7 @@ import Foundation
 /// count once every selectable piece is present.
 struct PeerSwarmDownloader: Sendable {
     let maxPeerConnections: Int
+    var rateLimiter: RateLimiter? = nil
 
     func download(
         metainfo: TorrentMetainfo,
@@ -67,6 +68,7 @@ struct PeerSwarmDownloader: Sendable {
                                 try await session.client.downloadPiece(index: pieceIndex, length: length, expectedHash: metainfo.pieceHashes[pieceIndex])
                             }
                             try await writer.write(piece: piece, pieceIndex: pieceIndex)
+                            await rateLimiter?.consume(piece.count)
                             let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
                             await progress(TorrentDownloadProgress(status: "Downloading", downloadedBytes: downloaded, totalBytes: downloadTotal, files: mapper.snapshot(perFileBytes: perFileBytes)))
                         } catch is CancellationError {

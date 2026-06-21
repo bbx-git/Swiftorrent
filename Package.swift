@@ -39,6 +39,11 @@ let package = Package(
             name: "SwiftorrentCoreTests",
             dependencies: ["SwiftorrentCore"],
             path: "Packages/SwiftorrentCore/Tests/SwiftorrentCoreTests"
+        ),
+        .testTarget(
+            name: "SwiftorrentDomainTests",
+            dependencies: ["SwiftorrentDomain"],
+            path: "Packages/SwiftorrentDomain/Tests/SwiftorrentDomainTests"
         )
     ]
 )

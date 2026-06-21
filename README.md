@@ -22,6 +22,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Lets you choose which files in a multi-file torrent to download from the add dialog, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Partial selections download via web seeds when available (selected files are streamed whole and the deselected-neighbor slice of each shared boundary piece is range-fetched so it verifies) as well as via peers.
 - Shows per-file download progress in an expandable file list for multi-file torrents, with a per-file trash button (and a confirmation warning) that permanently deletes that file from the drive and drops it from the torrent's selection.
 - Displays a live combined download-speed statistic (bytes/s across all torrents) alongside active/done counts in the header.
+- Caps total download throughput with a header speed-limit control: pick a preset (Unlimited or 128 KB/s–10 MB/s) or type an exact value in KB/s or MB/s via the "Custom…" field. The limit is a shared token bucket applied across all active web-seed and peer transfers (the combined rate stays at the cap even with several concurrent peer connections) and is remembered between launches.
+- Remembers the torrent list across launches: the confirmed torrents, their file selection, destination, and progress are saved to `~/Library/Application Support/Swiftorrent/session.json` (each torrent's `info` dictionary is stored so the metainfo is rebuilt offline, no re-resolution). On the next launch the list is restored and any torrent that was actively downloading auto-resumes (re-verifying on-disk pieces); paused/complete/failed rows keep their state.
 - Lets you pause and resume any active torrent from an SF Symbol button on its row; pausing keeps on-disk progress and resuming re-verifies existing pieces before continuing.
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed, with a choice to remove only from Swiftorrent or also delete downloaded/partial files from disk.
@@ -30,7 +32,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, and support per-file selection (full and partial). The downloader does not yet use local peer discovery, encryption, NAT traversal, or bandwidth limits.
+- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, encryption, or NAT traversal.
 - Magnet links can fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 

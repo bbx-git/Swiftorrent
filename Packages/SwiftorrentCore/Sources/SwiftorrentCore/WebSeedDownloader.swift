@@ -7,6 +7,7 @@ import Foundation
 /// later drops the neighbor partials, leaving exactly the selected files.
 struct WebSeedDownloader: Sendable {
     let session: URLSession
+    var rateLimiter: RateLimiter? = nil
 
     /// Streams every file in `metainfo` whole from the first working web seed.
     func downloadAll(
@@ -60,6 +61,7 @@ struct WebSeedDownloader: Sendable {
                     let sourceURL = webSeedURL.appendingTorrentRelativePath(slice.file.path)
                     let data = try await self.fetchRange(from: sourceURL, offset: slice.fileOffset, length: slice.length)
                     try writer.writeFileChunk(data, to: slice.file, atFileOffset: slice.fileOffset)
+                    await self.rateLimiter?.consume(data.count)
                 }
             }
         )
@@ -210,7 +212,9 @@ struct WebSeedDownloader: Sendable {
                 if buffer.count >= 64 * 1024 {
                     try handle.write(contentsOf: buffer)
                     fileDownloadedBytes += Int64(buffer.count)
+                    let chunkSize = buffer.count
                     buffer.removeAll(keepingCapacity: true)
+                    await rateLimiter?.consume(chunkSize)
                     await progress(progressDownloadedBytes + fileDownloadedBytes)
                 }
             }

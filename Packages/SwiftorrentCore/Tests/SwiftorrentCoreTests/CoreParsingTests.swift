@@ -593,6 +593,53 @@ struct CoreParsingTests {
         #expect(metainfo.flatteningRootDirectory().files.map(\.path) == ["movie.mp4"])
     }
 
+    @Test("Rate limiter passes traffic through when unlimited")
+    func rateLimiterUnlimitedDoesNotBlock() async {
+        let limiter = RateLimiter(bytesPerSecond: nil)
+        let start = ContinuousClock().now
+        // A large consume must return immediately when no cap is set.
+        await limiter.consume(50 * 1024 * 1024)
+        let elapsed = ContinuousClock().now - start
+        #expect(elapsed < .milliseconds(50))
+    }
+
+    @Test("Rate limiter throttles a burst beyond the per-second budget")
+    func rateLimiterThrottlesOverBudget() async {
+        // 1 KB/s cap, bucket starts empty. A 3 KB consume must wait ~3s.
+        let limiter = RateLimiter(bytesPerSecond: 1024)
+        let start = ContinuousClock().now
+        await limiter.consume(3 * 1024)
+        let elapsed = ContinuousClock().now - start
+        #expect(elapsed >= .milliseconds(2500))
+    }
+
+    @Test("Rate limiter caps the combined rate of concurrent consumers")
+    func rateLimiterCapsConcurrentStreams() async {
+        // Four parallel streams each charging 1 KB against a 1 KB/s cap must take
+        // ~4s in total (serialized debt), not ~1s — this is the property that
+        // keeps N peer connections from each running at the full cap.
+        let limiter = RateLimiter(bytesPerSecond: 1024)
+        let start = ContinuousClock().now
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<4 {
+                group.addTask { await limiter.consume(1024) }
+            }
+        }
+        let elapsed = ContinuousClock().now - start
+        #expect(elapsed >= .milliseconds(3500))
+    }
+
+    @Test("Rate limiter stops throttling once the limit is cleared")
+    func rateLimiterClearingLimitUnblocks() async {
+        let limiter = RateLimiter(bytesPerSecond: 1024)
+        await limiter.consume(1024) // drain the initial bucket
+        await limiter.setLimit(bytesPerSecond: nil)
+        let start = ContinuousClock().now
+        await limiter.consume(10 * 1024 * 1024)
+        let elapsed = ContinuousClock().now - start
+        #expect(elapsed < .milliseconds(50))
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",

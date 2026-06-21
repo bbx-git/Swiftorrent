@@ -10,19 +10,24 @@ public struct TorrentDownloader: Sendable {
     private let trackerClient: any TrackerAnnouncing
     private let dhtClient: any DHTPeerFinding
     private let session: URLSession
+    /// Shared throughput cap applied across every concurrent download path. When
+    /// `nil` no limiting is applied.
+    private let rateLimiter: RateLimiter?
     private let maxPeerAttempts = 24
     private let maxPeerConnections = 4
 
-    public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient(), session: URLSession = .shared) {
+    public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient(), session: URLSession = .shared, rateLimiter: RateLimiter? = nil) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
         self.session = session
+        self.rateLimiter = rateLimiter
     }
 
-    init(trackerClient: any TrackerAnnouncing, dhtClient: any DHTPeerFinding, session: URLSession = .shared) {
+    init(trackerClient: any TrackerAnnouncing, dhtClient: any DHTPeerFinding, session: URLSession = .shared, rateLimiter: RateLimiter? = nil) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
         self.session = session
+        self.rateLimiter = rateLimiter
     }
 
     public func download(
@@ -79,7 +84,7 @@ public struct TorrentDownloader: Sendable {
         // into `verifiedPieces` below.
         if !metainfo.webSeedURLs.isEmpty {
             do {
-                let webSeeds = WebSeedDownloader(session: session)
+                let webSeeds = WebSeedDownloader(session: session, rateLimiter: rateLimiter)
                 if isFullSelection {
                     try await webSeeds.downloadAll(
                         metainfo: metainfo,
@@ -137,7 +142,7 @@ public struct TorrentDownloader: Sendable {
             return
         }
 
-        let downloaded = try await PeerSwarmDownloader(maxPeerConnections: maxPeerConnections).download(
+        let downloaded = try await PeerSwarmDownloader(maxPeerConnections: maxPeerConnections, rateLimiter: rateLimiter).download(
             metainfo: metainfo,
             destination: destination,
             layout: layout,

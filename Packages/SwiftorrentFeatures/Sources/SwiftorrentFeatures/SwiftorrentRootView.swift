@@ -163,6 +163,7 @@ public struct SwiftorrentRootView: View {
 
     private var header: some View {
         HStack {
+            SpeedLimitControl(limit: $session.downloadRateLimit)
             Spacer()
             Metric(title: "Speed", value: session.downloadSpeedDescription, systemImage: "arrow.down.circle")
             Metric(title: "Active", value: "\(session.items.filter { $0.state == .downloading }.count)", systemImage: "arrow.down.to.line")
@@ -575,6 +576,133 @@ private struct FileSelectionSheet: View {
             Spacer()
             Button("Close") { cancel() }
                 .keyboardShortcut(.defaultAction)
+        }
+    }
+}
+
+/// Header control for the global download-speed cap: a menu of presets plus a
+/// "Custom…" popover where the user types an exact value in KB/s or MB/s. The
+/// limit is bytes per second; `nil` means unlimited.
+private struct SpeedLimitControl: View {
+    @Binding var limit: Int?
+
+    @State private var showingCustom = false
+    @State private var customValue = ""
+    @State private var customUnit: SpeedUnit = .megabytes
+
+    private enum SpeedUnit: String, CaseIterable, Identifiable {
+        case kilobytes, megabytes
+        var id: String { rawValue }
+        var label: String { self == .kilobytes ? "KB/s" : "MB/s" }
+        var multiplier: Int { self == .kilobytes ? 1024 : 1024 * 1024 }
+    }
+
+    private static let presets: [Int] = [
+        128 * 1024, 256 * 1024, 512 * 1024,
+        1024 * 1024, 2 * 1024 * 1024, 5 * 1024 * 1024, 10 * 1024 * 1024
+    ]
+
+    static func label(forBytesPerSecond bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file) + "/s"
+    }
+
+    var body: some View {
+        Menu {
+            menuButton(title: "Unlimited", isSelected: limit == nil) { limit = nil }
+            Divider()
+            ForEach(Self.presets, id: \.self) { bytes in
+                menuButton(title: Self.label(forBytesPerSecond: bytes), isSelected: limit == bytes) {
+                    limit = bytes
+                }
+            }
+            Divider()
+            Button("Custom…") {
+                prepareCustomFields()
+                showingCustom = true
+            }
+        } label: {
+            Label(limit.map(Self.label(forBytesPerSecond:)) ?? "Unlimited", systemImage: "speedometer")
+        }
+        .menuStyle(.button)
+        .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.16)).interactive()))
+        .fixedSize()
+        .help("Limit total download speed")
+        .popover(isPresented: $showingCustom, arrowEdge: .bottom) { customForm }
+    }
+
+    @ViewBuilder private func menuButton(title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if isSelected {
+                Label(title, systemImage: "checkmark")
+            } else {
+                Text(title)
+            }
+        }
+    }
+
+    private var customForm: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Custom Speed Limit")
+                .font(.headline)
+            HStack(spacing: 8) {
+                TextField("Max", text: $customValue)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 90)
+                    .onSubmit(applyCustom)
+                Picker("", selection: $customUnit) {
+                    ForEach(SpeedUnit.allCases) { unit in
+                        Text(unit.label).tag(unit)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+            HStack {
+                Button("Unlimited") {
+                    limit = nil
+                    showingCustom = false
+                }
+                Spacer()
+                Button("Set", action: applyCustom)
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.swiftorrentGraphite)
+                    .disabled(parsedBytesPerSecond == nil)
+            }
+        }
+        .padding(16)
+        .frame(width: 260)
+    }
+
+    /// Parses the typed value (accepting a comma or dot decimal) into bytes per
+    /// second, or `nil` when it isn't a positive number.
+    private var parsedBytesPerSecond: Int? {
+        let normalized = customValue
+            .replacingOccurrences(of: ",", with: ".")
+            .trimmingCharacters(in: .whitespaces)
+        guard let value = Double(normalized), value > 0 else { return nil }
+        return Int(value * Double(customUnit.multiplier))
+    }
+
+    private func applyCustom() {
+        guard let bytes = parsedBytesPerSecond else { return }
+        limit = bytes
+        showingCustom = false
+    }
+
+    /// Pre-fills the popover from the active limit so editing starts from the
+    /// current value rather than blank.
+    private func prepareCustomFields() {
+        guard let limit else {
+            customValue = ""
+            return
+        }
+        if limit % (1024 * 1024) == 0 {
+            customUnit = .megabytes
+            customValue = String(limit / (1024 * 1024))
+        } else {
+            customUnit = .kilobytes
+            customValue = String(format: "%g", Double(limit) / 1024.0)
         }
     }
 }
