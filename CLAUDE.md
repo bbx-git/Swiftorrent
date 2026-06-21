@@ -16,9 +16,10 @@ Act as a Senior iOS Engineer. Use **Swift 6.3** and the latest SwiftUI standards
 ---
 
 ## Test Data & Assets
-- **Standard Test Directory:** All external test assets (images, videos, sample data) are located at `~/Documents/Xcode/aTemp`.
-- **Constraint:** Do not search for or assume the existence of test files in any other directory (e.g., Downloads, Desktop, or Pictures).
-- **Usage:** If the app or tests require sample media, always reference this path or ask the user to confirm a filename within this specific folder.
+- **In-Repo Test Assets:** Live download/smoke testing uses assets committed to the repository root:
+    - **Torrent file:** `big-buck-bunny.torrent` (well-seeded, public-domain) — documented in `README.md`.
+    - **Magnet link:** the Big Buck Bunny magnet documented in `README.md` (under "Live download smoke test").
+- **Constraint:** Do not search for or assume the existence of external sample files on disk (e.g., Downloads, Desktop, Pictures). If a test needs an asset not already in the repo, ask the user to provide it.
 
 ---
 
@@ -46,7 +47,7 @@ To avoid stale builds and DerivedData issues:
 - **Strict Isolation:** Adhere to Swift 6 isolation; prefer `@MainActor` on UI-bound types and explicit `Sendable` conformance.
 - **Reference vs Value:** Prefer `struct` by default; use `final class` only when reference semantics are essential.
 - **File Discipline:** One file per meaningful responsibility; no "god" files.
-- **Resource Safety:** Check volume capacity before large file operations. Always use the standard test directory `~/Documents/Xcode/aTemp` for media processing tests.
+- **Resource Safety:** Check volume capacity before large file operations.
 - **Temp Paths:** Use `FileManager.default.temporaryDirectory` with uniquely named subdirectories for session-specific outputs.
 
 ---
@@ -89,7 +90,7 @@ Keep it short and factual. It must contain:
 - Are targets thin?
 - Is it Swift 6.3 compatible?
 - App built in **Release** mode and moved to `~/Applications/`?
-- Are test assets strictly pulled from `~/Documents/Xcode/aTemp`?
+- Are test assets pulled from the in-repo files (`big-buck-bunny.torrent` / documented magnet)?
 - `SESSION_STATE.md` contains the "next step" for the next session?
 
 ## Current Project Note

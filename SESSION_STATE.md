@@ -4,7 +4,7 @@
 - **Project:** Swiftorrent
 - **Current Architecture:** Package-first modular Swift Package with Core, Domain, Features, and a thin SwiftUI app executable.
 - **Swift Version:** 6.3.2
-- **Next Immediate Step:** R1 (peer-pool replenishment) and R2 (robustness & polish) both shipped; 43 tests green, Release app redeployed. NEXT: pick from Roadmap candidates (magnet-path PEX, integration testing against `~/Documents/Xcode/aTemp`, or native Xcode app target). Live smoke test uses `big-buck-bunny.torrent` in the repo root (documented in README).
+- **Next Immediate Step:** R1 (peer-pool replenishment) and R2 (robustness & polish) both shipped; 43 tests green, Release app redeployed. NEXT: pick from Roadmap candidates (magnet-path PEX, integration testing against the in-repo assets, or native Xcode app target). Live smoke test uses `big-buck-bunny.torrent` and the Big Buck Bunny magnet link in the repo root / README.
 
 ## Modules & Targets
 - **App:** `SwiftorrentApp` in `App/Sources/SwiftorrentApp`
@@ -57,13 +57,13 @@
 
 ## Known Issues / Technical Debt
 - `.torrent` peer discovery uses HTTP/HTTPS trackers, UDP trackers, DHT, and inbound PEX; magnet metadata discovery uses trackers + DHT (no PEX yet on the magnet path).
-- Downloader uses a self-replenishing concurrent peer pool (4 workers over a shared `PeerSupply` reserve; dead peers are replaced from the ~24-peer reserve) with per-wait peer-wire timeouts. Live-validated against `big-buck-bunny.torrent` (repo root). aTemp holds only astronomy media, no torrents.
+- Downloader uses a self-replenishing concurrent peer pool (4 workers over a shared `PeerSupply` reserve; dead peers are replaced from the ~24-peer reserve) with per-wait peer-wire timeouts. Live-validated against `big-buck-bunny.torrent` (repo root).
 - Disk deletion removes known torrent output paths and partial `.tor` files; unresolved/queued rows (no `outputRelativePaths`) skip disk deletion entirely (logged) rather than guessing from the item name. Swallowed file-delete/persistence failures are logged via `os.Logger` (subsystem `Swiftorrent`).
 - File selection is chosen up front in the add dialog. After a download starts, the row's expandable file list no longer toggles selection; instead its per-file trash button deletes a file from disk and `deleteFile` deselects it, cancelling/restarting a live download (re-verifies on-disk pieces) so the scheduler drops it. Partial selections download via web seeds (selected files whole + range-fetched neighbor slices of shared boundary pieces) and via peers. Deselected files that received shared-boundary bytes are cleaned up at finalize.
 - The torrent list now persists across launches (`session.json` under Application Support) and downloading rows auto-resume. Persistence stores the `info` dict per item to rebuild the metainfo offline; if a stored `info` dict ever fails to parse, that row is silently dropped on restore rather than shown broken.
 - Download throughput can be capped via a shared `RateLimiter` token bucket. Limiting is applied *after* each chunk/piece is read (it throttles by pausing the read loop), so the cap governs the running average rather than instantaneous burst; a peer piece larger than one second's budget is admitted after a proportional wait.
 - Manual app bundling is required because the current project is an SPM executable instead of a native Xcode app target.
-- The user-provided magnet was used only for parser/hash/tracker-shape verification, not media download. Future external test assets must use `~/Documents/Xcode/aTemp`.
+- The Big Buck Bunny magnet link (documented in README) drives magnet-path testing (info-hash → metadata exchange → swarm). New test assets live in the repo root, not an external directory.
 
 ## Decisions & Rationale
 - **Pure Swift/Apple-only:** Uses SwiftUI, Observation, Foundation, Network, CryptoKit, AppKit, and UniformTypeIdentifiers only.
@@ -96,4 +96,4 @@
 
 ## Handoff for Next Context
 - All P0/P1/P2 roadmap items done. Latest session shipped two user-requested features: (1) **session persistence + auto-resume** (`TorrentSessionStore`, `PersistedSession`/`PersistedItem`, `restore`/`resumeRestoredDownloads`, persist hooks across all structural mutations + completion + periodic checkpoint) — list and rate limit survive relaunch, downloading rows auto-resume offline-rebuilt from the stored `info` dict; and (2) a **global download-speed limiter** (`RateLimiter` token-bucket actor shared across web-seed + peer paths, header `Picker` bound to `session.downloadRateLimit`). 40 tests green; Release built/deployed.
-- Candidate next work (none open as P-items): magnet-path PEX (BEP 11 on the magnet metadata path, matching the `.torrent` path); harden the best-effort delete for unresolved/queued rows; integration testing against real assets in `~/Documents/Xcode/aTemp` (needs a user-confirmed sample filename); or migrating to a native Xcode app target to drop manual bundling.
+- Candidate next work (none open as P-items): magnet-path PEX (BEP 11 on the magnet metadata path, matching the `.torrent` path); harden the best-effort delete for unresolved/queued rows; integration testing against the in-repo assets (`big-buck-bunny.torrent` + the documented Big Buck Bunny magnet); or migrating to a native Xcode app target to drop manual bundling.
