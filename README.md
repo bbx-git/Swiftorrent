@@ -16,9 +16,9 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, bounded concurrent peer downloads, rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Bounds every peer-wire network wait with connect and per-operation send/receive timeouts, so a peer that goes silent mid-message is torn down instead of parking a download slot.
 - Discovers additional inbound peers through BEP 11 PEX (consumes peer lists only; never advertises this client as a source).
-- Presents a file-selection dialog after a torrent's metadata is read (immediately for `.torrent` files, once resolved for magnets) with per-file checkboxes, Select All / Deselect All, and a running selected-size total, so you pick what to download before any data is fetched. Dismissing the dialog cancels adding the torrent.
-- Offers a per-torrent "Create a subfolder named ..." option in that dialog so multi-file torrents can write their files directly into the destination instead of an enclosing folder.
-- Lets you choose which files in a multi-file torrent to download, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Selection can also be changed mid-download from the expandable file list.
+- Presents an add dialog the moment you open a `.torrent` or paste a magnet: it shows a resolving spinner while metadata loads, then per-file checkboxes, Select All / Deselect All, and a running selected-size total, so you pick what to download before any data is fetched. The torrent only appears in the list after you click **Download**; dismissing the dialog cancels adding it entirely (nothing is written to disk).
+- Offers a per-torrent "Create a subfolder named ..." option in that dialog so multi-file torrents can write their files directly into the destination instead of an enclosing folder. This affects only the on-disk output path; the torrent-relative paths used for web-seed URLs and the piece map are unchanged.
+- Lets you choose which files in a multi-file torrent to download, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Partial selections download via web seeds when available (selected files are streamed whole and the deselected-neighbor slice of each shared boundary piece is range-fetched so it verifies) as well as via peers. Selection can also be changed mid-download from the expandable file list.
 - Shows per-file download progress in an expandable file list for multi-file torrents.
 - Performs a free-space check before writing torrent data.
 - Cancels active tracker and peer work when a torrent row is removed, with a choice to remove only from Swiftorrent or also delete downloaded/partial files from disk.
@@ -27,7 +27,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, and support per-file selection. The downloader does not yet use local peer discovery, encryption, NAT traversal, or bandwidth limits. Web-seed acceleration applies only to full (non-partial) selections.
+- `.torrent` downloads now use a small pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, and support per-file selection (full and partial). The downloader does not yet use local peer discovery, encryption, NAT traversal, or bandwidth limits.
 - Magnet links can fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 

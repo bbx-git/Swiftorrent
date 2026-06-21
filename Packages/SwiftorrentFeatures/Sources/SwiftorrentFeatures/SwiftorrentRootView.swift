@@ -61,7 +61,7 @@ public struct SwiftorrentRootView: View {
                     session.startDownload(itemID: item.id, createSubfolder: createSubfolder)
                 },
                 cancel: {
-                    session.remove(item)
+                    session.cancelPending(itemID: item.id)
                 }
             )
         }
@@ -69,14 +69,15 @@ public struct SwiftorrentRootView: View {
         .frame(minWidth: 940, minHeight: 620)
     }
 
-    /// Surfaces the torrent awaiting file selection. Dismissing the dialog
-    /// without starting (Esc / close) cancels adding that torrent.
+    /// Surfaces the torrent currently in the add dialog (resolving metadata or
+    /// awaiting file selection). It is not yet in the list. Dismissing the dialog
+    /// (Esc / close) cancels adding that torrent.
     private var reviewingBinding: Binding<TorrentItem?> {
         Binding {
-            session.items.first { $0.state == .reviewing }
+            session.pendingItems.first
         } set: { newValue in
-            if newValue == nil, let pending = session.items.first(where: { $0.state == .reviewing }) {
-                session.remove(pending)
+            if newValue == nil, let pending = session.pendingItems.first {
+                session.cancelPending(itemID: pending.id)
             }
         }
     }
@@ -448,7 +449,7 @@ private struct FileSelectionSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Select Files to Download")
+                Text(item.state == .reviewing ? "Select Files to Download" : "Add Torrent")
                     .font(.title3.bold())
                 Text(item.name)
                     .font(.callout)
@@ -457,66 +458,109 @@ private struct FileSelectionSheet: View {
                     .truncationMode(.middle)
             }
 
-            HStack {
-                Text("\(selectedCount) of \(item.files.count) files · \(selectedBytesDescription)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Select All") { setAllSelected(true) }
-                    .buttonStyle(.link)
-                Button("Deselect All") { setAllSelected(false) }
-                    .buttonStyle(.link)
-            }
-
-            ScrollView {
-                LazyVStack(spacing: 4) {
-                    ForEach(item.files) { file in
-                        HStack(spacing: 10) {
-                            Toggle(isOn: Binding(get: { file.isSelected }, set: { setFileSelected(file.id, $0) })) {
-                                EmptyView()
-                            }
-                            .toggleStyle(.checkbox)
-                            .labelsHidden()
-
-                            Text(file.path)
-                                .font(.caption)
-                                .foregroundStyle(file.isSelected ? .primary : .secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-
-                            Text(file.totalDescription)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                        .padding(.vertical, 2)
-                    }
-                }
-                .padding(.vertical, 4)
-            }
-            .frame(minHeight: 180, maxHeight: 320)
-            .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
-
-            if item.createsEnclosingDirectory {
-                Toggle("Create a subfolder named \"\(item.name)\"", isOn: $createSubfolder)
-                    .toggleStyle(.checkbox)
-                    .font(.callout)
-            }
-
-            HStack {
-                Button("Cancel", role: .cancel) { cancel() }
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-                Button("Download") { start(createSubfolder) }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
-                    .tint(.swiftorrentGraphite)
-                    .disabled(selectedCount == 0)
+            switch item.state {
+            case .reviewing:
+                reviewBody
+            case .failed:
+                failureBody
+            default:
+                resolvingBody
             }
         }
         .padding(24)
         .frame(width: 520)
+    }
+
+    @ViewBuilder private var reviewBody: some View {
+        HStack {
+            Text("\(selectedCount) of \(item.files.count) files · \(selectedBytesDescription)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Select All") { setAllSelected(true) }
+                .buttonStyle(.link)
+            Button("Deselect All") { setAllSelected(false) }
+                .buttonStyle(.link)
+        }
+
+        ScrollView {
+            LazyVStack(spacing: 4) {
+                ForEach(item.files) { file in
+                    HStack(spacing: 10) {
+                        Toggle(isOn: Binding(get: { file.isSelected }, set: { setFileSelected(file.id, $0) })) {
+                            EmptyView()
+                        }
+                        .toggleStyle(.checkbox)
+                        .labelsHidden()
+
+                        Text(file.path)
+                            .font(.caption)
+                            .foregroundStyle(file.isSelected ? .primary : .secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Text(file.totalDescription)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .frame(minHeight: 180, maxHeight: 320)
+        .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
+
+        if item.createsEnclosingDirectory {
+            Toggle("Create a subfolder named \"\(item.name)\"", isOn: $createSubfolder)
+                .toggleStyle(.checkbox)
+                .font(.callout)
+        }
+
+        HStack {
+            Button("Cancel", role: .cancel) { cancel() }
+                .keyboardShortcut(.cancelAction)
+            Spacer()
+            Button("Download") { start(createSubfolder) }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .tint(.swiftorrentGraphite)
+                .disabled(selectedCount == 0)
+        }
+    }
+
+    @ViewBuilder private var resolvingBody: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+            Text(item.status)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 24)
+
+        HStack {
+            Spacer()
+            Button("Cancel", role: .cancel) { cancel() }
+                .keyboardShortcut(.cancelAction)
+        }
+    }
+
+    @ViewBuilder private var failureBody: some View {
+        Label(item.status, systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 24)
+
+        HStack {
+            Spacer()
+            Button("Close") { cancel() }
+                .keyboardShortcut(.defaultAction)
+        }
     }
 }
 

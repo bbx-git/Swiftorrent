@@ -5,7 +5,12 @@ import SwiftorrentCore
 @MainActor
 @Observable
 public final class TorrentSession {
+    /// Torrents the user has confirmed; these are the rows shown in the list.
     public private(set) var items: [TorrentItem] = []
+    /// Torrents still being resolved or awaiting file selection in the add
+    /// dialog. They are kept out of `items` so a torrent only appears in the
+    /// list once the user clicks Download.
+    public private(set) var pendingItems: [TorrentItem] = []
     public var destination: URL
 
     private let metainfoParser = TorrentMetainfoParser()
@@ -24,71 +29,52 @@ public final class TorrentSession {
     }
 
     public func addTorrentFile(_ url: URL) {
-        let item = TorrentItem(name: url.lastPathComponent, source: .torrentFile(url), destination: destination, totalBytes: 0)
-        items.insert(item, at: 0)
-        tasks[item.id] = Task {
-            defer { tasks[item.id] = nil }
+        var item = TorrentItem(name: url.lastPathComponent, source: .torrentFile(url), destination: destination, totalBytes: 0)
+        item.status = "Reading torrent…"
+        let id = item.id
+        pendingItems.append(item)
+        tasks[id] = Task {
+            defer { tasks[id] = nil }
             do {
                 let data = try Data(contentsOf: url)
                 try Task.checkCancellation()
                 let metainfo = try metainfoParser.parse(data: data)
-                metainfos[item.id] = metainfo
-                update(item.id) {
-                    $0.name = metainfo.name
-                    $0.totalBytes = metainfo.totalSize
-                    $0.outputRelativePaths = metainfo.files.map(\.path)
-                    $0.files = makeFileEntries(from: metainfo, existing: $0.files)
-                    $0.createsEnclosingDirectory = metainfo.createsEnclosingDirectory
-                    $0.status = "Choose files to download."
-                    $0.state = .reviewing
-                }
+                metainfos[id] = metainfo
+                applyResolvedMetadata(metainfo, to: id)
             } catch is CancellationError {
                 return
             } catch {
-                update(item.id) {
-                    $0.status = error.localizedDescription
-                    $0.state = .failed
-                }
+                failPending(id, message: error.localizedDescription)
             }
         }
     }
 
     public func addMagnet(_ text: String) {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let item = TorrentItem(name: "Magnet link", source: .magnet(trimmedText), destination: destination, totalBytes: 0)
-        items.insert(item, at: 0)
-        tasks[item.id] = Task {
-            defer { tasks[item.id] = nil }
+        var item = TorrentItem(name: "Magnet link", source: .magnet(trimmedText), destination: destination, totalBytes: 0)
+        item.status = "Resolving metadata…"
+        let id = item.id
+        pendingItems.append(item)
+        tasks[id] = Task {
+            defer { tasks[id] = nil }
             do {
                 let magnet = try magnetParser.parse(trimmedText)
                 let name = magnet.displayName ?? "Magnet \(magnet.infoHash.map { String(format: "%02x", $0) }.joined().prefix(8))"
-                update(item.id) {
+                update(id) {
                     $0.name = name
-                    $0.status = "Resolving metadata."
+                    $0.status = "Resolving metadata…"
                 }
                 let metainfo = try await magnetResolver.resolve(magnet: magnet) { [weak self] progress in
-                    await self?.update(item.id) {
+                    await self?.update(id) {
                         $0.status = progress.status
-                        $0.state = .downloading
                     }
                 }
-                metainfos[item.id] = metainfo
-                update(item.id) {
-                    $0.name = metainfo.name
-                    $0.totalBytes = metainfo.totalSize
-                    $0.outputRelativePaths = metainfo.files.map(\.path)
-                    $0.files = makeFileEntries(from: metainfo, existing: $0.files)
-                    $0.createsEnclosingDirectory = metainfo.createsEnclosingDirectory
-                    $0.status = "Choose files to download."
-                    $0.state = .reviewing
-                }
+                metainfos[id] = metainfo
+                applyResolvedMetadata(metainfo, to: id)
             } catch is CancellationError {
                 return
             } catch {
-                update(item.id) {
-                    $0.status = error.localizedDescription
-                    $0.state = .failed
-                }
+                failPending(id, message: error.localizedDescription)
             }
         }
     }
@@ -101,12 +87,73 @@ public final class TorrentSession {
             removeFiles(for: item)
         }
         items.removeAll { $0.id == item.id }
+        pendingItems.removeAll { $0.id == item.id }
     }
 
-    /// Toggles whether a file inside a multi-file torrent is downloaded. If the
-    /// torrent is already running, its download is restarted with the new
-    /// selection (on-disk pieces are re-verified, so progress is preserved).
+    /// Discards a torrent still in the add dialog (resolution failed, or the user
+    /// dismissed the dialog without starting). Nothing was written to disk yet.
+    public func cancelPending(itemID: TorrentItem.ID) {
+        tasks[itemID]?.cancel()
+        tasks[itemID] = nil
+        metainfos[itemID] = nil
+        pendingItems.removeAll { $0.id == itemID }
+    }
+
+    /// Confirms the user's selection from the add dialog, moves the torrent into
+    /// the visible list, and begins downloading. When `createSubfolder` is
+    /// `false`, multi-file torrents write their files directly into the
+    /// destination instead of an enclosing `<name>/` folder.
+    public func startDownload(itemID: TorrentItem.ID, createSubfolder: Bool) {
+        guard let pendingIndex = pendingItems.firstIndex(where: { $0.id == itemID }),
+              pendingItems[pendingIndex].state == .reviewing,
+              let metainfo = metainfos[itemID] else {
+            return
+        }
+        var item = pendingItems.remove(at: pendingIndex)
+        guard item.files.contains(where: \.isSelected) else {
+            // Nothing selected: drop the torrent rather than starting a no-op.
+            metainfos[itemID] = nil
+            return
+        }
+
+        let stripRoot = !createSubfolder && metainfo.createsEnclosingDirectory
+        item.stripRootDirectory = stripRoot
+        item.createsEnclosingDirectory = stripRoot ? false : metainfo.createsEnclosingDirectory
+        // `outputRelativePaths` drives on-disk deletion, so it must match where
+        // files actually land (stripped of the root folder when requested).
+        item.outputRelativePaths = stripRoot
+            ? metainfo.flatteningRootDirectory().files.map(\.path)
+            : metainfo.files.map(\.path)
+        item.state = .downloading
+        item.status = "Starting download."
+        items.insert(item, at: 0)
+
+        tasks[itemID] = Task {
+            defer { tasks[itemID] = nil }
+            do {
+                try await runDownload(itemID: itemID, metainfo: metainfo)
+            } catch is CancellationError {
+                return
+            } catch {
+                update(itemID) {
+                    $0.status = error.localizedDescription
+                    $0.state = .failed
+                }
+            }
+        }
+    }
+
+    /// Toggles whether a file inside a multi-file torrent is downloaded. Used both
+    /// by the add dialog (pending review) and mid-download. A running torrent is
+    /// restarted with the new selection (on-disk pieces are re-verified, so
+    /// progress is preserved).
     public func setFileSelected(itemID: TorrentItem.ID, fileID: Int, isSelected: Bool) {
+        if let pendingIndex = pendingItems.firstIndex(where: { $0.id == itemID }) {
+            guard let fileIndex = pendingItems[pendingIndex].files.firstIndex(where: { $0.id == fileID }) else { return }
+            pendingItems[pendingIndex].files[fileIndex].isSelected = isSelected
+            return
+        }
+
         guard let index = items.firstIndex(where: { $0.id == itemID }),
               let fileIndex = items[index].files.firstIndex(where: { $0.id == fileID }) else {
             return
@@ -114,8 +161,8 @@ public final class TorrentSession {
         guard items[index].files[fileIndex].isSelected != isSelected else { return }
         items[index].files[fileIndex].isSelected = isSelected
         guard let metainfo = metainfos[itemID] else { return }
-        // Only relaunch torrents that are actively working; failed/queued rows
-        // pick up the new selection when they next start.
+        // Only relaunch torrents that are actively working; failed rows pick up
+        // the new selection when they next start.
         guard items[index].state == .downloading || items[index].state == .complete else { return }
         items[index].state = .downloading
         items[index].status = "Applying file selection."
@@ -135,49 +182,39 @@ public final class TorrentSession {
         }
     }
 
-    /// Confirms the user's selection from the add dialog and begins downloading.
-    /// When `createSubfolder` is `false`, multi-file torrents are flattened so
-    /// their files land directly in the destination instead of an enclosing
-    /// `<name>/` folder.
-    public func startDownload(itemID: TorrentItem.ID, createSubfolder: Bool) {
-        guard let index = items.firstIndex(where: { $0.id == itemID }),
-              items[index].state == .reviewing,
-              var metainfo = metainfos[itemID] else {
-            return
-        }
-        guard items[index].files.contains(where: \.isSelected) else { return }
-
-        if !createSubfolder {
-            metainfo = metainfo.flatteningRootDirectory()
-            metainfos[itemID] = metainfo
-            items[index].outputRelativePaths = metainfo.files.map(\.path)
-            items[index].files = makeFileEntries(from: metainfo, existing: items[index].files)
-            items[index].createsEnclosingDirectory = false
-        }
-
-        items[index].state = .downloading
-        items[index].status = "Starting download."
-        tasks[itemID] = Task {
-            defer { tasks[itemID] = nil }
-            do {
-                try await runDownload(itemID: itemID, metainfo: metainfo)
-            } catch is CancellationError {
-                return
-            } catch {
-                update(itemID) {
-                    $0.status = error.localizedDescription
-                    $0.state = .failed
-                }
-            }
-        }
-    }
-
     /// Selects or deselects every file in a torrent at once (the dialog's
     /// "Select All" / "Deselect All" actions).
     public func setAllFilesSelected(itemID: TorrentItem.ID, isSelected: Bool) {
+        if let pendingIndex = pendingItems.firstIndex(where: { $0.id == itemID }) {
+            for fileIndex in pendingItems[pendingIndex].files.indices {
+                pendingItems[pendingIndex].files[fileIndex].isSelected = isSelected
+            }
+            return
+        }
         guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
         for fileIndex in items[index].files.indices {
             items[index].files[fileIndex].isSelected = isSelected
+        }
+    }
+
+    private func applyResolvedMetadata(_ metainfo: TorrentMetainfo, to id: TorrentItem.ID) {
+        update(id) {
+            $0.name = metainfo.name
+            $0.totalBytes = metainfo.totalSize
+            $0.outputRelativePaths = metainfo.files.map(\.path)
+            $0.files = makeFileEntries(from: metainfo, existing: $0.files)
+            $0.createsEnclosingDirectory = metainfo.createsEnclosingDirectory
+            $0.status = "Choose files to download."
+            $0.state = .reviewing
+        }
+    }
+
+    private func failPending(_ id: TorrentItem.ID, message: String) {
+        // A torrent that never resolved was never shown in the list; surface the
+        // error in the dialog by keeping it pending in a failed state.
+        update(id) {
+            $0.status = message
+            $0.state = .failed
         }
     }
 
@@ -219,8 +256,10 @@ public final class TorrentSession {
 
     private func runDownload(itemID: TorrentItem.ID, metainfo: TorrentMetainfo) async throws {
         let selected = selectedFileIDs(for: itemID, metainfo: metainfo)
-        let itemDestination = items.first(where: { $0.id == itemID })?.destination ?? destination
-        try await downloader.download(metainfo: metainfo, destination: itemDestination, selectedFileIDs: selected) { [weak self] progress in
+        let item = items.first(where: { $0.id == itemID })
+        let itemDestination = item?.destination ?? destination
+        let stripRoot = item?.stripRootDirectory ?? false
+        try await downloader.download(metainfo: metainfo, destination: itemDestination, selectedFileIDs: selected, stripRootDirectory: stripRoot) { [weak self] progress in
             await self?.update(itemID) { item in
                 item.status = progress.status
                 item.totalBytes = progress.totalBytes
@@ -258,9 +297,13 @@ public final class TorrentSession {
         }
     }
 
+    /// Mutates an item in whichever list (`items` or `pendingItems`) holds it.
     private func update(_ id: TorrentItem.ID, mutate: (inout TorrentItem) -> Void) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        mutate(&items[index])
+        if let index = items.firstIndex(where: { $0.id == id }) {
+            mutate(&items[index])
+        } else if let index = pendingItems.firstIndex(where: { $0.id == id }) {
+            mutate(&pendingItems[index])
+        }
     }
 }
 
@@ -315,6 +358,9 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
     public var outputRelativePaths: [String]
     public var files: [FileEntry]
     public var createsEnclosingDirectory: Bool
+    /// Whether the shared top-level torrent folder is stripped from on-disk
+    /// output paths (the "don't create a subfolder" choice from the add dialog).
+    public var stripRootDirectory: Bool
     public var downloadedBytes: Int64
     public var progress: Double
     public var status: String
@@ -329,6 +375,7 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
         self.outputRelativePaths = []
         self.files = []
         self.createsEnclosingDirectory = false
+        self.stripRootDirectory = false
         self.downloadedBytes = 0
         self.progress = 0
         self.status = "Queued"

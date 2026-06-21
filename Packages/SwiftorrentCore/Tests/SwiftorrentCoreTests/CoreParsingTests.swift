@@ -545,6 +545,25 @@ struct CoreParsingTests {
         #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root/b.txt.tor").path))
     }
 
+    @Test("Stripping the root directory writes files directly into the destination")
+    func writerStripsRootDirectory() throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8), Data("ef".utf8)])
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination, stripRootDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        try writer.write(piece: Data("abcd".utf8), pieceIndex: 0)
+        try writer.write(piece: Data("ef".utf8), pieceIndex: 1)
+        try writer.finalize(selectedFileIDs: [0, 1])
+
+        // No enclosing "Root/" folder: files land directly in the destination.
+        #expect(try Data(contentsOf: destination.appendingPathComponent("a.txt")) == Data("ab".utf8))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("b.txt")) == Data("cdef".utf8))
+        #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("Root").path))
+    }
+
     @Test func flatteningRootDirectoryStripsSharedFolder() {
         let metainfo = makeMetainfo(pieceLength: 2, pieces: [Data("ab".utf8), Data("cdef".utf8)])
         #expect(metainfo.createsEnclosingDirectory)

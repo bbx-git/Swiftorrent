@@ -62,11 +62,12 @@ public struct TorrentDownloader: Sendable {
         metainfo: TorrentMetainfo,
         destination: URL,
         selectedFileIDs: Set<Int>? = nil,
+        stripRootDirectory: Bool = false,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws {
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination)
+        let writer = TorrentFileWriter(metainfo: metainfo, destination: destination, stripRootDirectory: stripRootDirectory)
         let layout = TorrentLayout(metainfo: metainfo)
 
         // Resolve the selection into the set of pieces we actually fetch. A full
@@ -103,20 +104,35 @@ public struct TorrentDownloader: Sendable {
             return
         }
 
-        // Web seeds fetch whole files over HTTP, which cannot satisfy the
-        // boundary pieces a partial selection needs, so the optimization only
-        // applies to a full download.
-        if isFullSelection, !metainfo.webSeedURLs.isEmpty {
+        // Web seeds fetch over HTTP. A full download streams each whole file; a
+        // partial download fetches only the selected files plus the small slices
+        // of any boundary piece that belong to a deselected neighbor (so the
+        // shared piece still verifies). Either way, completed pieces are folded
+        // into `verifiedPieces` below.
+        if !metainfo.webSeedURLs.isEmpty {
             do {
-                try await downloadFromWebSeeds(
-                    metainfo: metainfo,
-                    writer: writer,
-                    layout: layout,
-                    selection: selection,
-                    initialDownloaded: initialDownloaded,
-                    totalBytes: downloadTotal,
-                    progress: progress
-                )
+                if isFullSelection {
+                    try await downloadFromWebSeeds(
+                        metainfo: metainfo,
+                        writer: writer,
+                        layout: layout,
+                        selection: selection,
+                        initialDownloaded: initialDownloaded,
+                        totalBytes: downloadTotal,
+                        progress: progress
+                    )
+                } else {
+                    try await downloadSelectedFromWebSeeds(
+                        metainfo: metainfo,
+                        writer: writer,
+                        layout: layout,
+                        selection: selection,
+                        selectablePieces: selectablePieces,
+                        initialDownloaded: initialDownloaded,
+                        totalBytes: downloadTotal,
+                        progress: progress
+                    )
+                }
                 // Web seeds only write pieces we did not already have, so verify
                 // just the previously-unverified indices and fold the result in.
                 let unverified = selectablePieces.subtracting(verifiedPieces)
@@ -164,6 +180,7 @@ public struct TorrentDownloader: Sendable {
                 peerID: peerID,
                 verifiedPieces: verifiedPieces,
                 initialDownloaded: verifiedBytes,
+                stripRootDirectory: stripRootDirectory,
                 progress: progress
             )
             try writer.finalize(selectedFileIDs: selection)
@@ -225,6 +242,112 @@ public struct TorrentDownloader: Sendable {
             }
         }
         throw lastError ?? TrackerClientError.invalidResponse
+    }
+
+    /// Web-seed path for a partial selection. Streams each selected file whole,
+    /// then fetches the slice of any boundary piece that belongs to a deselected
+    /// neighbor so the shared piece can be SHA-1 verified. `finalize` later drops
+    /// those neighbor partials, leaving only the selected files on disk.
+    private func downloadSelectedFromWebSeeds(
+        metainfo: TorrentMetainfo,
+        writer: TorrentFileWriter,
+        layout: TorrentLayout,
+        selection: Set<Int>,
+        selectablePieces: Set<Int>,
+        initialDownloaded: Int64,
+        totalBytes: Int64,
+        progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
+    ) async throws {
+        let selectedFiles = metainfo.files.filter { selection.contains($0.id) }
+        let neighborSlices = boundaryNeighborSlices(metainfo: metainfo, layout: layout, selectablePieces: selectablePieces, selection: selection)
+
+        var lastError: Error?
+        for webSeedURL in metainfo.webSeedURLs {
+            try Task.checkCancellation()
+            do {
+                var downloadedBytes = initialDownloaded
+                var perFileBytes = [Int64](repeating: 0, count: metainfo.files.count)
+                for file in selectedFiles {
+                    try Task.checkCancellation()
+                    let sourceURL = webSeedURL.appendingTorrentRelativePath(file.path)
+                    let fileBase = downloadedBytes
+                    let baseFileBytes = perFileBytes
+                    let snapshot: @Sendable (Int64) -> [TorrentFileProgress] = { currentFileBytes in
+                        var bytes = baseFileBytes
+                        if file.id < bytes.count { bytes[file.id] = min(currentFileBytes, file.length) }
+                        return self.fileProgress(metainfo: metainfo, selection: selection, perFileBytes: bytes)
+                    }
+                    await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: downloadedBytes, totalBytes: totalBytes, files: snapshot(0)))
+                    downloadedBytes += try await downloadWebSeedFile(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: downloadedBytes) { currentDownloadedBytes in
+                        await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: currentDownloadedBytes, totalBytes: totalBytes, files: snapshot(currentDownloadedBytes - fileBase)))
+                    }
+                    if file.id < perFileBytes.count { perFileBytes[file.id] = file.length }
+                }
+
+                // Fill the deselected-neighbor slices of any shared boundary pieces.
+                for slice in neighborSlices {
+                    try Task.checkCancellation()
+                    let sourceURL = webSeedURL.appendingTorrentRelativePath(slice.file.path)
+                    let data = try await fetchRange(from: sourceURL, offset: slice.fileOffset, length: slice.length)
+                    try writer.writeFileChunk(data, to: slice.file, atFileOffset: slice.fileOffset)
+                }
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? TrackerClientError.invalidResponse
+    }
+
+    private struct NeighborSlice {
+        let file: TorrentFile
+        let fileOffset: Int64
+        let length: Int64
+    }
+
+    /// For each selectable piece, the byte ranges that fall inside a deselected
+    /// file. These are exactly the boundary slices that whole-file selected
+    /// downloads leave missing but a shared piece needs to verify.
+    private func boundaryNeighborSlices(metainfo: TorrentMetainfo, layout: TorrentLayout, selectablePieces: Set<Int>, selection: Set<Int>) -> [NeighborSlice] {
+        var slices: [NeighborSlice] = []
+        for piece in selectablePieces {
+            let pieceRange = layout.range(ofPiece: piece)
+            for file in metainfo.files where !selection.contains(file.id) {
+                let fileRange = layout.range(ofFile: file.id)
+                let low = max(pieceRange.lowerBound, fileRange.lowerBound)
+                let high = min(pieceRange.upperBound, fileRange.upperBound)
+                guard high > low else { continue }
+                slices.append(NeighborSlice(file: file, fileOffset: low - fileRange.lowerBound, length: high - low))
+            }
+        }
+        return slices
+    }
+
+    /// Fetches `length` bytes of a file starting at `offset` over HTTP. Honors a
+    /// `206` range response; if the server ignores the range and returns the
+    /// whole body (`200`), the requested window is sliced out locally.
+    private func fetchRange(from sourceURL: URL, offset: Int64, length: Int64) async throws -> Data {
+        var request = URLRequest(url: sourceURL)
+        request.timeoutInterval = 30
+        request.setValue("bytes=\(offset)-\(offset + length - 1)", forHTTPHeaderField: "Range")
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TrackerClientError.invalidResponse
+        }
+        switch httpResponse.statusCode {
+        case 206:
+            guard data.count >= Int(length) else { throw TrackerClientError.invalidResponse }
+            return data.prefix(Int(length))
+        case 200:
+            let start = Int(offset)
+            let end = start + Int(length)
+            guard end <= data.count else { throw TrackerClientError.invalidResponse }
+            return data.subdata(in: start..<end)
+        default:
+            throw TrackerClientError.invalidResponse
+        }
     }
 
     private func downloadWebSeedFile(
@@ -307,6 +430,7 @@ public struct TorrentDownloader: Sendable {
         peerID: Data,
         verifiedPieces: Set<Int>,
         initialDownloaded: Int64,
+        stripRootDirectory: Bool = false,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void
     ) async throws -> Int64 {
         let sessions = try await connectPeerSessions(
@@ -319,7 +443,7 @@ public struct TorrentDownloader: Sendable {
         )
         guard !sessions.isEmpty else { throw TrackerClientError.invalidResponse }
 
-        let writer = TorrentPieceWriter(writer: TorrentFileWriter(metainfo: metainfo, destination: destination))
+        let writer = TorrentPieceWriter(writer: TorrentFileWriter(metainfo: metainfo, destination: destination, stripRootDirectory: stripRootDirectory))
         let coordinator = PieceDownloadCoordinator(
             layout: layout,
             selectablePieces: selectablePieces,
@@ -666,7 +790,26 @@ private actor PieceDownloadCoordinator {
 struct TorrentFileWriter: Sendable {
     let metainfo: TorrentMetainfo
     let destination: URL
+    /// When true, the shared top-level torrent folder is removed from every
+    /// output path so files land directly in `destination` rather than an
+    /// enclosing `<name>/` directory. This affects only the on-disk location;
+    /// `metainfo.files[].path` stays torrent-relative so web-seed source URLs
+    /// and the protocol piece map remain correct.
+    let stripRootDirectory: Bool
     private let partialExtension = "tor"
+
+    init(metainfo: TorrentMetainfo, destination: URL, stripRootDirectory: Bool = false) {
+        self.metainfo = metainfo
+        self.destination = destination
+        self.stripRootDirectory = stripRootDirectory
+    }
+
+    /// Writes a raw byte range of a single file into its `.tor` partial. Used by
+    /// the web-seed path to fill the slice of a boundary piece that belongs to a
+    /// deselected neighbor file, so the shared piece can still be SHA-1 verified.
+    func writeFileChunk(_ chunk: Data, to file: TorrentFile, atFileOffset offset: Int64) throws {
+        try write(chunk: chunk, to: file, at: offset)
+    }
 
     func verifiedPieces() throws -> Set<Int> {
         try verifiedPieces(among: metainfo.pieceHashes.indices)
@@ -859,7 +1002,8 @@ struct TorrentFileWriter: Sendable {
 
     private func outputURL(for file: TorrentFile, partial: Bool) throws -> URL {
         let destinationURL = destination.standardizedFileURL
-        let finalURL = destinationURL.appendingPathComponent(file.path)
+        let relativePath = stripRootDirectory ? Self.strippingRootDirectory(file.path) : file.path
+        let finalURL = destinationURL.appendingPathComponent(relativePath)
         let outputURL = (partial ? finalURL.appendingPathExtension(partialExtension) : finalURL).standardizedFileURL
         let destinationPath = destinationURL.path
         let outputPath = outputURL.path
@@ -867,5 +1011,14 @@ struct TorrentFileWriter: Sendable {
             throw CocoaError(.fileWriteInvalidFileName)
         }
         return outputURL
+    }
+
+    /// Drops the leading path component (the shared torrent folder) from a
+    /// multi-file torrent-relative path. Single-component paths are unchanged.
+    static func strippingRootDirectory(_ path: String) -> String {
+        var components = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard components.count > 1 else { return path }
+        components.removeFirst()
+        return components.joined(separator: "/")
     }
 }
