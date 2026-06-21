@@ -16,7 +16,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Discovers `.torrent` download peers through HTTP/HTTPS trackers, UDP trackers, and BEP 5 DHT `get_peers`.
 - Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, a self-replenishing pool of concurrent peer downloads (workers draw from a shared peer reserve and replace any peer that dies or runs dry, so the swarm refills toward full instead of bleeding out), rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Bounds every peer-wire network wait with connect and per-operation send/receive timeouts, so a peer that goes silent mid-message is torn down instead of parking a download slot.
-- Discovers additional inbound peers through BEP 11 PEX (consumes peer lists only; never advertises this client as a source).
+- Discovers additional inbound peers through BEP 11 PEX while downloading: each peer-wire connection advertises `ut_pex` and folds the compact-IPv4 peer lists peers gossip back into the swarm's replacement reserve (deduped against peers already queued). Because PEX lives in the peer-wire layer, it benefits both `.torrent` and magnet swarm downloads. Download-only: the client consumes `added` lists only and never advertises itself as a source (`added6`/IPv6 entries are ignored, matching the IPv4 tracker/DHT paths).
 - Presents an add dialog the moment you open a `.torrent` or paste a magnet: it shows a resolving spinner while metadata loads, then per-file checkboxes, Select All / Deselect All, and a running selected-size total, so you pick what to download before any data is fetched. The torrent only appears in the list after you click **Download**; dismissing the dialog cancels adding it entirely (nothing is written to disk).
 - Offers a per-torrent "Create a subfolder named ..." option in that dialog so multi-file torrents can write their files directly into the destination instead of an enclosing folder. This affects only the on-disk output path; the torrent-relative paths used for web-seed URLs and the piece map are unchanged.
 - Lets you choose which files in a multi-file torrent to download from the add dialog, downloading only the pieces overlapping the selected files (shared boundary pieces are fetched whole so selected edges still verify) and finalizing only the selected files. Partial selections download via web seeds when available (selected files are streamed whole and the deselected-neighbor slice of each shared boundary piece is range-fetched so it verifies) as well as via peers.
@@ -32,8 +32,8 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- `.torrent` downloads use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, encryption, NAT traversal, uTP, or endgame mode.
-- Magnet links can fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT.
+- Downloads (both `.torrent` and resolved magnets) use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, encryption, NAT traversal, uTP, or endgame mode.
+- Magnet links fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT (the metadata exchange itself does not yet use PEX); once metadata is resolved the swarm download uses the same tracker/DHT/PEX peer discovery as `.torrent` files.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
 ## Requirements
@@ -130,17 +130,11 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 ## Roadmap
 
-All items preserve the download-only policy (no seeding, uploading, or sharing). PEX, if added, is inbound-only: consume peer lists, never advertise this client as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships. (Peer-pool replenishment shipped and is validated against a live swarm — see **Features**.)
-
-### Robustness & polish (next)
-
-- Harden best-effort file deletion for unresolved/queued rows (skip disk deletion when no resolved output paths exist instead of guessing the display name).
-- Add structured logging (`os.Logger`) so currently-swallowed persistence and file-deletion failures are observable.
-- Minor cleanups: drop a redundant rethrow in the web-seed writer; replace an avoidable force-unwrap in the peer handshake.
+All items preserve the download-only policy (no seeding, uploading, or sharing). PEX is implemented inbound-only: the client consumes peer lists and never advertises itself as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships. (Peer-pool replenishment and inbound BEP 11 PEX have shipped and are validated against a live swarm — see **Features**.)
 
 ### Larger, optional
 
 - Endgame mode (re-request the last in-flight pieces across peers so the tail doesn't stall).
-- BEP 11 PEX on the magnet metadata path (already present on the `.torrent` path).
+- BEP 11 PEX during the magnet *metadata* exchange (PEX already drives the swarm download for both `.torrent` and magnet downloads; only the info-hash→metadata step is still trackers + DHT).
 - uTP transport and/or MSE/PE stream encryption for networks that throttle plain BitTorrent TCP.
 - Migrate to a native Xcode app target to drop the manual `.app` bundling step.

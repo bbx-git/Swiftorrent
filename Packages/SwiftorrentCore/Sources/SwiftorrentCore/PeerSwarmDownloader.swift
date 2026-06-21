@@ -119,7 +119,7 @@ struct PeerSwarmDownloader: Sendable {
 
             await context.progress(TorrentDownloadProgress(status: "Connected to peer \(peer.host):\(peer.port)", downloadedBytes: await coordinator.downloadedBytes, totalBytes: context.downloadTotal))
 
-            let outcome = await drainPeer(client: client, peer: peer, coordinator: coordinator, writer: writer, context: context)
+            let outcome = await drainPeer(client: client, peer: peer, supply: supply, coordinator: coordinator, writer: writer, context: context)
             await client.close()
             switch outcome {
             case .cancelled:
@@ -139,6 +139,7 @@ struct PeerSwarmDownloader: Sendable {
     private static func drainPeer(
         client: PeerWireClient,
         peer: PeerEndpoint,
+        supply: PeerSupply,
         coordinator: PieceDownloadCoordinator,
         writer: TorrentPieceWriter,
         context: WorkerContext
@@ -152,6 +153,9 @@ struct PeerSwarmDownloader: Sendable {
         while true {
             try? Task.checkCancellation()
             guard !Task.isCancelled else { return .cancelled }
+            // Fold any peers this connection gossiped via PEX into the shared reserve
+            // so workers replacing dead peers can draw them.
+            await supply.add(client.takeDiscoveredPeers())
             // Pull live availability each pass so `have`/`bitfield` messages received
             // mid-download refine the set. When the peer never declared availability
             // (unchoked first), fall back optimistically to all selectable pieces;
@@ -223,15 +227,33 @@ private struct WorkerContext: Sendable {
 actor PeerSupply {
     private var remaining: [PeerEndpoint]
     private var index = 0
+    /// Every endpoint ever queued, so PEX-discovered peers that are already in the
+    /// reserve (or were handed out) are not enqueued twice.
+    private var seen: Set<PeerEndpoint>
 
     init(peers: [PeerEndpoint]) {
         self.remaining = peers
+        self.seen = Set(peers)
     }
 
     func next() -> PeerEndpoint? {
         guard index < remaining.count else { return nil }
         defer { index += 1 }
         return remaining[index]
+    }
+
+    /// Enqueues newly discovered peers (e.g. from inbound PEX) that have not been
+    /// queued before, so workers replacing dead peers can draw them. Returns how
+    /// many were actually added.
+    @discardableResult
+    func add(_ peers: [PeerEndpoint]) -> Int {
+        var added = 0
+        for peer in peers where !seen.contains(peer) {
+            seen.insert(peer)
+            remaining.append(peer)
+            added += 1
+        }
+        return added
     }
 }
 

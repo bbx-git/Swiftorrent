@@ -38,6 +38,13 @@ public actor PeerWireClient {
     static let maxMessageLength = 1024 * 1024
     /// Upper bound on peer-advertised `metadata_size`, guarding against OOM from hostile peers.
     static let maxMetadataSize = 10 * 1024 * 1024
+    /// Local extension-message id we advertise for BEP 11 PEX. Peers address their
+    /// `ut_pex` messages to us using this id. Download-only: we declare support so
+    /// peers gossip more peers to us, but we never send an `added` list ourselves.
+    static let localPexExtensionID: UInt8 = 2
+    /// Cap on peers retained from inbound PEX, so a hostile peer flooding `added`
+    /// lists cannot grow this set without bound.
+    static let maxDiscoveredPeers = 500
 
     private let endpoint: PeerEndpoint
     private let infoHash: Data
@@ -55,6 +62,12 @@ public actor PeerWireClient {
     private var metadataSize: Int?
     private var availablePieces = Set<Int>()
     private var availabilityIsKnown = false
+    /// Guards against re-sending our extension handshake when both `connect()` and
+    /// `fetchMetadata()` would otherwise send one.
+    private var sentExtendedHandshake = false
+    /// Peers learned from inbound BEP 11 PEX `added` lists during this session,
+    /// drained by the swarm so dead connections are replaced from gossiped peers.
+    private var discoveredPeers = Set<PeerEndpoint>()
 
     public init(
         endpoint: PeerEndpoint,
@@ -118,7 +131,19 @@ public actor PeerWireClient {
             throw PeerWireError.invalidHandshake
         }
         peerSupportsExtensions = (response[25] & 0x10) != 0
+        // Advertise our extension map (incl. `ut_pex`) before declaring interest so
+        // peers begin gossiping more peers to us over the lifetime of the download.
+        if peerSupportsExtensions {
+            try await sendExtendedHandshake()
+        }
         try await sendMessage(id: 2, payload: Data())
+    }
+
+    /// Returns peers learned from inbound PEX since the last call and clears the
+    /// buffer, so the swarm can fold them into its replacement reserve.
+    public func takeDiscoveredPeers() -> [PeerEndpoint] {
+        defer { discoveredPeers.removeAll(keepingCapacity: true) }
+        return Array(discoveredPeers)
     }
 
     public func readInitialAvailability(pieceCount: Int) async throws -> Set<Int> {
@@ -277,8 +302,13 @@ public actor PeerWireClient {
     }
 
     private func sendExtendedHandshake() async throws {
+        guard !sentExtendedHandshake else { return }
+        sentExtendedHandshake = true
         let payload = Data([0]) + BencodeEncoder.encode([
-            "m": .dictionary(["ut_metadata": .integer(1)]),
+            "m": .dictionary([
+                "ut_metadata": .integer(1),
+                "ut_pex": .integer(Int64(Self.localPexExtensionID))
+            ]),
             "p": .integer(0)
         ])
         try await sendMessage(id: 20, payload: payload)
@@ -326,8 +356,23 @@ public actor PeerWireClient {
     }
 
     private func handleExtendedMessage(_ payload: Data) {
-        guard payload.first == 0 else { return }
+        guard let extendedID = payload.first else { return }
         let body = Data(payload.dropFirst())
+        switch extendedID {
+        case 0:
+            handleExtendedHandshake(body)
+        case Self.localPexExtensionID:
+            // A `ut_pex` message addressed to the id we advertised: fold its gossiped
+            // peers in (download-only — we consume `added`, never send our own).
+            for peer in Self.parsePexAddedPeers(body) where discoveredPeers.count < Self.maxDiscoveredPeers {
+                discoveredPeers.insert(peer)
+            }
+        default:
+            break
+        }
+    }
+
+    private func handleExtendedHandshake(_ body: Data) {
         guard let node = try? BencodeParser(data: body).parse(),
               case let .dictionary(dictionary) = node.value else {
             return
@@ -341,6 +386,17 @@ public actor PeerWireClient {
         if let size = dictionary["metadata_size"]?.value.intValue, size > 0 {
             metadataSize = Int(size)
         }
+    }
+
+    /// Parses the compact IPv4 `added` list from a bencoded BEP 11 PEX message
+    /// body. IPv6 (`added6`) is ignored, matching the IPv4-only tracker/DHT paths.
+    static func parsePexAddedPeers(_ body: Data) -> [PeerEndpoint] {
+        guard let node = try? BencodeParser(data: body).parse(),
+              case let .dictionary(dictionary) = node.value,
+              case let .bytes(added)? = dictionary["added"]?.value else {
+            return []
+        }
+        return TrackerClient.parseCompactPeers(added)
     }
 
     private func readMessage() async throws -> (id: UInt8, payload: Data) {

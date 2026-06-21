@@ -674,6 +674,44 @@ struct CoreParsingTests {
         #expect(await supply.next() == nil)
     }
 
+    @Test("Peer supply enqueues only unseen PEX peers and hands them out")
+    func peerSupplyAddsUnseenDiscoveredPeers() async {
+        let initial = [
+            PeerEndpoint(host: "192.0.2.1", port: 1),
+            PeerEndpoint(host: "192.0.2.2", port: 2)
+        ]
+        let supply = PeerSupply(peers: initial)
+        _ = await supply.next() // hand out 192.0.2.1
+        // One brand-new peer plus a duplicate of an already-queued one.
+        let added = await supply.add([
+            PeerEndpoint(host: "192.0.2.2", port: 2),
+            PeerEndpoint(host: "198.51.100.9", port: 9)
+        ])
+        #expect(added == 1)
+        var handed: [PeerEndpoint] = []
+        while let peer = await supply.next() { handed.append(peer) }
+        #expect(handed == [
+            PeerEndpoint(host: "192.0.2.2", port: 2),
+            PeerEndpoint(host: "198.51.100.9", port: 9)
+        ])
+    }
+
+    @Test("PEX message parser reads compact IPv4 added peers and ignores added6")
+    func pexAddedPeersParse() {
+        let body = BencodeEncoder.encode([
+            "added": .bytes(Data([192, 0, 2, 5, 0x1A, 0xE1])),   // 192.0.2.5:6881
+            "added6": .bytes(Data(repeating: 0, count: 18))
+        ])
+        let peers = PeerWireClient.parsePexAddedPeers(body)
+        #expect(peers == [PeerEndpoint(host: "192.0.2.5", port: 6881)])
+    }
+
+    @Test("PEX message parser tolerates a missing added field")
+    func pexAddedPeersMissingField() {
+        let body = BencodeEncoder.encode(["dropped": .bytes(Data())])
+        #expect(PeerWireClient.parsePexAddedPeers(body).isEmpty)
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",
