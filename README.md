@@ -32,8 +32,9 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Current Limitations
 
-- Downloads (both `.torrent` and resolved magnets) use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, encryption, NAT traversal, uTP, or endgame mode.
-- **No protocol encryption (MSE/PE) and no listening port.** Swiftorrent connects out over plain BitTorrent TCP only and never accepts inbound connections. Peers that require encryption accept the TCP connection but then stay silent (they will not speak our plaintext handshake), and NAT'd peers that only accept inbound are unreachable to us entirely. In a typical public swarm the majority of advertised peers therefore cannot be used, so the effective peer set is the plaintext-accepting, inbound-reachable minority. Downloads still work when such peers exist, but on swarms where they are scarce, magnet metadata resolution can time out even though other clients (which implement MSE and have a listening port) succeed. See the Roadmap — MSE/PE support is the highest-value item for improving connect success.
+- Downloads (both `.torrent` and resolved magnets) use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, NAT traversal, uTP, or endgame mode.
+- **Outbound protocol encryption (MSE/PE, BEP-8 Message Stream Encryption).** Every peer connection first attempts the MSE handshake — Diffie-Hellman key exchange over MSE's fixed 768-bit group followed by an RC4-encrypted stream — and only falls back to a plaintext handshake if the peer isn't MSE-capable. This reaches the encryption-required majority of public-swarm peers that accept a TCP connection but stay silent on a plaintext handshake. Both `.torrent` and magnet swarm downloads use it (they share the peer-wire layer). The DH modular exponentiation and RC4 are implemented in pure Swift (`MSECrypto.swift`); SHA-1 comes from CryptoKit. Live-validated against the Big Buck Bunny swarm: of 13 peers that connected, 12 negotiated RC4 encryption and 11 downloaded and SHA-1-verified real pieces. Encryption changes only the transport — Swiftorrent stays strictly download-only, with no listening port and no upload.
+- **Still no listening port.** We never accept inbound connections, so NAT'd peers that only accept inbound remain unreachable. With MSE now in place, the remaining reach gap is these inbound-only peers plus swarms with no reachable seed at all.
 - Magnet links fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT (the metadata exchange itself does not yet use PEX); once metadata is resolved the swarm download uses the same tracker/DHT/PEX peer discovery as `.torrent` files.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
@@ -131,12 +132,11 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 ## Roadmap
 
-All items preserve the download-only policy (no seeding, uploading, or sharing). PEX is implemented inbound-only: the client consumes peer lists and never advertises itself as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships. (Peer-pool replenishment and inbound BEP 11 PEX have shipped and are validated against a live swarm — see **Features**.)
+All items preserve the download-only policy (no seeding, uploading, or sharing). PEX is implemented inbound-only: the client consumes peer lists and never advertises itself as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships. (Peer-pool replenishment, inbound BEP 11 PEX, and outbound MSE/PE encryption have shipped and are validated against a live swarm — see **Features**.)
 
 ### Priority: reach more peers
 
-- **MSE/PE (BEP-8 Message Stream Encryption) for outbound peer connections — highest-value next item.** Live diagnosis shows that on public swarms the large majority of reachable peers require encryption: they accept our TCP connection but never respond to a plaintext BitTorrent handshake, so we cannot fetch metadata or pieces from them. Implementing the encrypted handshake (RC4/ARC4 key exchange over the peer socket) would unlock most of the swarm and is the single biggest lever for magnet-resolution and download success. Stays download-only (encryption changes the transport, not the seeding policy).
-- BEP 11 PEX during the magnet *metadata* exchange, to discover more reachable peers while resolving (PEX already drives the swarm download for both `.torrent` and magnet downloads; only the info-hash→metadata step is still trackers + DHT).
+- BEP 11 PEX during the magnet *metadata* exchange, to discover more reachable peers while resolving (PEX already drives the swarm download for both `.torrent` and magnet downloads, and MSE now encrypts those connections; only the info-hash→metadata step is still trackers + DHT).
 
 ### Larger, optional
 

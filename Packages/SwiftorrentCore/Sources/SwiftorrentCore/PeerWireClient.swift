@@ -46,6 +46,26 @@ public actor PeerWireClient {
     /// lists cannot grow this set without bound.
     static let maxDiscoveredPeers = 500
 
+    /// How `connect()` negotiates the transport.
+    public enum EncryptionPolicy: Sendable {
+        /// Try the MSE/PE encrypted handshake first; if the peer isn't MSE-capable,
+        /// retry once over a fresh plaintext connection. Reaches both the
+        /// encryption-required majority of public-swarm peers and plaintext peers.
+        case preferEncrypted
+        /// Plaintext BitTorrent handshake only.
+        case plaintextOnly
+    }
+
+    /// MSE `crypto_select` value for RC4 (BEP-8 / MSE spec).
+    private static let cryptoRC4: UInt32 = 0x02
+    /// What we advertise in `crypto_provide`: RC4 only, so a completed MSE
+    /// handshake always yields an encrypted stream (the whole point here). A peer
+    /// without RC4 simply fails MSE and we fall back to plaintext.
+    private static let cryptoProvide: UInt8 = 0x02
+    /// Upper bound on bytes scanned while resyncing on the encrypted VC — MSE PadB
+    /// is at most 512 bytes, so this caps a hostile peer streaming padding forever.
+    private static let maxResyncBytes = 8 + 600
+
     private let endpoint: PeerEndpoint
     private let infoHash: Data
     private let peerID: Data
@@ -55,7 +75,18 @@ public actor PeerWireClient {
     /// silent mid-message is torn down within this window instead of parking a
     /// download slot forever.
     private let ioTimeout: TimeInterval
+    private let encryptionPolicy: EncryptionPolicy
     private var connection: NWConnection?
+    /// Once the MSE handshake selects RC4, `sendCipher` encrypts our outgoing
+    /// bytes and `recvCipher` decrypts the peer's — both `nil` on a plaintext
+    /// connection. RC4 is a stream cipher, so running bytes through in order works
+    /// regardless of how sends/receives are chunked.
+    private var sendCipher: RC4?
+    private var recvCipher: RC4?
+    /// Raw (still-encrypted) bytes received from the socket but not yet consumed.
+    /// Every receive drains this first, so the MSE VC resync can over-read while
+    /// scanning without losing the payload bytes that follow.
+    private var inputBuffer = [UInt8]()
     private var isChoked = true
     private var peerSupportsExtensions = false
     private var peerMetadataExtensionID: UInt8?
@@ -78,17 +109,48 @@ public actor PeerWireClient {
         infoHash: Data,
         peerID: Data,
         connectTimeout: TimeInterval = 10,
-        ioTimeout: TimeInterval = 30
+        ioTimeout: TimeInterval = 30,
+        encryptionPolicy: EncryptionPolicy = .preferEncrypted
     ) {
         self.endpoint = endpoint
         self.infoHash = infoHash
         self.peerID = peerID
         self.connectTimeout = connectTimeout
         self.ioTimeout = ioTimeout
+        self.encryptionPolicy = encryptionPolicy
     }
 
+    /// Whether the active connection negotiated MSE/RC4 encryption rather than
+    /// falling back to (or being configured for) plaintext.
+    public var isEncrypted: Bool { sendCipher != nil }
+
     public func connect() async throws {
+        try await openConnection()
+        switch encryptionPolicy {
+        case .plaintextOnly:
+            try await bittorrentHandshake()
+        case .preferEncrypted:
+            do {
+                try await mseHandshake()
+                try await bittorrentHandshake()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // The peer isn't MSE-capable (or stalled mid-encryption). Retry once
+                // over a fresh plaintext connection so plaintext peers aren't lost.
+                close()
+                resetForReconnect()
+                try await openConnection()
+                try await bittorrentHandshake()
+            }
+        }
+    }
+
+    /// Opens the TCP connection and waits for it to become ready (bounded by
+    /// `connectTimeout`). Resets any buffered input from a prior attempt.
+    private func openConnection() async throws {
         try Task.checkCancellation()
+        inputBuffer.removeAll(keepingCapacity: true)
         guard let port = NWEndpoint.Port(rawValue: endpoint.port) else {
             throw PeerWireError.connectionFailed
         }
@@ -126,6 +188,12 @@ public actor PeerWireClient {
                 connection.cancel()
             }
         }
+    }
+
+    /// The plaintext BitTorrent handshake. Runs over whatever transport is in
+    /// place: raw TCP for a plaintext connection, or the RC4 stream cipher once
+    /// the MSE handshake has installed `sendCipher`/`recvCipher`.
+    private func bittorrentHandshake() async throws {
         try await send(handshake())
         let response = try await receiveExactly(68)
         guard response.count == 68,
@@ -141,6 +209,126 @@ public actor PeerWireClient {
             try await sendExtendedHandshake()
         }
         try await sendMessage(id: 2, payload: Data())
+    }
+
+    /// Clears per-connection state so a fresh `openConnection` + plaintext
+    /// handshake can be attempted after MSE failed. Availability/metadata state is
+    /// untouched — no wire messages were processed yet.
+    private func resetForReconnect() {
+        inputBuffer.removeAll(keepingCapacity: true)
+        sendCipher = nil
+        recvCipher = nil
+        isChoked = true
+        peerSupportsExtensions = false
+        sentExtendedHandshake = false
+        receivedExtendedHandshake = false
+    }
+
+    /// Performs the MSE/PE handshake as the initiator (BEP-8 message-stream
+    /// encryption): Diffie-Hellman key exchange, the `req1`/`req2⊕req3` hashes and
+    /// `crypto_provide`, then resync on the peer's encrypted VC to read
+    /// `crypto_select`. On RC4 selection it installs the stream ciphers so all
+    /// subsequent traffic — starting with the BitTorrent handshake — is encrypted.
+    /// Throws on any mismatch so `connect()` can fall back to plaintext.
+    ///
+    /// Download-only: this changes the transport so we can reach the
+    /// encryption-required peers that accept our TCP connection then go silent on a
+    /// plaintext handshake. It adds no listener and no upload.
+    private func mseHandshake() async throws {
+        // Step 1 — A→B: DH public key Ya, then random padding PadA.
+        let keyPair = MSE.generateKeyPair()
+        try await send(keyPair.publicKey + Self.randomPad())
+
+        // Step 2 — B→A: DH public key Yb (first 96 bytes). PadB follows and is
+        // skipped during the VC resync below.
+        let yb = try await rawReceive(MSE.keyLength)
+
+        // Step 3 — derive the shared secret and directional RC4 ciphers, then send
+        // HASH('req1',S) · HASH('req2',SKEY)⊕HASH('req3',S) · ENCRYPT(payload).
+        let secret = MSE.sharedSecret(peerPublicKey: yb, privateKey: keyPair.privateKey)
+        var outCipher = MSE.outgoingCipher(secret: secret, skey: infoHash)
+        var inCipher = MSE.incomingCipher(secret: secret, skey: infoHash)
+
+        let req2 = MSE.hash("req2", infoHash)
+        let req3 = MSE.hash("req3", secret)
+        var req2xor3 = Data(count: 20)
+        for i in 0..<20 { req2xor3[i] = req2[i] ^ req3[i] }
+
+        var cleartext = Data(count: 8)                          // VC = 8 zero bytes
+        cleartext.append(contentsOf: [0, 0, 0, Self.cryptoProvide]) // crypto_provide
+        cleartext.append(contentsOf: [0, 0])                    // len(PadC) = 0
+        cleartext.append(contentsOf: [0, 0])                    // len(IA)  = 0
+        let step3 = MSE.hash("req1", secret) + req2xor3 + outCipher.process(cleartext)
+        try await send(step3)
+
+        // Step 4 — resync on the encrypted VC, then read crypto_select + PadD.
+        let selected = try await readCryptoSelect(inCipher: &inCipher)
+        guard selected == Self.cryptoRC4 else {
+            // We only offered RC4; anything else (incl. plaintext) is unusable here.
+            throw PeerWireError.invalidHandshake
+        }
+        sendCipher = outCipher
+        recvCipher = inCipher
+    }
+
+    /// Skips PadB by scanning for the peer's encrypted VC (`inCipher` applied to 8
+    /// zero bytes), then decrypts and returns the 4-byte `crypto_select`, consuming
+    /// the trailing PadD. Advances `inCipher` exactly across VC + select + PadD so
+    /// it is aligned to decrypt the payload stream that follows.
+    private func readCryptoSelect(inCipher: inout RC4) async throws -> UInt32 {
+        // Peek the expected encrypted VC from a copy, leaving the real cipher intact.
+        var probe = inCipher
+        let encVC = [UInt8](probe.process(Data(count: 8)))
+
+        var searchFrom = 0
+        var vcEnd: Int?
+        while vcEnd == nil {
+            if let start = Self.firstIndex(of: encVC, in: inputBuffer, from: searchFrom) {
+                vcEnd = start + encVC.count
+            } else {
+                guard inputBuffer.count <= Self.maxResyncBytes else {
+                    throw PeerWireError.invalidHandshake
+                }
+                searchFrom = max(0, inputBuffer.count - encVC.count + 1)
+                try await fillInputBuffer()
+            }
+        }
+        // Drop PadB + VC; advance the real cipher past the 8 VC bytes it encrypted.
+        inputBuffer.removeFirst(vcEnd!)
+        _ = inCipher.process(Data(count: 8))
+
+        let select = inCipher.process(try await rawReceive(4))
+        let padDLenBytes = inCipher.process(try await rawReceive(2))
+        let padDLen = Int(padDLenBytes[0]) << 8 | Int(padDLenBytes[1])
+        if padDLen > 0 {
+            guard padDLen <= 1024 else { throw PeerWireError.invalidHandshake }
+            _ = inCipher.process(try await rawReceive(padDLen))
+        }
+        return UInt32(select[0]) << 24 | UInt32(select[1]) << 16 | UInt32(select[2]) << 8 | UInt32(select[3])
+    }
+
+    /// First index of `pattern` in `buffer` at or after `from`, or `nil`.
+    static func firstIndex(of pattern: [UInt8], in buffer: [UInt8], from: Int) -> Int? {
+        guard pattern.count <= buffer.count else { return nil }
+        let last = buffer.count - pattern.count
+        guard from <= last else { return nil }
+        for start in from...last {
+            var matched = true
+            for k in 0..<pattern.count where buffer[start + k] != pattern[k] {
+                matched = false
+                break
+            }
+            if matched { return start }
+        }
+        return nil
+    }
+
+    /// 0–512 random bytes of MSE PadA, obscuring the fixed-length key exchange.
+    private static func randomPad() -> Data {
+        let length = Int.random(in: 0...512)
+        var pad = Data(count: length)
+        for i in 0..<length { pad[i] = UInt8.random(in: 0...255) }
+        return pad
     }
 
     /// Returns peers learned from inbound PEX since the last call and clears the
@@ -443,10 +631,17 @@ public actor PeerWireClient {
     private func send(_ data: Data) async throws {
         try Task.checkCancellation()
         guard let connection else { throw PeerWireError.disconnected }
+        let outgoing: Data
+        if var cipher = sendCipher {
+            outgoing = cipher.process(data)
+            sendCipher = cipher
+        } else {
+            outgoing = data
+        }
         try await withTimeout(ioTimeout) {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    connection.send(content: data, completion: .contentProcessed { error in
+                    connection.send(content: outgoing, completion: .contentProcessed { error in
                         if let error {
                             continuation.resume(throwing: error)
                         } else {
@@ -460,32 +655,50 @@ public actor PeerWireClient {
         }
     }
 
+    /// Reads exactly `count` bytes, decrypting through `recvCipher` when the MSE
+    /// handshake selected RC4 (raw bytes otherwise). Drains the input buffer first
+    /// so bytes over-read during the MSE resync are consumed in order.
     private func receiveExactly(_ count: Int) async throws -> Data {
-        var result = Data()
-        while result.count < count {
-            try Task.checkCancellation()
-            guard let connection else { throw PeerWireError.disconnected }
-            let remaining = count - result.count
-            let chunk = try await withTimeout(ioTimeout) {
-                try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                        connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
-                            if let error {
-                                continuation.resume(throwing: error)
-                            } else if let data, !data.isEmpty {
-                                continuation.resume(returning: data)
-                            } else {
-                                continuation.resume(throwing: PeerWireError.disconnected)
-                            }
+        let raw = try await rawReceive(count)
+        guard var cipher = recvCipher else { return raw }
+        let plain = cipher.process(raw)
+        recvCipher = cipher
+        return plain
+    }
+
+    /// Removes and returns exactly `count` raw (undecrypted) bytes from the input
+    /// buffer, reading from the socket as needed.
+    private func rawReceive(_ count: Int) async throws -> Data {
+        while inputBuffer.count < count {
+            try await fillInputBuffer()
+        }
+        let head = Data(inputBuffer[0..<count])
+        inputBuffer.removeFirst(count)
+        return head
+    }
+
+    /// Appends one socket read to the raw input buffer.
+    private func fillInputBuffer() async throws {
+        try Task.checkCancellation()
+        guard let connection else { throw PeerWireError.disconnected }
+        let chunk = try await withTimeout(ioTimeout) {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                    connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else if let data, !data.isEmpty {
+                            continuation.resume(returning: data)
+                        } else {
+                            continuation.resume(throwing: PeerWireError.disconnected)
                         }
                     }
-                } onCancel: {
-                    connection.cancel()
                 }
+            } onCancel: {
+                connection.cancel()
             }
-            result.append(chunk)
         }
-        return result
+        inputBuffer.append(contentsOf: chunk)
     }
 
     /// Races `operation` against a sleeping timer. If the timer wins, the

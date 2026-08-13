@@ -480,7 +480,13 @@ struct CoreParsingTests {
             infoHash: Data(repeating: 0, count: 20),
             peerID: Data(repeating: 1, count: 20),
             connectTimeout: 2,
-            ioTimeout: 0.5
+            ioTimeout: 0.5,
+            // Exercise the plaintext handshake-read timeout directly. The default
+            // .preferEncrypted policy would (correctly) try MSE first and, on that
+            // read timing out, fall back to a second plaintext attempt — doubling
+            // the wait — which is a separate behavior from the teardown primitive
+            // under test here.
+            encryptionPolicy: .plaintextOnly
         )
 
         let start = ContinuousClock.now
