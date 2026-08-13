@@ -12,7 +12,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - Parses bencoded torrent metainfo, computes SHA-1 info hashes from the raw `info` dictionary, reads single-file and multi-file torrents, and extracts tracker tiers.
 - Talks to HTTP and HTTPS trackers with compact peer responses.
 - Talks to UDP trackers with compact IPv4 peer responses.
-- Resolves magnet metadata through BEP 5 DHT `get_peers`, BEP 10 extension negotiation, and BEP 9 `ut_metadata` requests.
+- Resolves magnet metadata through BEP 5 DHT `get_peers`, BEP 10 extension negotiation, and BEP 9 `ut_metadata` requests. Peer collection returns as soon as it has gathered enough peers or an 18s deadline elapses (rather than blocking on the slowest source, e.g. a DHT sweep), and metadata is fetched by a bounded pool of concurrent peer probes that keeps only the peers that actually connect and retries them until one delivers SHA-1-verified metadata or a 90s phase deadline elapses. A reachable peer that turns out not to hold the metadata (a leecher) is dropped in about one round-trip instead of parking a probe slot.
 - Discovers `.torrent` download peers through HTTP/HTTPS trackers, UDP trackers, and BEP 5 DHT `get_peers`.
 - Implements a peer-wire downloader for `.torrent` metadata: handshake, interested, bitfield/have availability tracking, a self-replenishing pool of concurrent peer downloads (workers draw from a shared peer reserve and replace any peer that dies or runs dry, so the swarm refills toward full instead of bleeding out), rarest-first piece scheduling, unchoke handling, block requests, piece receipt, SHA-1 piece verification, existing-piece resume checks, and file writing.
 - Bounds every peer-wire network wait with connect and per-operation send/receive timeouts, so a peer that goes silent mid-message is torn down instead of parking a download slot.
@@ -33,6 +33,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 ## Current Limitations
 
 - Downloads (both `.torrent` and resolved magnets) use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, encryption, NAT traversal, uTP, or endgame mode.
+- **No protocol encryption (MSE/PE) and no listening port.** Swiftorrent connects out over plain BitTorrent TCP only and never accepts inbound connections. Peers that require encryption accept the TCP connection but then stay silent (they will not speak our plaintext handshake), and NAT'd peers that only accept inbound are unreachable to us entirely. In a typical public swarm the majority of advertised peers therefore cannot be used, so the effective peer set is the plaintext-accepting, inbound-reachable minority. Downloads still work when such peers exist, but on swarms where they are scarce, magnet metadata resolution can time out even though other clients (which implement MSE and have a listening port) succeed. See the Roadmap — MSE/PE support is the highest-value item for improving connect success.
 - Magnet links fetch metadata from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT (the metadata exchange itself does not yet use PEX); once metadata is resolved the swarm download uses the same tracker/DHT/PEX peer discovery as `.torrent` files.
 - The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
 
@@ -132,9 +133,13 @@ The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The
 
 All items preserve the download-only policy (no seeding, uploading, or sharing). PEX is implemented inbound-only: the client consumes peer lists and never advertises itself as a source. Completed work is dropped from this list; see **Features** above and `SESSION_STATE.md` for what already ships. (Peer-pool replenishment and inbound BEP 11 PEX have shipped and are validated against a live swarm — see **Features**.)
 
+### Priority: reach more peers
+
+- **MSE/PE (BEP-8 Message Stream Encryption) for outbound peer connections — highest-value next item.** Live diagnosis shows that on public swarms the large majority of reachable peers require encryption: they accept our TCP connection but never respond to a plaintext BitTorrent handshake, so we cannot fetch metadata or pieces from them. Implementing the encrypted handshake (RC4/ARC4 key exchange over the peer socket) would unlock most of the swarm and is the single biggest lever for magnet-resolution and download success. Stays download-only (encryption changes the transport, not the seeding policy).
+- BEP 11 PEX during the magnet *metadata* exchange, to discover more reachable peers while resolving (PEX already drives the swarm download for both `.torrent` and magnet downloads; only the info-hash→metadata step is still trackers + DHT).
+
 ### Larger, optional
 
 - Endgame mode (re-request the last in-flight pieces across peers so the tail doesn't stall).
-- BEP 11 PEX during the magnet *metadata* exchange (PEX already drives the swarm download for both `.torrent` and magnet downloads; only the info-hash→metadata step is still trackers + DHT).
-- uTP transport and/or MSE/PE stream encryption for networks that throttle plain BitTorrent TCP.
+- uTP transport for networks that throttle plain BitTorrent TCP.
 - Migrate to a native Xcode app target to drop the manual `.app` bundling step.

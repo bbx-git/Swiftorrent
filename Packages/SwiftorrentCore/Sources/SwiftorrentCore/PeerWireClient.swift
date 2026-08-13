@@ -65,6 +65,10 @@ public actor PeerWireClient {
     /// Guards against re-sending our extension handshake when both `connect()` and
     /// `fetchMetadata()` would otherwise send one.
     private var sentExtendedHandshake = false
+    /// Set once the peer's BEP 10 extension handshake (extended id 0) arrives.
+    /// Lets the metadata path stop waiting as soon as we know whether the peer
+    /// offers `ut_metadata`, rather than blocking until the I/O timeout.
+    private var receivedExtendedHandshake = false
     /// Peers learned from inbound BEP 11 PEX `added` lists during this session,
     /// drained by the swarm so dead connections are replaced from gossiped peers.
     private var discoveredPeers = Set<PeerEndpoint>()
@@ -315,7 +319,13 @@ public actor PeerWireClient {
     }
 
     private func readUntilMetadataHandshake() async throws {
-        while peerMetadataExtensionID == nil || metadataSize == nil {
+        // The peer's extension handshake (extended id 0) carries its `ut_metadata`
+        // id and `metadata_size`, and is sent once, up front. Loop only until we
+        // receive it — not until metadata appears — so a reachable peer that
+        // simply doesn't have the metadata (a leecher) is abandoned in ~1 RTT
+        // instead of pinning the slot for the full I/O timeout. The caller then
+        // sees `peerMetadataExtensionID`/`metadataSize` still nil and fails fast.
+        while !receivedExtendedHandshake {
             try Task.checkCancellation()
             let message = try await readMessage()
             if message.id == 20 {
@@ -373,6 +383,7 @@ public actor PeerWireClient {
     }
 
     private func handleExtendedHandshake(_ body: Data) {
+        receivedExtendedHandshake = true
         guard let node = try? BencodeParser(data: body).parse(),
               case let .dictionary(dictionary) = node.value else {
             return

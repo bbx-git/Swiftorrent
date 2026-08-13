@@ -538,6 +538,7 @@ private struct FileSelectionSheet: View {
         HStack {
             Button("Cancel", role: .cancel) { cancel() }
                 .keyboardShortcut(.cancelAction)
+                .buttonStyle(.bordered)
             Spacer()
             Button("Download") { start(createSubfolder) }
                 .keyboardShortcut(.defaultAction)
@@ -562,6 +563,7 @@ private struct FileSelectionSheet: View {
             Spacer()
             Button("Cancel", role: .cancel) { cancel() }
                 .keyboardShortcut(.cancelAction)
+                .buttonStyle(.bordered)
         }
     }
 
@@ -576,6 +578,7 @@ private struct FileSelectionSheet: View {
             Spacer()
             Button("Close") { cancel() }
                 .keyboardShortcut(.defaultAction)
+                .buttonStyle(.bordered)
         }
     }
 }

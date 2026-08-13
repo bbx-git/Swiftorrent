@@ -63,36 +63,92 @@ public struct MagnetMetadataResolver: Sendable {
         let peers = try await collectPeers(trackers: trackers, magnet: magnet, peerID: peerID)
         guard !peers.isEmpty else { throw MagnetMetadataResolverError.noPeers }
 
+        // Try peers concurrently. Most peers in a public swarm are unreachable
+        // (NAT) or won't serve metadata, and the few that will are often slow
+        // leechers, so probing serially — or giving up after one pass — stalls or
+        // fails. A bounded worker pool pulls from a **recycling** cursor: workers
+        // keep handshaking peers (retrying the pool, since a peer that was busy or
+        // still fetching metadata itself may serve on a later pass) until one
+        // delivers verified metadata or the overall deadline fires. The deadline
+        // bounds the whole phase so a dead swarm errors in seconds-to-a-minute
+        // instead of hanging, while a live-but-slow seed still gets found.
         await progress(MagnetMetadataProgress(status: "Fetching magnet metadata from \(peers.count) peers"))
-        var lastError: Error?
+        let candidates = Array(peers.prefix(Self.maxMetadataPeers))
+        let cursor = PeerCursor(peers: candidates)
+        let errorBox = ErrorBox()
+        let workerCount = min(Self.maxConcurrentMetadataFetches, candidates.count)
 
-        for peer in peers.prefix(24) {
-            try Task.checkCancellation()
-            do {
-                let infoData = try await withTimeout(seconds: .seconds(20)) {
-                    try await fetchMetadata(from: peer, magnet: magnet, peerID: peerID)
+        let metainfo = try await withThrowingTaskGroup(of: TorrentMetainfo?.self) { group in
+            for _ in 0..<workerCount {
+                group.addTask {
+                    while let peer = await cursor.next() {
+                        try Task.checkCancellation()
+                        do {
+                            let infoData = try await withTimeout(seconds: .seconds(15)) {
+                                try await fetchMetadata(from: peer, magnet: magnet, peerID: peerID) {
+                                    // Peer accepted our TCP + BitTorrent handshake, so it is
+                                    // reachable — worth retrying. ~3 of 4 swarm peers are NAT'd
+                                    // and never get here; concentrating retries on the reachable
+                                    // minority is what finds the rare metadata-serving seed.
+                                    await cursor.markReachable(peer)
+                                }
+                            }
+                            let hash = Data(Insecure.SHA1.hash(data: infoData))
+                            guard hash == magnet.infoHash else {
+                                throw MagnetMetadataResolverError.metadataHashMismatch
+                            }
+                            return try parser.parseInfoDictionary(
+                                data: infoData,
+                                announceURLs: trackers,
+                                webSeedURLs: magnet.webSeeds,
+                                preferredName: magnet.displayName
+                            )
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            await errorBox.record(error)
+                        }
+                    }
+                    return nil // recycling cursor only returns nil once cancelled
                 }
-                let hash = Data(Insecure.SHA1.hash(data: infoData))
-                guard hash == magnet.infoHash else {
-                    throw MagnetMetadataResolverError.metadataHashMismatch
-                }
-                let metainfo = try parser.parseInfoDictionary(
-                    data: infoData,
-                    announceURLs: trackers,
-                    webSeedURLs: magnet.webSeeds,
-                    preferredName: magnet.displayName
-                )
-                await progress(MagnetMetadataProgress(status: "Metadata resolved: \(metainfo.name)"))
-                return metainfo
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                lastError = error
             }
+            // Deadline sentinel: returns nil to end the phase if no worker has
+            // succeeded by the time it fires.
+            group.addTask {
+                try? await Task.sleep(for: Self.metadataPhaseDeadline)
+                return nil
+            }
+
+            var resolved: TorrentMetainfo?
+            for try await result in group {
+                if let result {
+                    resolved = result
+                    break
+                }
+                // A nil is either the deadline firing or a worker seeing a
+                // cancelled cursor; both mean we should stop.
+                break
+            }
+            group.cancelAll()
+            return resolved
         }
 
-        throw lastError ?? MagnetMetadataResolverError.noPeers
+        if let metainfo {
+            await progress(MagnetMetadataProgress(status: "Metadata resolved: \(metainfo.name)"))
+            return metainfo
+        }
+
+        throw await errorBox.lastError ?? MagnetMetadataResolverError.noPeers
     }
+
+    /// Upper bound on peers probed for metadata per magnet, how many probes run
+    /// at once, and the wall-clock budget for the whole metadata phase. Trying a
+    /// wide slice of the swarm concurrently — and retrying it until the deadline —
+    /// is what keeps a magnet from stalling behind unreachable/slow peers while
+    /// still finding the occasional slow seed that actually has the metadata.
+    private static let maxMetadataPeers = 300
+    private static let maxConcurrentMetadataFetches = 24
+    private static let metadataPhaseDeadline: Duration = .seconds(90)
 
     private func resolveFromExactSources(
         magnet: MagnetLink,
@@ -136,7 +192,13 @@ public struct MagnetMetadataResolver: Sendable {
         var peers: Set<PeerEndpoint> = []
         var lastError: Error?
 
-        await withTaskGroup(of: Result<[PeerEndpoint], Error>.self) { group in
+        // Each source (tracker or DHT) returns `.some(result)`; a deadline task
+        // returns `nil`. We stop as soon as we have enough peers to start
+        // fetching metadata, or the deadline fires — otherwise a fast tracker's
+        // peers would sit unused for minutes while the DHT exhausts its query
+        // budget (the whole group would only return once its *slowest* source
+        // finished). Stragglers are cancelled on exit.
+        await withTaskGroup(of: Optional<Result<[PeerEndpoint], Error>>.self) { group in
             for tracker in trackers {
                 group.addTask {
                     do {
@@ -163,19 +225,23 @@ public struct MagnetMetadataResolver: Sendable {
                     return .failure(error)
                 }
             }
+            group.addTask {
+                try? await Task.sleep(for: Self.peerCollectionDeadline)
+                return nil
+            }
 
             for await result in group {
-                if Task.isCancelled {
-                    group.cancelAll()
-                    break
-                }
+                if Task.isCancelled { break }
+                guard let result else { break } // deadline reached
                 switch result {
                 case let .success(endpoints):
                     peers.formUnion(endpoints)
                 case let .failure(error):
                     lastError = error
                 }
+                if peers.count >= Self.enoughPeersToStart { break }
             }
+            group.cancelAll()
         }
 
         try Task.checkCancellation()
@@ -185,10 +251,29 @@ public struct MagnetMetadataResolver: Sendable {
         return Array(peers).shuffled()
     }
 
-    private func fetchMetadata(from peer: PeerEndpoint, magnet: MagnetLink, peerID: Data) async throws -> Data {
-        let client = PeerWireClient(endpoint: peer, infoHash: magnet.infoHash, peerID: peerID)
+    /// Peer-collection stops early once this many peers are gathered, and never
+    /// runs longer than the deadline even if a slow DHT/tracker is still working.
+    /// The threshold is deliberately high: metadata-serving seeds are often
+    /// reachable only via the DHT or a specific tracker, so quitting the instant
+    /// one fast tracker answers (with mostly unreachable leechers) tanks the
+    /// odds of the metadata phase succeeding. We'd rather spend a few extra
+    /// seconds gathering a diverse set from every source.
+    private static let enoughPeersToStart = 300
+    private static let peerCollectionDeadline: Duration = .seconds(18)
+
+    private func fetchMetadata(
+        from peer: PeerEndpoint,
+        magnet: MagnetLink,
+        peerID: Data,
+        onConnected: @Sendable () async -> Void = {}
+    ) async throws -> Data {
+        // A short connect timeout is what keeps a worker slot from being pinned
+        // for 10s by an unreachable (NAT/filtered) peer; a peer that actually has
+        // metadata completes its handshake within a couple seconds.
+        let client = PeerWireClient(endpoint: peer, infoHash: magnet.infoHash, peerID: peerID, connectTimeout: 8)
         do {
             try await client.connect()
+            await onConnected()
             let metadata = try await client.fetchMetadata()
             await client.close()
             return metadata
@@ -196,6 +281,62 @@ public struct MagnetMetadataResolver: Sendable {
             await client.close()
             throw error
         }
+    }
+}
+
+/// Hands out swarm peers to a pool of concurrent metadata-fetch workers, learning
+/// reachability as it goes. **First pass:** every candidate is tried once (broad
+/// sweep to discover which peers actually accept a connection — roughly 1 in 4,
+/// the rest being NAT'd and dropping our SYN). **After the first pass:** it cycles
+/// only the peers that connected, since re-dialing the ~75% unreachable majority
+/// just burns the metadata-phase budget on connect timeouts. Concentrating
+/// retries on reachable peers is what lets the rare metadata-serving seed be hit
+/// repeatedly until it delivers. Returns nil only when the peer list is empty.
+private actor PeerCursor {
+    private let all: [PeerEndpoint]
+    private var index = 0
+    private var firstPassComplete = false
+    private var reachable: [PeerEndpoint] = []
+    private var reachableSeen = Set<PeerEndpoint>()
+    private var reachableIndex = 0
+
+    init(peers: [PeerEndpoint]) {
+        all = peers
+    }
+
+    /// Records that a peer accepted our handshake, so later passes retry it.
+    func markReachable(_ peer: PeerEndpoint) {
+        if reachableSeen.insert(peer).inserted {
+            reachable.append(peer)
+        }
+    }
+
+    func next() -> PeerEndpoint? {
+        guard !all.isEmpty else { return nil }
+        if !firstPassComplete {
+            if index < all.count {
+                defer { index += 1 }
+                return all[index]
+            }
+            firstPassComplete = true
+        }
+        // Retry only reachable peers. Until any are known (in-flight first-pass
+        // probes haven't reported yet), fall back to recycling the full list so
+        // workers never starve mid-sweep.
+        let pool = reachable.isEmpty ? all : reachable
+        if reachableIndex >= pool.count { reachableIndex = 0 }
+        defer { reachableIndex = (reachableIndex + 1) % pool.count }
+        return pool[reachableIndex]
+    }
+}
+
+/// Collects the most recent non-cancellation failure across concurrent metadata
+/// workers so the resolver can surface a meaningful error if no peer succeeds.
+private actor ErrorBox {
+    private(set) var lastError: Error?
+
+    func record(_ error: Error) {
+        lastError = error
     }
 }
 
