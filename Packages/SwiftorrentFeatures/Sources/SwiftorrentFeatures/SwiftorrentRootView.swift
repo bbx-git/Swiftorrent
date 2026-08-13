@@ -539,6 +539,7 @@ private struct FileSelectionSheet: View {
             Button("Cancel", role: .cancel) { cancel() }
                 .keyboardShortcut(.cancelAction)
                 .buttonStyle(.bordered)
+                .tint(.primary)
             Spacer()
             Button("Download") { start(createSubfolder) }
                 .keyboardShortcut(.defaultAction)
@@ -564,6 +565,7 @@ private struct FileSelectionSheet: View {
             Button("Cancel", role: .cancel) { cancel() }
                 .keyboardShortcut(.cancelAction)
                 .buttonStyle(.bordered)
+                .tint(.primary)
         }
     }
 
@@ -579,6 +581,7 @@ private struct FileSelectionSheet: View {
             Button("Close") { cancel() }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.bordered)
+                .tint(.primary)
         }
     }
 }
