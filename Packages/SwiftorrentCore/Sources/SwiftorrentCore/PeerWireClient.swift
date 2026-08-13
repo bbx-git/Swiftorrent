@@ -42,6 +42,11 @@ public actor PeerWireClient {
     /// `ut_pex` messages to us using this id. Download-only: we declare support so
     /// peers gossip more peers to us, but we never send an `added` list ourselves.
     static let localPexExtensionID: UInt8 = 2
+    /// Local extension-message id we advertise for BEP 9 `ut_metadata`. Per BEP 10,
+    /// a peer addresses its metadata replies to us using *this* id (the one we
+    /// advertised), not the id it advertised for itself, so incoming metadata
+    /// pieces must be matched against this constant.
+    static let localMetadataExtensionID: UInt8 = 1
     /// Cap on peers retained from inbound PEX, so a hostile peer flooding `added`
     /// lists cannot grow this set without bound.
     static let maxDiscoveredPeers = 500
@@ -376,7 +381,7 @@ public actor PeerWireClient {
         for piece in 0..<pieceCount {
             try Task.checkCancellation()
             try await requestMetadataPiece(piece, extensionID: extensionID)
-            let response = try await readMetadataPiece(expectedPiece: piece, extensionID: extensionID)
+            let response = try await readMetadataPiece(expectedPiece: piece)
             metadata.append(response)
         }
 
@@ -498,7 +503,7 @@ public actor PeerWireClient {
         sentExtendedHandshake = true
         let payload = Data([0]) + BencodeEncoder.encode([
             "m": .dictionary([
-                "ut_metadata": .integer(1),
+                "ut_metadata": .integer(Int64(Self.localMetadataExtensionID)),
                 "ut_pex": .integer(Int64(Self.localPexExtensionID))
             ]),
             "p": .integer(0)
@@ -530,7 +535,7 @@ public actor PeerWireClient {
         try await sendMessage(id: 20, payload: payload)
     }
 
-    private func readMetadataPiece(expectedPiece: Int, extensionID: UInt8) async throws -> Data {
+    private func readMetadataPiece(expectedPiece: Int) async throws -> Data {
         while true {
             try Task.checkCancellation()
             let message = try await readMessage()
@@ -540,7 +545,14 @@ public actor PeerWireClient {
                 handleExtendedMessage(message.payload)
                 continue
             }
-            guard extendedID == extensionID else { continue }
+            // Per BEP 10 the peer tags its metadata reply with the id *we*
+            // advertised for `ut_metadata` (not the id it advertised for itself).
+            // Route any other extended id (e.g. `ut_pex`) through the normal
+            // handler so PEX peers gossiped mid-fetch aren't lost.
+            guard extendedID == Self.localMetadataExtensionID else {
+                handleExtendedMessage(message.payload)
+                continue
+            }
 
             let payload = Data(message.payload.dropFirst())
             let header = try BencodeParser(data: payload).parsePrefix()

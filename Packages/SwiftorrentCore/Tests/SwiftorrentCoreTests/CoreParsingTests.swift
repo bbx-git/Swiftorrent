@@ -511,6 +511,88 @@ struct CoreParsingTests {
         #expect(elapsed < .seconds(2))
     }
 
+    @Test("Metadata fetch accepts replies tagged with our advertised ut_metadata id")
+    func fetchMetadataMatchesLocalExtensionID() async throws {
+        // A scripted loopback peer that completes the BEP-9/BEP-10 metadata
+        // exchange, but advertises `ut_metadata` under id 3 for itself while
+        // (correctly, per BEP-10) tagging the reply it sends us with the id *we*
+        // advertised. Regression guard: the reader must key off our advertised
+        // id, not the peer's — the old code compared against the peer's id (3),
+        // ignored every reply, and hung until the peer disconnected.
+        let infoHash = Data(repeating: 7, count: 20)
+        let metadata = Data((0..<50).map { UInt8($0) })
+        let localMetaID = PeerWireClient.localMetadataExtensionID // the id we advertise
+
+        func be32(_ value: Int) -> Data {
+            let v = UInt32(value)
+            return Data([UInt8(v >> 24 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 8 & 0xff), UInt8(v & 0xff)])
+        }
+        func frame(id: UInt8, payload: Data) -> Data {
+            be32(payload.count + 1) + Data([id]) + payload
+        }
+
+        var reserved = Data(repeating: 0, count: 8)
+        reserved[5] = 0x10 // advertise extension-protocol support
+        let peerHandshake = Data([19]) + Data("BitTorrent protocol".utf8) + reserved + infoHash + Data(repeating: 9, count: 20)
+        let extHandshake = frame(id: 20, payload: Data([0]) + BencodeEncoder.encode([
+            "m": .dictionary(["ut_metadata": .integer(3)]),
+            "metadata_size": .integer(Int64(metadata.count))
+        ]))
+        let metadataReply = frame(id: 20, payload: Data([localMetaID]) + BencodeEncoder.encode([
+            "msg_type": .integer(1),
+            "piece": .integer(0),
+            "total_size": .integer(Int64(metadata.count))
+        ]) + metadata)
+        let scriptedBlob = peerHandshake + extHandshake + metadataReply
+
+        let holder = AcceptedConnections()
+        let listener = try NWListener(using: .tcp)
+        listener.newConnectionHandler = { connection in
+            holder.add(connection)
+            connection.stateUpdateHandler = { state in
+                if case .ready = state {
+                    connection.stateUpdateHandler = nil
+                    connection.send(content: scriptedBlob, completion: .contentProcessed { _ in })
+                }
+            }
+            connection.start(queue: .global(qos: .utility))
+        }
+        let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if let port = listener.port {
+                        listener.stateUpdateHandler = nil
+                        continuation.resume(returning: port)
+                    }
+                case let .failed(error):
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default:
+                    break
+                }
+            }
+            listener.start(queue: .global(qos: .utility))
+        }
+        defer {
+            listener.cancel()
+            holder.cancelAll()
+        }
+
+        let client = PeerWireClient(
+            endpoint: PeerEndpoint(host: "127.0.0.1", port: port.rawValue),
+            infoHash: infoHash,
+            peerID: Data(repeating: 1, count: 20),
+            connectTimeout: 2,
+            ioTimeout: 2,
+            encryptionPolicy: .plaintextOnly
+        )
+        try await client.connect()
+        let resolved = try await client.fetchMetadata()
+        await client.close()
+        #expect(resolved == metadata)
+    }
+
     @Test("Layout maps selected files onto overlapping pieces, including shared boundaries")
     func layoutSelectsBoundaryPieces() {
         // a.txt = bytes 0..2 (piece 0), b.txt = bytes 2..6 (pieces 0 and 1).
