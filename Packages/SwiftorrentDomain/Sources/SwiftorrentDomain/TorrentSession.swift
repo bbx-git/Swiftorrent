@@ -265,11 +265,12 @@ public final class TorrentSession {
         persist()
     }
 
-    /// Restarts a paused torrent. On-disk pieces are re-verified, so the download
-    /// picks up where it left off.
+    /// Restarts a paused or failed torrent. On-disk pieces are re-verified, so the
+    /// download picks up where it left off — this is also the retry path for a
+    /// torrent that failed mid-download (e.g. a dropped connection).
     public func resume(itemID: TorrentItem.ID) {
         guard let index = items.firstIndex(where: { $0.id == itemID }),
-              items[index].state == .paused,
+              items[index].state == .paused || items[index].state == .failed,
               let metainfo = metainfos[itemID] else {
             return
         }
@@ -290,6 +291,11 @@ public final class TorrentSession {
             } catch is CancellationError {
                 return
             } catch {
+                // A cancelled download (pause / relaunch / remove) tears down its
+                // socket, which can surface as a network/timeout error rather than
+                // CancellationError. Don't misreport that as a failure — the
+                // pause/relaunch path already set the correct state.
+                if Task.isCancelled { return }
                 update(itemID) {
                     $0.status = error.localizedDescription
                     $0.state = .failed

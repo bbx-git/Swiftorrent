@@ -274,7 +274,25 @@ private struct TorrentRow: View {
     @State private var showFiles = false
 
     private var hasFileList: Bool { item.files.count > 1 }
-    private var canPauseOrResume: Bool { item.state == .downloading || item.state == .paused }
+    private var canPauseOrResume: Bool {
+        item.state == .downloading || item.state == .paused || item.state == .failed
+    }
+
+    private var pauseResumeIcon: String {
+        switch item.state {
+        case .downloading: "pause.fill"
+        case .failed: "arrow.clockwise"
+        default: "play.fill"
+        }
+    }
+
+    private var pauseResumeHelp: String {
+        switch item.state {
+        case .downloading: "Pause"
+        case .failed: "Retry"
+        default: "Resume"
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -329,10 +347,10 @@ private struct TorrentRow: View {
 
                 if canPauseOrResume {
                     Button(action: item.state == .downloading ? pause : resume) {
-                        Image(systemName: item.state == .downloading ? "pause.fill" : "play.fill")
+                        Image(systemName: pauseResumeIcon)
                     }
                     .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.12)).interactive()))
-                    .help(item.state == .downloading ? "Pause" : "Resume")
+                    .help(pauseResumeHelp)
                 }
 
                 Button(role: .destructive, action: remove) {
