@@ -285,6 +285,12 @@ struct PeerSwarmDownloader: Sendable {
                     // Fold peers this connection gossiped via PEX into the shared
                     // reserve so workers replacing dead peers can draw them.
                     await supply.add(peers)
+                },
+                completedElsewhere: { held in
+                    // Endgame: which of this peer's in-flight pieces another peer has
+                    // already finished, so downloadPieces can cancel their outstanding
+                    // blocks instead of redownloading a verified duplicate.
+                    await coordinator.completedAmong(held)
                 }
             )
         } catch is CancellationError {

@@ -447,6 +447,12 @@ public actor PeerWireClient {
     ///   nothing more we need — at which point the session ends cleanly.
     /// - `onBlock` is awaited per block with its byte count (rate-limit pacing +
     ///   live-speed accounting); `onPeersDiscovered` folds inbound PEX gossip.
+    /// - `completedElsewhere` (endgame): given the pieces this peer is still
+    ///   assembling, returns the subset another peer has already finished. We send a
+    ///   BEP-3 `cancel` for each still-outstanding block of those pieces and drop
+    ///   them, reclaiming the tail bandwidth endgame duplication would otherwise burn
+    ///   finishing an already-verified copy. Polled on a throttle so it stays off the
+    ///   hot path, and returns empty outside endgame.
     public func downloadPieces(
         blockSize: Int = 16 * 1024,
         pieceLength: @Sendable (Int) -> Int,
@@ -455,7 +461,8 @@ public actor PeerWireClient {
         onPieceComplete: @Sendable (Int, Data) async throws -> Void,
         onReturnPiece: @Sendable (Int) async -> Void,
         onBlock: (@Sendable (Int) async -> Void)? = nil,
-        onPeersDiscovered: (@Sendable ([PeerEndpoint]) async -> Void)? = nil
+        onPeersDiscovered: (@Sendable ([PeerEndpoint]) async -> Void)? = nil,
+        completedElsewhere: (@Sendable (_ held: Set<Int>) async -> Set<Int>)? = nil
     ) async throws {
         var active: [Int: PieceAssembly] = [:]           // claimed, still assembling
         var requestQueue: [(piece: Int, begin: Int, length: Int)] = []   // not yet requested
@@ -469,6 +476,9 @@ public actor PeerWireClient {
         var windowCap = Self.minPipelinedBlocks
         var rateWindowStart = clock.now
         var rateWindowBytes = 0
+        // Endgame: throttle how often we ask whether a held piece was completed by
+        // another peer, so this stays off the per-block hot path.
+        var lastCancelCheck = clock.now
 
         func returnAll() async {
             for index in active.keys { await onReturnPiece(index) }
@@ -487,6 +497,29 @@ public actor PeerWireClient {
                     windowCap = min(Self.maxPipelinedBlocks, max(Self.minPipelinedBlocks, target))
                     rateWindowStart = clock.now
                     rateWindowBytes = 0
+                }
+
+                // Endgame cancel: drop any held piece another peer already finished and
+                // send a `cancel` for its still-outstanding blocks, so we don't spend
+                // the tail redownloading a verified duplicate. Throttled; a no-op until
+                // endgame (when the same piece is handed to several peers at once).
+                if let completedElsewhere, !active.isEmpty,
+                   lastCancelCheck.duration(to: clock.now) >= .milliseconds(250) {
+                    lastCancelCheck = clock.now
+                    for piece in await completedElsewhere(Set(active.keys)) {
+                        active.removeValue(forKey: piece)
+                        requestQueue.removeAll { $0.piece == piece }
+                        let toCancel = outstanding.filter { $0.piece == piece }
+                        outstanding.subtract(toCancel)
+                        for key in toCancel {
+                            let length = min(blockSize, pieceLength(piece) - key.begin)
+                            var payload = Data()
+                            payload.appendUInt32(UInt32(key.piece))
+                            payload.appendUInt32(UInt32(key.begin))
+                            payload.appendUInt32(UInt32(length))
+                            try await sendMessage(id: 8, payload: payload)
+                        }
+                    }
                 }
 
                 // Fill the pipeline while unchoked: claim fresh pieces as the queue

@@ -121,6 +121,16 @@ actor PieceDownloadCoordinator {
         return (downloadedBytes, perFileBytes)
     }
 
+    /// Endgame support: of the pieces a peer is still assembling, which have already
+    /// been completed by another peer. The peer cancels its outstanding block
+    /// requests for these and drops them, so the tail isn't spent finishing an
+    /// already-verified duplicate. Returns an empty set outside endgame (nothing a
+    /// peer holds has been completed elsewhere), so it's a cheap no-op on the hot path.
+    func completedAmong(_ pieces: Set<Int>) -> Set<Int> {
+        guard !pieces.isEmpty else { return [] }
+        return completedPieces.intersection(pieces)
+    }
+
     func returnPiece(_ pieceIndex: Int) {
         guard !completedPieces.contains(pieceIndex), let count = assignments[pieceIndex] else {
             return

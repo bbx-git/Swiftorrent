@@ -1044,6 +1044,29 @@ struct CoreParsingTests {
         #expect(await coordinator.isComplete)
     }
 
+    @Test("Coordinator reports which held pieces another peer already completed (endgame cancel)")
+    func coordinatorCompletedAmongDrivesEndgameCancel() async {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8), Data("ef".utf8)])
+        let layout = TorrentLayout(metainfo: metainfo)
+        let coordinator = PieceDownloadCoordinator(
+            layout: layout,
+            selectablePieces: [0, 1],
+            completedPieces: [],
+            initialDownloaded: 0,
+            availabilityCounts: [:]
+        )
+        // Before anything completes, a peer holding both pieces is told to cancel
+        // nothing — completedAmong is a no-op outside endgame.
+        #expect(await coordinator.completedAmong([0, 1]).isEmpty)
+        // Peer A finishes piece 0. A peer still assembling pieces 0 and 1 must now be
+        // told piece 0 is done (so it can cancel those blocks) but not piece 1.
+        _ = await coordinator.complete(pieceIndex: 0)
+        #expect(await coordinator.completedAmong([0, 1]) == [0])
+        #expect(await coordinator.completedAmong([1]).isEmpty)
+        // A peer that isn't holding the completed piece is told to cancel nothing.
+        #expect(await coordinator.completedAmong([]).isEmpty)
+    }
+
     @Test("Peer supply hands out each peer once then drains to nil")
     func peerSupplyDrainsWithoutDuplicates() async {
         let peers = [

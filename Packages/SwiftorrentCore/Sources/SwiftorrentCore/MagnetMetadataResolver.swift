@@ -237,16 +237,22 @@ public struct MagnetMetadataResolver: Sendable {
                 return nil
             }
 
+            let realSources = trackers.count + 1 // trackers + DHT
+            var reported = 0
             for await result in group {
                 if Task.isCancelled { break }
                 guard let result else { break } // deadline reached
+                reported += 1
                 switch result {
                 case let .success(endpoints):
                     peers.formUnion(endpoints)
                 case let .failure(error):
                     lastError = error
                 }
-                if peers.count >= Self.enoughPeersToStart { break }
+                // Stop once we have plenty, or every tracker/DHT has answered — a fast
+                // small swarm shouldn't sit on the 18s deadline waiting for stragglers
+                // that already finished. Mirrors TorrentDownloader.collectPeers.
+                if peers.count >= Self.enoughPeersToStart || reported >= realSources { break }
             }
             group.cancelAll()
         }
