@@ -68,6 +68,26 @@ Scripts/package_app.sh
 
 The packaged app is written to `.build/output/Release/Swiftorrent.app` and copied to `~/Applications/Swiftorrent.app`.
 
+### Opening the app on another Mac
+
+`package_app.sh` **ad-hoc signs** the bundle, which is enough to run on the machine
+that built it but not to pass Gatekeeper on someone else's Mac. When you copy the
+`.app` to another Mac it will be quarantined, so the first launch needs one of:
+
+- **Right-click the app → Open**, then confirm in the dialog (only needed once), or
+- strip the quarantine attribute from a terminal:
+
+  ```sh
+  xattr -dr com.apple.quarantine /path/to/Swiftorrent.app
+  ```
+
+This is normal for unsigned indie Mac apps — the app is fully functional, it just
+isn't notarized. To make it launch with **no** prompt on any Mac, the bundle must
+be signed with an Apple **Developer ID** certificate and notarized (requires a
+paid Apple Developer account). That step can be added to the current
+Swift Package build from the command line (`codesign` + `xcrun notarytool` +
+`stapler`) — it does **not** require migrating to an Xcode project.
+
 ### Live download smoke test
 
 `big-buck-bunny.torrent` in the repository root is a well-seeded public-domain
