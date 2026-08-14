@@ -83,6 +83,9 @@ public final class TorrentSession {
             // verifies), so the readout tracks the true rate instead of swinging
             // between a near-zero dip and a one-piece spike.
             var samples: [(time: ContinuousClock.Instant, bytes: Int64)] = []
+            // Per-torrent trailing windows, keyed by item id, feeding the per-row
+            // rate with the same smoothing as the combined figure.
+            var itemWindows: [TorrentItem.ID: [(time: ContinuousClock.Instant, bytes: Int64)]] = [:]
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
@@ -96,6 +99,7 @@ public final class TorrentSession {
                 let seconds = Double(span.components.seconds) + Double(span.components.attoseconds) / 1e18
                 let delta = max(0, current - oldest.bytes)
                 self.downloadSpeed = seconds > 0 ? Int64(Double(delta) / seconds) : 0
+                self.updatePerItemSpeeds(now: now, windows: &itemWindows)
                 // Checkpoint progress to disk every ~10s so a crash mid-download
                 // loses at most a few seconds of progress (resume re-verifies the
                 // actual on-disk bytes regardless).
@@ -106,6 +110,35 @@ public final class TorrentSession {
                 }
             }
         }
+    }
+
+    /// Updates each active torrent's per-row rate using the same trailing window
+    /// as the combined figure. Torrents that aren't downloading report 0 and drop
+    /// their history so a paused or finished row never shows a stale rate.
+    private func updatePerItemSpeeds(
+        now: ContinuousClock.Instant,
+        windows: inout [TorrentItem.ID: [(time: ContinuousClock.Instant, bytes: Int64)]]
+    ) {
+        var live = Set<TorrentItem.ID>()
+        for index in items.indices {
+            guard items[index].state == .downloading else {
+                if items[index].downloadSpeed != 0 { items[index].downloadSpeed = 0 }
+                continue
+            }
+            let id = items[index].id
+            live.insert(id)
+            var window = windows[id] ?? []
+            window.append((now, items[index].downloadedBytes))
+            if window.count > 4 { window.removeFirst() }
+            windows[id] = window
+            let oldest = window[0]
+            let span = oldest.time.duration(to: now)
+            let seconds = Double(span.components.seconds) + Double(span.components.attoseconds) / 1e18
+            let delta = max(0, items[index].downloadedBytes - oldest.bytes)
+            items[index].downloadSpeed = seconds > 0 ? Int64(Double(delta) / seconds) : 0
+        }
+        // Forget windows for rows that vanished or stopped downloading.
+        windows = windows.filter { live.contains($0.key) }
     }
 
     public func chooseDestination(_ url: URL) {
@@ -659,6 +692,10 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
     public var progress: Double
     public var status: String
     public var state: State
+    /// Live download rate for this torrent in bytes per second. Transient
+    /// (sampled once a second by the session, never persisted); it is 0 unless
+    /// the torrent is actively downloading.
+    public var downloadSpeed: Int64 = 0
 
     public init(name: String, source: Source, destination: URL, totalBytes: Int64) {
         self.id = UUID()
@@ -685,6 +722,11 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
 
     public var downloadedDescription: String {
         ByteCountFormatter.string(fromByteCount: downloadedBytes, countStyle: .file)
+    }
+
+    /// This torrent's live download rate formatted for display, e.g. "1.2 MB/s".
+    public var speedDescription: String {
+        ByteCountFormatter.string(fromByteCount: downloadSpeed, countStyle: .file) + "/s"
     }
 
     public var totalDescription: String {

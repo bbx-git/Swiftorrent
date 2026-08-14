@@ -17,10 +17,13 @@ public struct TorrentDownloader: Sendable {
     /// then kept topped up by inbound PEX and the supervisor's periodic re-announce,
     /// so this only caps the *initial* set, not the total peers ever tried.
     private let maxSwarmReservePeers = 300
-    /// Concurrent peer connections. A download-only client is kept choked by most
-    /// peers (tit-for-tat), so aggregate throughput tracks how many *unchoking*
-    /// seeds we hold at once — hence a fairly wide pool rather than the classic 4–5.
-    private let maxPeerConnections = 16
+    /// Concurrent peer connections — a large pool like a mainstream client (qBittorrent
+    /// defaults to ~100 per torrent). A download-only client is kept choked by most
+    /// peers (no tit-for-tat credit), so aggregate throughput tracks how many
+    /// *unchoking* seeds we hold at once; holding many connections open (they persist
+    /// through chokes, see `PeerWireClient.idleTimeoutSeconds`) maximises the chance
+    /// that enough of them are seeds actively feeding us.
+    private let maxPeerConnections = 100
     /// Start the swarm as soon as discovery has this many peers instead of waiting
     /// for every tracker and the DHT to finish, so the first byte isn't gated on
     /// the slowest source.

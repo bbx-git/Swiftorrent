@@ -12,7 +12,12 @@ actor PieceDownloadCoordinator {
     /// keeps refining as peers join and leave.
     private var availabilityCounts: [Int: Int]
     private var pendingPieces: Set<Int>
-    private var activePieces = Set<Int>()
+    /// In-flight pieces mapped to the number of peers currently downloading each.
+    /// Normally 1, but **endgame** hands the same piece to several peers at once
+    /// (so the last pieces aren't gated by one slow peer), so this is a count, not a
+    /// set: a piece stays in flight until its *last* holder returns it, and only its
+    /// first completion is counted.
+    private var assignments: [Int: Int] = [:]
     private var completedPieces: Set<Int>
     private var completedBytes: Int64
     private var perFileBytes: [Int64]
@@ -49,7 +54,7 @@ actor PieceDownloadCoordinator {
     }
 
     var isComplete: Bool {
-        pendingPieces.isEmpty && activePieces.isEmpty
+        pendingPieces.isEmpty && assignments.isEmpty
     }
 
     /// Folds a newly connected peer's available pieces into the rarest-first
@@ -61,25 +66,51 @@ actor PieceDownloadCoordinator {
         }
     }
 
-    func nextPiece(availablePieces: Set<Int>) -> Int? {
+    /// Hands out the next piece for a peer to download. `excluding` is the set the
+    /// peer is already assembling, so endgame never hands a peer a piece it holds.
+    ///
+    /// Normal path: the rarest still-*unassigned* piece the peer can serve. Endgame
+    /// (no unassigned piece remains anywhere): a duplicate of the least-duplicated
+    /// in-flight piece the peer can serve, so several peers race the final pieces and
+    /// the tail isn't held hostage by one slow seed.
+    func nextPiece(availablePieces: Set<Int>, excluding: Set<Int> = []) -> Int? {
         let candidates = pendingPieces.intersection(availablePieces)
-        guard let piece = candidates.min(by: { left, right in
+        if let piece = candidates.min(by: { left, right in
             let leftCount = availabilityCounts[left, default: Int.max]
             let rightCount = availabilityCounts[right, default: Int.max]
+            if leftCount == rightCount { return left < right }
+            return leftCount < rightCount
+        }) {
+            pendingPieces.remove(piece)
+            assignments[piece, default: 0] += 1
+            return piece
+        }
+
+        // Endgame: every remaining piece is already in flight. Duplicate the
+        // least-duplicated one this peer can serve and isn't already working on.
+        guard pendingPieces.isEmpty else { return nil }
+        let endgame = assignments.keys.filter { availablePieces.contains($0) && !excluding.contains($0) }
+        guard let piece = endgame.min(by: { left, right in
+            let leftCount = assignments[left, default: 0]
+            let rightCount = assignments[right, default: 0]
             if leftCount == rightCount { return left < right }
             return leftCount < rightCount
         }) else {
             return nil
         }
-        pendingPieces.remove(piece)
-        activePieces.insert(piece)
+        assignments[piece, default: 0] += 1
         return piece
     }
 
     func complete(pieceIndex: Int) -> (downloadedBytes: Int64, perFileBytes: [Int64]) {
-        guard activePieces.remove(pieceIndex) != nil, !completedPieces.contains(pieceIndex) else {
+        // Guard on completion, not membership: with endgame duplicates a second peer
+        // may report the same piece, and it may even have been requeued meanwhile.
+        // The first completion counts; the rest are harmless no-ops.
+        guard !completedPieces.contains(pieceIndex) else {
             return (downloadedBytes, perFileBytes)
         }
+        assignments[pieceIndex] = nil
+        pendingPieces.remove(pieceIndex)
         completedPieces.insert(pieceIndex)
         completedBytes += Int64(layout.length(ofPiece: pieceIndex))
         // Fold just this piece's slices into the running per-file tally instead
@@ -91,9 +122,16 @@ actor PieceDownloadCoordinator {
     }
 
     func returnPiece(_ pieceIndex: Int) {
-        guard activePieces.remove(pieceIndex) != nil, !completedPieces.contains(pieceIndex) else {
+        guard !completedPieces.contains(pieceIndex), let count = assignments[pieceIndex] else {
             return
         }
-        pendingPieces.insert(pieceIndex)
+        if count <= 1 {
+            // The last holder gave up: requeue the piece so another peer can fetch it.
+            assignments[pieceIndex] = nil
+            pendingPieces.insert(pieceIndex)
+        } else {
+            // Other peers (endgame duplicates) are still on it; just drop this holder.
+            assignments[pieceIndex] = count - 1
+        }
     }
 }

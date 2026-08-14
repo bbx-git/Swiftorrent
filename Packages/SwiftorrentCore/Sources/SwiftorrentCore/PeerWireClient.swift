@@ -43,13 +43,28 @@ public actor PeerWireClient {
     /// Cap on peers retained from inbound PEX, so a hostile peer flooding `added`
     /// lists cannot grow this set without bound.
     static let maxDiscoveredPeers = 500
-    /// How many 16 KB block requests to keep outstanding per piece at once.
-    /// BitTorrent throughput is RTT-bound: requesting one block, waiting a full
-    /// round-trip for it, then requesting the next caps a peer at ~one block per
-    /// RTT (≈100–300 KB/s on a typical link) regardless of its real bandwidth.
-    /// Keeping a deep window of requests in flight lets a fast peer stream at line
-    /// rate. 16 blocks = 256 KB in flight, the common client default.
-    static let maxPipelinedBlocks = 16
+    /// Floor/ceiling on the in-flight block-request window, which `downloadPieces`
+    /// sizes **adaptively** per peer (like libtorrent): the target is roughly
+    /// `requestQueueTargetSeconds` of the peer's *measured* rate, so a slow peer keeps
+    /// a shallow queue (little wasted memory across a large pool) while a fast seed
+    /// gets a deep one that covers its bandwidth × RTT. The window spans piece
+    /// boundaries, so it never drains between pieces. 256 blocks = 4 MB caps a very
+    /// fast peer; 16 is the warm-up floor before any rate is known.
+    static let minPipelinedBlocks = 16
+    static let maxPipelinedBlocks = 256
+    /// How many seconds of the peer's measured throughput to keep queued as requests.
+    static let requestQueueTargetSeconds: Double = 2
+    /// Snub timeout: once we are unchoked with requests outstanding, a peer that
+    /// sends no data for this long is snubbing us — drop it and let the worker draw
+    /// a fresh peer. This is BitTorrent's real "not delivering" signal (no *data*),
+    /// not "still choked".
+    public static let snubTimeoutSeconds: TimeInterval = 30
+    /// Idle timeout: while choked (or otherwise not actively receiving), we keep the
+    /// connection open — like a mainstream client's large peer pool — waiting for the
+    /// peer to unchoke us, and only drop it after this long of total silence. Chosen
+    /// under the ~2-minute peer keep-alive interval so a still-alive peer that
+    /// keep-alives is retained while a truly dead socket is reaped.
+    public static let idleTimeoutSeconds: TimeInterval = 90
 
     /// How `connect()` negotiates the transport.
     public enum EncryptionPolicy: Sendable {
@@ -80,6 +95,12 @@ public actor PeerWireClient {
     /// silent mid-message is torn down within this window instead of parking a
     /// download slot forever.
     private let ioTimeout: TimeInterval
+    /// Peer-pool retention timeouts used by `downloadPieces`: `snubTimeout` drops an
+    /// unchoked peer that stops delivering data; `idleTimeout` drops a choked/idle
+    /// peer only after long silence (otherwise the connection is kept, waiting for an
+    /// unchoke). Instance-settable so tests can drive them deterministically.
+    private let snubTimeout: TimeInterval
+    private let idleTimeout: TimeInterval
     private let encryptionPolicy: EncryptionPolicy
     private var connection: NWConnection?
     /// Once the MSE handshake selects RC4, `sendCipher` encrypts our outgoing
@@ -115,6 +136,8 @@ public actor PeerWireClient {
         peerID: Data,
         connectTimeout: TimeInterval = 10,
         ioTimeout: TimeInterval = 30,
+        snubTimeout: TimeInterval = PeerWireClient.snubTimeoutSeconds,
+        idleTimeout: TimeInterval = PeerWireClient.idleTimeoutSeconds,
         encryptionPolicy: EncryptionPolicy = .preferEncrypted
     ) {
         self.endpoint = endpoint
@@ -122,6 +145,8 @@ public actor PeerWireClient {
         self.peerID = peerID
         self.connectTimeout = connectTimeout
         self.ioTimeout = ioTimeout
+        self.snubTimeout = snubTimeout
+        self.idleTimeout = idleTimeout
         self.encryptionPolicy = encryptionPolicy
     }
 
@@ -246,7 +271,7 @@ public actor PeerWireClient {
 
         // Step 2 — B→A: DH public key Yb (first 96 bytes). PadB follows and is
         // skipped during the VC resync below.
-        let yb = try await rawReceive(MSE.keyLength)
+        let yb = try await rawReceive(MSE.keyLength, timeout: ioTimeout)
 
         // Step 3 — derive the shared secret and directional RC4 ciphers, then send
         // HASH('req1',S) · HASH('req2',SKEY)⊕HASH('req3',S) · ENCRYPT(payload).
@@ -295,19 +320,19 @@ public actor PeerWireClient {
                     throw PeerWireError.invalidHandshake
                 }
                 searchFrom = max(0, inputBuffer.count - encVC.count + 1)
-                try await fillInputBuffer()
+                try await fillInputBuffer(timeout: ioTimeout)
             }
         }
         // Drop PadB + VC; advance the real cipher past the 8 VC bytes it encrypted.
         inputBuffer.removeFirst(vcEnd!)
         _ = inCipher.process(Data(count: 8))
 
-        let select = inCipher.process(try await rawReceive(4))
-        let padDLenBytes = inCipher.process(try await rawReceive(2))
+        let select = inCipher.process(try await rawReceive(4, timeout: ioTimeout))
+        let padDLenBytes = inCipher.process(try await rawReceive(2, timeout: ioTimeout))
         let padDLen = Int(padDLenBytes[0]) << 8 | Int(padDLenBytes[1])
         if padDLen > 0 {
             guard padDLen <= 1024 else { throw PeerWireError.invalidHandshake }
-            _ = inCipher.process(try await rawReceive(padDLen))
+            _ = inCipher.process(try await rawReceive(padDLen, timeout: ioTimeout))
         }
         return UInt32(select[0]) << 24 | UInt32(select[1]) << 16 | UInt32(select[2]) << 8 | UInt32(select[3])
     }
@@ -389,88 +414,176 @@ public actor PeerWireClient {
         return Data(metadata.prefix(metadataSize))
     }
 
-    /// Downloads a piece using a **pipelined** window of block requests: up to
-    /// `maxPipelinedBlocks` requests are kept outstanding at once instead of the
-    /// request→wait→request-next round-trip per block, which is what lifts a peer
-    /// from ~one-block-per-RTT (≈100–300 KB/s) to its real line rate. Blocks may
-    /// arrive out of order and are placed by their `begin` offset. On a choke the
-    /// peer discards our outstanding requests, so the still-missing blocks are
-    /// requeued and re-requested once it unchokes. `onBlock` is awaited per block
-    /// with its byte count so the caller can pace the shared rate limiter at block
-    /// granularity and report live speed as bytes land.
-    public func downloadPiece(index: Int, length: Int, expectedHash: Data, blockSize: Int = 16 * 1024, onBlock: (@Sendable (Int) async -> Void)? = nil) async throws -> Data {
-        try Task.checkCancellation()
-        var piece = Data(count: length)
+    /// Downloads a continuous stream of pieces from this peer over a **cross-piece**
+    /// request pipeline, the way a mainstream client (libtorrent/qBittorrent) drives a
+    /// peer connection. Key behaviours:
+    ///
+    /// - **Cross-piece pipelining.** A window of block requests is kept outstanding
+    ///   at all times, spanning piece boundaries — the moment a piece's last block is
+    ///   requested the pipeline claims the next piece and keeps filling, so the peer's
+    ///   send queue never drains between pieces (the inter-piece bubble that pins a
+    ///   fast seed below its line rate).
+    /// - **Adaptive window.** The window is sized to ~`requestQueueTargetSeconds` of
+    ///   the peer's *measured* rate, clamped to `[minPipelinedBlocks, maxPipelinedBlocks]`,
+    ///   so a slow peer keeps a shallow queue and a fast seed a deep one.
+    /// - **Hold through chokes.** A choke is normal, not a reason to disconnect. On a
+    ///   choke we requeue the discarded requests and keep the connection open, waiting
+    ///   for the peer to unchoke us again — the connection is dropped only on *silence*
+    ///   (`idleTimeout`), so a still-alive peer that may unchoke us later is retained
+    ///   like an entry in a mainstream client's large peer pool.
+    /// - **Snubbing.** Once unchoked with requests outstanding, a peer that stops
+    ///   sending data for `snubTimeout` is snubbing us; we drop it (via a read timeout)
+    ///   so the worker can draw a fresher peer. That is BitTorrent's true "not
+    ///   delivering" signal — no *data* — rather than merely "still choked".
+    ///
+    /// Pieces are claimed lazily via `claimNextPiece`, assembled out of order,
+    /// SHA-1-verified on completion, and handed to `onPieceComplete` (write +
+    /// accounting). Every claimed-but-unfinished piece is handed back via
+    /// `onReturnPiece` on any early exit so the coordinator can requeue it.
+    ///
+    /// - `claimNextPiece` receives this peer's live availability (whether it was
+    ///   declared, and the pieces this peer is already assembling so endgame never
+    ///   re-hands one) and returns the next piece to fetch, or nil when the peer has
+    ///   nothing more we need — at which point the session ends cleanly.
+    /// - `onBlock` is awaited per block with its byte count (rate-limit pacing +
+    ///   live-speed accounting); `onPeersDiscovered` folds inbound PEX gossip.
+    public func downloadPieces(
+        blockSize: Int = 16 * 1024,
+        pieceLength: @Sendable (Int) -> Int,
+        expectedHash: @Sendable (Int) -> Data,
+        claimNextPiece: @Sendable (_ available: Set<Int>, _ isKnown: Bool, _ held: Set<Int>) async -> Int?,
+        onPieceComplete: @Sendable (Int, Data) async throws -> Void,
+        onReturnPiece: @Sendable (Int) async -> Void,
+        onBlock: (@Sendable (Int) async -> Void)? = nil,
+        onPeersDiscovered: (@Sendable ([PeerEndpoint]) async -> Void)? = nil
+    ) async throws {
+        var active: [Int: PieceAssembly] = [:]           // claimed, still assembling
+        var requestQueue: [(piece: Int, begin: Int, length: Int)] = []   // not yet requested
+        var outstanding = Set<BlockKey>()                // requested, awaiting data
+        var noMorePieces = false
 
-        // Fixed set of block offsets making up this piece.
-        var blockBegins: [Int] = []
-        var offset = 0
-        while offset < length {
-            blockBegins.append(offset)
-            offset += blockSize
+        // Adaptive request window: recomputed ~once a second from the peer's measured
+        // rate so the in-flight depth tracks its bandwidth. Starts at the floor and
+        // grows as data flows.
+        let clock = ContinuousClock()
+        var windowCap = Self.minPipelinedBlocks
+        var rateWindowStart = clock.now
+        var rateWindowBytes = 0
+
+        func returnAll() async {
+            for index in active.keys { await onReturnPiece(index) }
         }
 
-        var pending = blockBegins       // offsets not yet requested (worklist)
-        var pendingCursor = 0
-        var outstanding = Set<Int>()    // requested, awaiting their data
-        var received = Set<Int>()       // already placed into `piece`
+        do {
+            while true {
+                try Task.checkCancellation()
 
-        while received.count < blockBegins.count {
-            try Task.checkCancellation()
-
-            // Refill the pipeline while unchoked. Offsets already received (possible
-            // after a requeue on choke) are skipped rather than re-requested.
-            while !isChoked, outstanding.count < Self.maxPipelinedBlocks, pendingCursor < pending.count {
-                let blockBegin = pending[pendingCursor]
-                pendingCursor += 1
-                if received.contains(blockBegin) { continue }
-                let blockLength = min(blockSize, length - blockBegin)
-                var payload = Data()
-                payload.appendUInt32(UInt32(index))
-                payload.appendUInt32(UInt32(blockBegin))
-                payload.appendUInt32(UInt32(blockLength))
-                try await sendMessage(id: 6, payload: payload)
-                outstanding.insert(blockBegin)
-            }
-
-            let message = try await readMessage()
-            switch message.id {
-            case 0:
-                // Choke: the peer drops every request we had in flight. Requeue the
-                // blocks we still need so they are re-requested after the unchoke.
-                isChoked = true
-                pending = blockBegins.filter { !received.contains($0) }
-                pendingCursor = 0
-                outstanding.removeAll()
-            case 1:
-                isChoked = false
-            case 4, 5:
-                handlePeerStateMessage(message)
-            case 7:
-                guard message.payload.count >= 8 else { throw PeerWireError.unexpectedMessage }
-                let pieceIndex = Int(message.payload.readUInt32(at: 0))
-                guard pieceIndex == index else { continue }
-                let blockBegin = Int(message.payload.readUInt32(at: 4))
-                let data = Data(message.payload.dropFirst(8))
-                guard blockBegin >= 0, blockBegin + data.count <= piece.count else {
-                    throw PeerWireError.unexpectedMessage
+                // Resize the request window from the rate measured over the last ~1 s.
+                let sinceRateSample = rateWindowStart.duration(to: clock.now)
+                let rateSeconds = Double(sinceRateSample.components.seconds) + Double(sinceRateSample.components.attoseconds) / 1e18
+                if rateSeconds >= 1 {
+                    let bytesPerSecond = Double(rateWindowBytes) / rateSeconds
+                    let target = Int(bytesPerSecond * Self.requestQueueTargetSeconds / Double(blockSize))
+                    windowCap = min(Self.maxPipelinedBlocks, max(Self.minPipelinedBlocks, target))
+                    rateWindowStart = clock.now
+                    rateWindowBytes = 0
                 }
-                if received.insert(blockBegin).inserted {
-                    piece.replaceSubrange(blockBegin..<(blockBegin + data.count), with: data)
-                    outstanding.remove(blockBegin)
-                    await onBlock?(data.count)
-                }
-            case 20:
-                handleExtendedMessage(message.payload)
-            default:
-                continue
-            }
-        }
 
-        guard Data(Insecure.SHA1.hash(data: piece)) == expectedHash else {
-            throw PeerWireError.invalidPieceHash
+                // Fill the pipeline while unchoked: claim fresh pieces as the queue
+                // drains and send block requests until the (adaptive) window is full
+                // or the peer has nothing left we need.
+                while !isChoked, outstanding.count < windowCap {
+                    if requestQueue.isEmpty {
+                        if noMorePieces { break }
+                        // Fold peers this connection gossiped before claiming more work.
+                        if let onPeersDiscovered {
+                            let gossiped = takeDiscoveredPeers()
+                            if !gossiped.isEmpty { await onPeersDiscovered(gossiped) }
+                        }
+                        guard let index = await claimNextPiece(availablePieces, availabilityIsKnown, Set(active.keys)) else {
+                            noMorePieces = true
+                            break
+                        }
+                        let length = pieceLength(index)
+                        var begins: [Int] = []
+                        var offset = 0
+                        while offset < length { begins.append(offset); offset += blockSize }
+                        active[index] = PieceAssembly(length: length, blockBegins: begins, hash: expectedHash(index))
+                        for begin in begins {
+                            requestQueue.append((index, begin, min(blockSize, length - begin)))
+                        }
+                    }
+                    guard !requestQueue.isEmpty else { break }
+                    let request = requestQueue.removeFirst()
+                    var payload = Data()
+                    payload.appendUInt32(UInt32(request.piece))
+                    payload.appendUInt32(UInt32(request.begin))
+                    payload.appendUInt32(UInt32(request.length))
+                    try await sendMessage(id: 6, payload: payload)
+                    outstanding.insert(BlockKey(piece: request.piece, begin: request.begin))
+                }
+
+                // Everything claimed has been assembled and the peer has nothing more
+                // we need: a clean end (the worker draws its next peer).
+                if active.isEmpty && noMorePieces { return }
+
+                // Read the next message. With requests outstanding we expect data, so a
+                // short `snubTimeout` reaps a peer that stalls; otherwise (choked/idle)
+                // we wait the longer `idleTimeout`, keeping the connection open for a
+                // possible unchoke rather than dropping it. A fired timeout throws
+                // `.timedOut`, which the outer catch turns into a peer replacement.
+                let readTimeout = outstanding.isEmpty ? idleTimeout : snubTimeout
+                let message = try await readMessage(timeout: readTimeout)
+
+                switch message.id {
+                case 0:
+                    // Choke: the peer drops every request in flight. Requeue the
+                    // still-missing blocks (front of the queue) to re-send on unchoke.
+                    isChoked = true
+                    for key in outstanding {
+                        guard let asm = active[key.piece] else { continue }
+                        requestQueue.insert((key.piece, key.begin, min(blockSize, asm.length - key.begin)), at: 0)
+                    }
+                    outstanding.removeAll()
+                case 1:
+                    isChoked = false
+                case 4, 5:
+                    handlePeerStateMessage(message)
+                case 7:
+                    guard message.payload.count >= 8 else { throw PeerWireError.unexpectedMessage }
+                    let pieceIndex = Int(message.payload.readUInt32(at: 0))
+                    let begin = Int(message.payload.readUInt32(at: 4))
+                    let data = Data(message.payload.dropFirst(8))
+                    outstanding.remove(BlockKey(piece: pieceIndex, begin: begin))
+                    guard let asm = active[pieceIndex] else { continue }   // stale/unwanted
+                    guard begin >= 0, begin + data.count <= asm.length else {
+                        throw PeerWireError.unexpectedMessage
+                    }
+                    if asm.received.insert(begin).inserted {
+                        asm.data.replaceSubrange(begin..<(begin + data.count), with: data)
+                        rateWindowBytes += data.count
+                        await onBlock?(data.count)
+                        if asm.received.count == asm.blockBegins.count {
+                            active.removeValue(forKey: pieceIndex)
+                            guard Data(Insecure.SHA1.hash(data: asm.data)) == asm.hash else {
+                                await onReturnPiece(pieceIndex)
+                                throw PeerWireError.invalidPieceHash
+                            }
+                            try await onPieceComplete(pieceIndex, asm.data)
+                        }
+                    }
+                case 20:
+                    handleExtendedMessage(message.payload)
+                default:
+                    continue
+                }
+            }
+        } catch {
+            // Any early exit (choke-out, disconnect, cancellation, bad piece): hand
+            // every still-unfinished piece back so another peer retries it.
+            await returnAll()
+            throw error
         }
-        return piece
     }
 
     public func close() {
@@ -622,13 +735,16 @@ public actor PeerWireClient {
         return TrackerClient.parseCompactPeers(added)
     }
 
-    private func readMessage() async throws -> (id: UInt8, payload: Data) {
+    /// Reads one wire message. `timeout` bounds each underlying socket read; it
+    /// defaults to `ioTimeout` (handshake/setup) but `downloadPieces` passes a longer
+    /// idle window so a choked-but-alive peer is kept rather than reaped every 30 s.
+    private func readMessage(timeout: TimeInterval? = nil) async throws -> (id: UInt8, payload: Data) {
         while true {
-            let lengthData = try await receiveExactly(4)
+            let lengthData = try await receiveExactly(4, timeout: timeout)
             let length = Int(lengthData.readUInt32(at: 0))
             if length == 0 { continue }
             guard length <= Self.maxMessageLength else { throw PeerWireError.unexpectedMessage }
-            let body = try await receiveExactly(length)
+            let body = try await receiveExactly(length, timeout: timeout)
             guard let id = body.first else { throw PeerWireError.unexpectedMessage }
             return (id, Data(body.dropFirst()))
         }
@@ -682,8 +798,8 @@ public actor PeerWireClient {
     /// Reads exactly `count` bytes, decrypting through `recvCipher` when the MSE
     /// handshake selected RC4 (raw bytes otherwise). Drains the input buffer first
     /// so bytes over-read during the MSE resync are consumed in order.
-    private func receiveExactly(_ count: Int) async throws -> Data {
-        let raw = try await rawReceive(count)
+    private func receiveExactly(_ count: Int, timeout: TimeInterval? = nil) async throws -> Data {
+        let raw = try await rawReceive(count, timeout: timeout ?? ioTimeout)
         guard var cipher = recvCipher else { return raw }
         let plain = cipher.process(raw)
         recvCipher = cipher
@@ -692,9 +808,9 @@ public actor PeerWireClient {
 
     /// Removes and returns exactly `count` raw (undecrypted) bytes from the input
     /// buffer, reading from the socket as needed.
-    private func rawReceive(_ count: Int) async throws -> Data {
+    private func rawReceive(_ count: Int, timeout: TimeInterval) async throws -> Data {
         while inputBuffer.count < count {
-            try await fillInputBuffer()
+            try await fillInputBuffer(timeout: timeout)
         }
         let head = Data(inputBuffer[0..<count])
         inputBuffer.removeFirst(count)
@@ -702,10 +818,10 @@ public actor PeerWireClient {
     }
 
     /// Appends one socket read to the raw input buffer.
-    private func fillInputBuffer() async throws {
+    private func fillInputBuffer(timeout: TimeInterval) async throws {
         try Task.checkCancellation()
         guard let connection else { throw PeerWireError.disconnected }
-        let chunk = try await withTimeout(ioTimeout) {
+        let chunk = try await withTimeout(timeout) {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
                     connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
@@ -746,6 +862,33 @@ public actor PeerWireClient {
             return result
         }
     }
+}
+
+/// A piece being assembled block-by-block inside a peer session. A reference type
+/// so the pipeline mutates its buffer in place — copying a 256 KB `Data` value on
+/// every one of the ~16 blocks per piece would swamp the transfer. Lives only in
+/// `PeerWireClient`'s actor-isolated state, so it never crosses a concurrency
+/// boundary and needs no `Sendable` conformance.
+private final class PieceAssembly {
+    var data: Data
+    var received = Set<Int>()
+    let blockBegins: [Int]
+    let length: Int
+    let hash: Data
+
+    init(length: Int, blockBegins: [Int], hash: Data) {
+        self.data = Data(count: length)
+        self.blockBegins = blockBegins
+        self.length = length
+        self.hash = hash
+    }
+}
+
+/// Identifies one outstanding block request by its piece and offset, so a block
+/// can be matched back to its request across piece boundaries in the pipeline.
+private struct BlockKey: Hashable {
+    let piece: Int
+    let begin: Int
 }
 
 extension Data {

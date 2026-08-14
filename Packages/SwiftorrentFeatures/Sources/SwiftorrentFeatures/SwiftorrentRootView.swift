@@ -301,8 +301,13 @@ private struct TorrentRow: View {
                         .progressViewStyle(.linear)
                         .tint(.swiftorrentProgress)
 
-                    HStack {
+                    HStack(spacing: 6) {
                         Text(item.status)
+                        if item.state == .downloading, item.downloadSpeed > 0 {
+                            Label(item.speedDescription, systemImage: "arrow.down")
+                                .labelStyle(.titleAndIcon)
+                                .foregroundStyle(Color.swiftorrentGreen)
+                        }
                         Spacer()
                         Text("\(item.downloadedDescription) / \(item.totalDescription)")
                     }

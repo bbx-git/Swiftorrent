@@ -213,9 +213,13 @@ struct PeerSwarmDownloader: Sendable {
         await supply.finish()
     }
 
-    /// Pulls the rarest needed piece this peer can serve, downloads and verifies it,
-    /// and writes it — looping until the peer fails, the coordinator finishes, or the
-    /// peer has no more useful pieces. The worker replaces the peer on `.peerEnded`.
+    /// Drives one peer through the cross-piece pipeline: it keeps claiming the
+    /// rarest needed piece this peer can serve and streaming blocks with an adaptive
+    /// request window, holding the connection through chokes and ending only when the
+    /// peer goes silent (snub/idle timeout), fails, or runs out of useful pieces. The
+    /// worker replaces the peer on `.peerEnded`. All the throughput-critical looping
+    /// now lives in `PeerWireClient.downloadPieces`; this method just wires the
+    /// coordinator, writer, and progress reporting to it.
     private static func drainPeer(
         client: PeerWireClient,
         supply: PeerSupply,
@@ -223,58 +227,57 @@ struct PeerSwarmDownloader: Sendable {
         writer: TorrentPieceWriter,
         context: WorkerContext
     ) async -> DrainOutcome {
-        let metainfo = context.metainfo
         let layout = context.layout
+        let metainfo = context.metainfo
         let downloadTotal = context.downloadTotal
         let limiter = context.rateLimiter
         let progress = context.progress
+        let mapper = context.mapper
+        let active = context.active
+        let selectablePieces = context.selectablePieces
 
-        while true {
-            try? Task.checkCancellation()
-            guard !Task.isCancelled else { return .cancelled }
-            // Fold any peers this connection gossiped via PEX into the shared reserve
-            // so workers replacing dead peers can draw them.
-            await supply.add(client.takeDiscoveredPeers())
-            // Pull live availability each pass so `have`/`bitfield` messages received
-            // mid-download refine the set. When the peer never declared availability
-            // (unchoked first), fall back optimistically to all selectable pieces;
-            // this self-corrects as soon as the peer announces anything.
-            let (livePieces, isKnown) = await client.currentAvailability()
-            let usablePieces = isKnown ? livePieces : context.selectablePieces
-            guard let pieceIndex = await coordinator.nextPiece(availablePieces: usablePieces) else {
-                // No more pieces this peer can serve: either we are done, or other
-                // peers hold what is left and this worker should fetch a new peer.
-                return await coordinator.isComplete ? .completed : .peerEnded(nil)
-            }
-
-            do {
-                let length = layout.length(ofPiece: pieceIndex)
-                let piece = try await withTimeout(seconds: .seconds(60)) {
-                    try await client.downloadPiece(index: pieceIndex, length: length, expectedHash: metainfo.pieceHashes[pieceIndex]) { blockBytes in
-                        // Pace at block granularity so the shared cap holds smoothly
-                        // instead of a whole piece arriving full-speed then sleeping.
-                        await limiter?.consume(blockBytes)
-                        // Refresh the status/verified total on a throttle so the row
-                        // stays lively while a large piece is in flight.
-                        if let verified = await coordinator.progressTick() {
-                            await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: await context.active.count), downloadedBytes: verified, totalBytes: downloadTotal))
-                        }
+        do {
+            try await client.downloadPieces(
+                pieceLength: { layout.length(ofPiece: $0) },
+                expectedHash: { metainfo.pieceHashes[$0] },
+                claimNextPiece: { livePieces, isKnown, held in
+                    // When the peer never declared availability (unchoked first), fall
+                    // back optimistically to all selectable pieces; this self-corrects
+                    // as soon as it announces anything.
+                    let usable = isKnown ? livePieces : selectablePieces
+                    return await coordinator.nextPiece(availablePieces: usable, excluding: held)
+                },
+                onPieceComplete: { pieceIndex, piece in
+                    try await writer.write(piece: piece, pieceIndex: pieceIndex)
+                    let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
+                    await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: await active.count), downloadedBytes: downloaded, totalBytes: downloadTotal, files: mapper.snapshot(perFileBytes: perFileBytes)))
+                },
+                onReturnPiece: { pieceIndex in
+                    await coordinator.returnPiece(pieceIndex)
+                },
+                onBlock: { blockBytes in
+                    // Pace at block granularity so the shared cap holds smoothly, and
+                    // refresh the verified total on a throttle so the row stays lively.
+                    await limiter?.consume(blockBytes)
+                    if let verified = await coordinator.progressTick() {
+                        await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: await active.count), downloadedBytes: verified, totalBytes: downloadTotal))
                     }
+                },
+                onPeersDiscovered: { peers in
+                    // Fold peers this connection gossiped via PEX into the shared
+                    // reserve so workers replacing dead peers can draw them.
+                    await supply.add(peers)
                 }
-                try await writer.write(piece: piece, pieceIndex: pieceIndex)
-                let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
-                await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: await context.active.count), downloadedBytes: downloaded, totalBytes: downloadTotal, files: context.mapper.snapshot(perFileBytes: perFileBytes)))
-            } catch is CancellationError {
-                await coordinator.returnPiece(pieceIndex)
-                return .cancelled
-            } catch {
-                // Return the piece so another peer (this worker's replacement or a
-                // concurrent one) retries it, then end this peer. No status update:
-                // one flaky peer among many isn't worth flickering the shared line.
-                await coordinator.returnPiece(pieceIndex)
-                return .peerEnded(error)
-            }
+            )
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            // The peer failed or choked us out; downloadPieces has already handed back
+            // every unfinished piece. No status update: one flaky peer among many
+            // isn't worth flickering the shared line.
+            return .peerEnded(error)
         }
+        return await coordinator.isComplete ? .completed : .peerEnded(nil)
     }
 
     /// The shared, flicker-free download status: reflects how many peers are

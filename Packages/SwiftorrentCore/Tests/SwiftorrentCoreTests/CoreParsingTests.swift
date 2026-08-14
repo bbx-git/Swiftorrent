@@ -511,6 +511,174 @@ struct CoreParsingTests {
         #expect(elapsed < .seconds(2))
     }
 
+    @Test("Peer session streams multiple pieces across the cross-piece pipeline")
+    func downloadPiecesStreamsAcrossBoundaries() async throws {
+        // A loopback seed that declares all pieces, unchokes, and serves every block
+        // it is asked for. Drives the continuous pipeline through three whole pieces
+        // (blocks requested with one deep window spanning piece boundaries) and
+        // asserts each is assembled and SHA-1-verified.
+        let infoHash = Data(repeating: 0x33, count: 20)
+        let pieceLen = 10
+        let pieces: [Data] = (0..<3).map { p in Data((0..<pieceLen).map { UInt8((p * pieceLen + $0) & 0xff) }) }
+        let hashes = pieces.map { Data(Insecure.SHA1.hash(data: $0)) }
+        // bitfield with the high 3 bits set (pieces 0–2), then unchoke.
+        let postHandshake = wireFrame(5, Data([0xE0])) + wireFrame(1)
+        let seed = RespondingSeed(infoHash: infoHash, pieces: pieces, postHandshake: postHandshake, respondToRequests: true)
+
+        let holder = AcceptedConnections()
+        let listener = try NWListener(using: .tcp)
+        listener.newConnectionHandler = { connection in
+            holder.add(connection)
+            seed.handle(connection)
+        }
+        let port = try await startLoopbackListener(listener)
+        defer { listener.cancel(); holder.cancelAll() }
+
+        let client = PeerWireClient(
+            endpoint: PeerEndpoint(host: "127.0.0.1", port: port.rawValue),
+            infoHash: infoHash,
+            peerID: Data(repeating: 1, count: 20),
+            connectTimeout: 2,
+            ioTimeout: 2,
+            encryptionPolicy: .plaintextOnly
+        )
+        try await client.connect()
+        _ = try await client.readInitialAvailability(pieceCount: 3)
+
+        let claimer = SequentialClaimer(total: 3)
+        let sink = PieceSink()
+        try await client.downloadPieces(
+            blockSize: 4,
+            pieceLength: { _ in pieceLen },
+            expectedHash: { hashes[$0] },
+            claimNextPiece: { _, _, _ in await claimer.claim() },
+            onPieceComplete: { index, data in await sink.add(index, data) },
+            onReturnPiece: { _ in }
+        )
+        await client.close()
+
+        let got = await sink.all
+        #expect(got.count == 3)
+        for index in 0..<3 { #expect(got[index] == pieces[index]) }
+    }
+
+    @Test("Peer session holds through a choke, then drops the peer only on idle silence")
+    func downloadPiecesHoldsThroughChokeThenDropsOnIdle() async throws {
+        // A loopback seed that declares piece 0, unchokes (so the pipeline claims and
+        // requests it), then immediately chokes and goes silent, never serving the
+        // block. The session must NOT drop the peer the instant it chokes — it holds
+        // the connection and waits — but once the peer stays silent past the (short,
+        // for the test) idle timeout it reaps the connection and hands the claimed
+        // piece back for another peer to retry.
+        let infoHash = Data(repeating: 0x44, count: 20)
+        let pieces = [Data(repeating: 0, count: 10)]
+        let postHandshake = wireFrame(5, Data([0x80])) + wireFrame(1) + wireFrame(0) // bitfield, unchoke, choke
+        let seed = RespondingSeed(infoHash: infoHash, pieces: pieces, postHandshake: postHandshake, respondToRequests: false)
+
+        let holder = AcceptedConnections()
+        let listener = try NWListener(using: .tcp)
+        listener.newConnectionHandler = { connection in
+            holder.add(connection)
+            seed.handle(connection)
+        }
+        let port = try await startLoopbackListener(listener)
+        defer { listener.cancel(); holder.cancelAll() }
+
+        let client = PeerWireClient(
+            endpoint: PeerEndpoint(host: "127.0.0.1", port: port.rawValue),
+            infoHash: infoHash,
+            peerID: Data(repeating: 1, count: 20),
+            connectTimeout: 2,
+            ioTimeout: 5,
+            snubTimeout: 5,
+            idleTimeout: 0.5,
+            encryptionPolicy: .plaintextOnly
+        )
+        try await client.connect()
+        _ = try await client.readInitialAvailability(pieceCount: 1)
+
+        let claimer = SequentialClaimer(total: 1)
+        let returned = ReturnedPieces()
+        let start = ContinuousClock.now
+        var thrown: Error?
+        do {
+            try await client.downloadPieces(
+                blockSize: 4,
+                pieceLength: { _ in 10 },
+                expectedHash: { _ in Data(repeating: 0, count: 20) },
+                claimNextPiece: { _, _, _ in await claimer.claim() },
+                onPieceComplete: { _, _ in },
+                onReturnPiece: { index in await returned.add(index) }
+            )
+        } catch {
+            thrown = error
+        }
+        let elapsed = ContinuousClock.now - start
+        await client.close()
+
+        if let peerError = thrown as? PeerWireError, case .timedOut = peerError {
+            // Expected.
+        } else {
+            Issue.record("Expected PeerWireError.timedOut, got \(String(describing: thrown))")
+        }
+        // Reaped near the 0.5s idle timeout, well under the 5s I/O timeout.
+        #expect(elapsed < .seconds(3))
+        // The claimed piece was handed back so another peer retries it.
+        #expect(await returned.all == [0])
+    }
+
+    @Test("Peer session rides out a transient choke and completes once re-unchoked")
+    func downloadPiecesRidesOutTransientChoke() async throws {
+        // A loopback seed that declares piece 0 but starts choked (bitfield only, no
+        // unchoke in the greeting), then unchokes after a short delay and serves the
+        // blocks. The session must keep the connection open across the initial choke
+        // — like a mainstream client holding a peer that hasn't unchoked it yet —
+        // rather than bailing, and complete the piece once the unchoke arrives.
+        let infoHash = Data(repeating: 0x55, count: 20)
+        let pieceLen = 10
+        let piece = Data((0..<pieceLen).map { UInt8($0) })
+        let hash = Data(Insecure.SHA1.hash(data: piece))
+        let postHandshake = wireFrame(5, Data([0x80])) // bitfield only — peer stays choked at first
+        let seed = RespondingSeed(infoHash: infoHash, pieces: [piece], postHandshake: postHandshake, respondToRequests: true, unchokeAfter: 0.3)
+
+        let holder = AcceptedConnections()
+        let listener = try NWListener(using: .tcp)
+        listener.newConnectionHandler = { connection in
+            holder.add(connection)
+            seed.handle(connection)
+        }
+        let port = try await startLoopbackListener(listener)
+        defer { listener.cancel(); holder.cancelAll() }
+
+        let client = PeerWireClient(
+            endpoint: PeerEndpoint(host: "127.0.0.1", port: port.rawValue),
+            infoHash: infoHash,
+            peerID: Data(repeating: 1, count: 20),
+            connectTimeout: 2,
+            ioTimeout: 5,
+            snubTimeout: 5,
+            idleTimeout: 3, // comfortably longer than the seed's 0.3s choke, so we hold
+            encryptionPolicy: .plaintextOnly
+        )
+        try await client.connect()
+        _ = try await client.readInitialAvailability(pieceCount: 1)
+
+        let claimer = SequentialClaimer(total: 1)
+        let sink = PieceSink()
+        try await client.downloadPieces(
+            blockSize: 4,
+            pieceLength: { _ in pieceLen },
+            expectedHash: { _ in hash },
+            claimNextPiece: { _, _, _ in await claimer.claim() },
+            onPieceComplete: { index, data in await sink.add(index, data) },
+            onReturnPiece: { _ in }
+        )
+        await client.close()
+
+        // The piece completed despite the peer being choked when we first connected.
+        #expect(await sink.all[0] == piece)
+    }
+
     @Test("Metadata fetch accepts replies tagged with our advertised ut_metadata id")
     func fetchMetadataMatchesLocalExtensionID() async throws {
         // A scripted loopback peer that completes the BEP-9/BEP-10 metadata
@@ -842,6 +1010,40 @@ struct CoreParsingTests {
         #expect(await coordinator.nextPiece(availablePieces: [0, 1]) == 0)
     }
 
+    @Test("Coordinator enters endgame and duplicates in-flight pieces, counting each once")
+    func coordinatorEndgameDuplicatesTail() async {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8), Data("ef".utf8)])
+        let layout = TorrentLayout(metainfo: metainfo)
+        let coordinator = PieceDownloadCoordinator(
+            layout: layout,
+            selectablePieces: [0, 1],
+            completedPieces: [],
+            initialDownloaded: 0,
+            availabilityCounts: [:]
+        )
+        // A slow peer A claims both pieces, so nothing is left unassigned.
+        let a0 = await coordinator.nextPiece(availablePieces: [0, 1])
+        let a1 = await coordinator.nextPiece(availablePieces: [0, 1])
+        #expect(Set([a0, a1]) == Set([0, 1]))
+        // Peer B, holding nothing, must now get an endgame *duplicate* of an in-flight
+        // piece rather than nil — otherwise B would idle while A drips out the tail.
+        let b0 = await coordinator.nextPiece(availablePieces: [0, 1], excluding: [])
+        #expect(b0 != nil)
+        // B is then spread onto the other in-flight piece (least-duplicated first) and
+        // never re-handed the one it already holds.
+        let b1 = await coordinator.nextPiece(availablePieces: [0, 1], excluding: [b0!])
+        #expect(b1 != nil && b1 != b0)
+        // The first completion of a duplicated piece counts once (piece 0 = 4 bytes);
+        // the redundant copy the other peer finishes is a harmless no-op.
+        let (afterFirst, _) = await coordinator.complete(pieceIndex: 0)
+        #expect(afterFirst == 4)
+        let (afterDuplicate, _) = await coordinator.complete(pieceIndex: 0)
+        #expect(afterDuplicate == 4)
+        // Finishing the other piece completes the download; nothing is left in flight.
+        _ = await coordinator.complete(pieceIndex: 1)
+        #expect(await coordinator.isComplete)
+    }
+
     @Test("Peer supply hands out each peer once then drains to nil")
     func peerSupplyDrainsWithoutDuplicates() async {
         let peers = [
@@ -944,6 +1146,147 @@ private struct MockDHTPeerFinder: DHTPeerFinding {
 
     func peers(for infoHash: Data) async throws -> [PeerEndpoint] {
         peers
+    }
+}
+
+/// Big-endian 4-byte encoding of a small non-negative integer, for scripting wire
+/// messages in tests.
+private func be32Data(_ value: Int) -> Data {
+    let v = UInt32(value)
+    return Data([UInt8(v >> 24 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 8 & 0xff), UInt8(v & 0xff)])
+}
+
+/// A length-prefixed BitTorrent wire message: `<len><id><payload>`.
+private func wireFrame(_ id: UInt8, _ payload: Data = Data()) -> Data {
+    be32Data(payload.count + 1) + Data([id]) + payload
+}
+
+/// Starts an `NWListener` and resolves once it is ready, returning its bound port.
+private func startLoopbackListener(_ listener: NWListener) async throws -> NWEndpoint.Port {
+    try await withCheckedThrowingContinuation { continuation in
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                if let port = listener.port {
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(returning: port)
+                }
+            case let .failed(error):
+                listener.stateUpdateHandler = nil
+                continuation.resume(throwing: error)
+            default:
+                break
+            }
+        }
+        listener.start(queue: .global(qos: .utility))
+    }
+}
+
+/// Hands out piece indices 0..<total once each, then nil — a scripted piece picker
+/// for driving `downloadPieces` in tests.
+private actor SequentialClaimer {
+    private var next = 0
+    private let total: Int
+    init(total: Int) { self.total = total }
+    func claim() -> Int? {
+        guard next < total else { return nil }
+        defer { next += 1 }
+        return next
+    }
+}
+
+/// Collects the pieces `downloadPieces` completes, keyed by index.
+private actor PieceSink {
+    private(set) var all: [Int: Data] = [:]
+    func add(_ index: Int, _ data: Data) { all[index] = data }
+}
+
+/// Collects the pieces `downloadPieces` hands back via `onReturnPiece`.
+private actor ReturnedPieces {
+    private(set) var all: [Int] = []
+    func add(_ index: Int) { all.append(index) }
+}
+
+/// A scripted loopback seed. On connect it sends the plaintext BitTorrent handshake
+/// (advertising no extensions, so the client's outbound stream is just interested +
+/// requests) followed by `postHandshake` (a bitfield and whatever choke/unchoke
+/// script the test needs). When `respondToRequests` is set it parses inbound
+/// `request` messages and serves the matching block from `pieces`.
+private final class RespondingSeed: @unchecked Sendable {
+    private let infoHash: Data
+    private let pieces: [Data]
+    private let postHandshake: Data
+    private let respondToRequests: Bool
+    private let unchokeAfter: TimeInterval?
+    private let queue = DispatchQueue(label: "responding-seed")
+
+    init(infoHash: Data, pieces: [Data], postHandshake: Data, respondToRequests: Bool, unchokeAfter: TimeInterval? = nil) {
+        self.infoHash = infoHash
+        self.pieces = pieces
+        self.postHandshake = postHandshake
+        self.respondToRequests = respondToRequests
+        self.unchokeAfter = unchokeAfter
+    }
+
+    /// Per-connection parse state. The first 68 bytes (the client's handshake) are
+    /// skipped; the remainder is length-prefixed messages. Only ever touched on the
+    /// seed's serial `queue`, so unchecked-Sendable is safe.
+    private final class ConnState: @unchecked Sendable {
+        var buffer = [UInt8]()
+        var skip = 68
+    }
+
+    func handle(_ connection: NWConnection) {
+        let state = ConnState()
+        connection.stateUpdateHandler = { [self] update in
+            if case .ready = update {
+                connection.stateUpdateHandler = nil
+                var greeting = Data([19]) + Data("BitTorrent protocol".utf8) + Data(repeating: 0, count: 8) + infoHash + Data(repeating: 9, count: 20)
+                greeting.append(postHandshake)
+                connection.send(content: greeting, completion: .contentProcessed { _ in })
+                if let unchokeAfter {
+                    queue.asyncAfter(deadline: .now() + unchokeAfter) {
+                        connection.send(content: wireFrame(1), completion: .contentProcessed { _ in })
+                    }
+                }
+                receive(connection, state)
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func receive(_ connection: NWConnection, _ state: ConnState) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [self] data, _, isComplete, error in
+            if let data, !data.isEmpty {
+                state.buffer.append(contentsOf: data)
+                drain(connection, state)
+            }
+            if error == nil, !isComplete {
+                receive(connection, state)
+            }
+        }
+    }
+
+    private func drain(_ connection: NWConnection, _ state: ConnState) {
+        if state.skip > 0 {
+            let n = min(state.skip, state.buffer.count)
+            state.buffer.removeFirst(n)
+            state.skip -= n
+        }
+        while state.buffer.count >= 4 {
+            let length = Int(state.buffer[0]) << 24 | Int(state.buffer[1]) << 16 | Int(state.buffer[2]) << 8 | Int(state.buffer[3])
+            guard state.buffer.count >= 4 + length else { break }
+            let body = Array(state.buffer[4..<(4 + length)])
+            state.buffer.removeFirst(4 + length)
+            guard respondToRequests, length >= 13, body.first == 6 else { continue }
+            let index = Int(body[1]) << 24 | Int(body[2]) << 16 | Int(body[3]) << 8 | Int(body[4])
+            let begin = Int(body[5]) << 24 | Int(body[6]) << 16 | Int(body[7]) << 8 | Int(body[8])
+            let blockLength = Int(body[9]) << 24 | Int(body[10]) << 16 | Int(body[11]) << 8 | Int(body[12])
+            guard index < pieces.count, begin >= 0, begin + blockLength <= pieces[index].count else { continue }
+            var payload = be32Data(index) + be32Data(begin)
+            payload.append(pieces[index].subdata(in: begin..<(begin + blockLength)))
+            connection.send(content: wireFrame(7, payload), completion: .contentProcessed { _ in })
+        }
     }
 }
 
