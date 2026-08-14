@@ -84,6 +84,17 @@ struct PeerSwarmDownloader: Sendable {
                 await Self.runSupervisor(supply: supply, coordinator: coordinator, refillPeers: refillPeers)
                 return nil
             }
+            // Completion watcher: end the run within ~1 s of the last piece verifying,
+            // rather than waiting out a worker parked in an idle-timeout read or the
+            // supervisor's re-announce sleep. Returns as soon as the swarm is done so
+            // the loop below can cancel the remaining workers.
+            group.addTask {
+                while !(await coordinator.isComplete) {
+                    if Task.isCancelled { return nil }
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                return nil
+            }
 
             for await result in group {
                 if Task.isCancelled {
@@ -92,6 +103,13 @@ struct PeerSwarmDownloader: Sendable {
                 }
                 if let result {
                     lastError = result
+                }
+                // Once every piece is verified the transfer is over; cancel the still-
+                // parked workers/supervisor (their reads are cancellation-aware) instead
+                // of waiting for each to time out on its own.
+                if await coordinator.isComplete {
+                    group.cancelAll()
+                    break
                 }
             }
         }
