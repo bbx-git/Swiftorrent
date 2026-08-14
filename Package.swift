@@ -9,6 +9,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "Swiftorrent", targets: ["SwiftorrentApp"]),
+        .executable(name: "swiftorrent-bench", targets: ["SwiftorrentBench"]),
         .library(name: "SwiftorrentCore", targets: ["SwiftorrentCore"]),
         .library(name: "SwiftorrentDomain", targets: ["SwiftorrentDomain"]),
         .library(name: "SwiftorrentFeatures", targets: ["SwiftorrentFeatures"])
@@ -34,6 +35,11 @@ let package = Package(
                 "SwiftorrentFeatures"
             ],
             path: "App/Sources/SwiftorrentApp"
+        ),
+        .executableTarget(
+            name: "SwiftorrentBench",
+            dependencies: ["SwiftorrentCore"],
+            path: "Tools/SwiftorrentBench"
         ),
         .testTarget(
             name: "SwiftorrentCoreTests",
