@@ -103,6 +103,14 @@ public actor PeerWireClient {
     private let idleTimeout: TimeInterval
     private let encryptionPolicy: EncryptionPolicy
     private var connection: NWConnection?
+    /// A dedicated **serial** queue for this connection's `NWConnection` callbacks.
+    /// Network.framework schedules state/send/receive handlers onto the queue passed
+    /// to `start`; a *concurrent* queue (e.g. `.global()`) lets the multi-shot
+    /// `stateUpdateHandler` fire `.ready`/`.cancelled` on two threads at once, which
+    /// can resume the connect continuation twice (a fatal "continuation misuse").
+    /// A serial queue keeps callbacks ordered so the `resumeOnce` guard below is
+    /// enough to make the transition strictly single-resume.
+    private let connectionQueue = DispatchQueue(label: "com.swiftorrent.peerwire.connection")
     /// Once the MSE handshake selects RC4, `sendCipher` encrypts our outgoing
     /// bytes and `recvCipher` decrypts the peer's — both `nil` on a plaintext
     /// connection. RC4 is a stream cipher, so running bytes through in order works
@@ -186,33 +194,39 @@ public actor PeerWireClient {
         }
         let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: port, using: .tcp)
         self.connection = connection
+        let queue = connectionQueue
         try await withTimeout(connectTimeout) {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    // `stateUpdateHandler` is multi-shot and can race the `onCancel`
+                    // below (which cancels the connection, delivering `.cancelled`),
+                    // so funnel every resume through a once-only guard to make the
+                    // "resume more than once" fatal error impossible.
+                    let resume = ResumeOnce(continuation)
                     connection.stateUpdateHandler = { state in
                         switch state {
                         case .ready:
                             connection.stateUpdateHandler = nil
-                            continuation.resume()
+                            resume.resume(returning: ())
                         case let .failed(error):
                             connection.stateUpdateHandler = nil
-                            continuation.resume(throwing: error)
+                            resume.resume(throwing: error)
                         case let .waiting(error):
                             // Without waitForConnectivity, NWConnection parks unreachable or
                             // refused peers in `.waiting` indefinitely. Fail fast instead.
                             connection.stateUpdateHandler = nil
                             connection.cancel()
-                            continuation.resume(throwing: error)
+                            resume.resume(throwing: error)
                         case .cancelled:
                             // Reached when `onCancel` (or `.waiting` above) cancels the
                             // connection; resume so the continuation never leaks.
                             connection.stateUpdateHandler = nil
-                            continuation.resume(throwing: CancellationError())
+                            resume.resume(throwing: CancellationError())
                         default:
                             break
                         }
                     }
-                    connection.start(queue: .global(qos: .utility))
+                    connection.start(queue: queue)
                 }
             } onCancel: {
                 connection.cancel()

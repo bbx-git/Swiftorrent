@@ -144,29 +144,35 @@ public struct TrackerClient: Sendable {
 
     private func waitUntilReady(_ connection: NWConnection) async throws {
         try Task.checkCancellation()
+        // Per-connection serial queue + `ResumeOnce`: NWConnection's multi-shot
+        // `stateUpdateHandler` on a concurrent queue can resume this continuation
+        // twice (a `.ready`/`.failed` racing the `.cancelled` from `onCancel`),
+        // which is a fatal continuation misuse.
+        let queue = DispatchQueue(label: "com.swiftorrent.tracker.connection")
         try await withTimeout(seconds: .seconds(10)) {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    let resume = ResumeOnce(continuation)
                     connection.stateUpdateHandler = { state in
                         switch state {
                         case .ready:
                             connection.stateUpdateHandler = nil
-                            continuation.resume()
+                            resume.resume(returning: ())
                         case let .failed(error):
                             connection.stateUpdateHandler = nil
-                            continuation.resume(throwing: error)
+                            resume.resume(throwing: error)
                         case let .waiting(error):
                             connection.stateUpdateHandler = nil
                             connection.cancel()
-                            continuation.resume(throwing: error)
+                            resume.resume(throwing: error)
                         case .cancelled:
                             connection.stateUpdateHandler = nil
-                            continuation.resume(throwing: CancellationError())
+                            resume.resume(throwing: CancellationError())
                         default:
                             break
                         }
                     }
-                    connection.start(queue: .global(qos: .utility))
+                    connection.start(queue: queue)
                 }
             } onCancel: {
                 connection.cancel()
