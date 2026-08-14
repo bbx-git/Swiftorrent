@@ -13,8 +13,21 @@ public struct TorrentDownloader: Sendable {
     /// Shared throughput cap applied across every concurrent download path. When
     /// `nil` no limiting is applied.
     private let rateLimiter: RateLimiter?
-    private let maxPeerAttempts = 24
-    private let maxPeerConnections = 4
+    /// Upper bound on peers seeded into the swarm reserve up front. The reserve is
+    /// then kept topped up by inbound PEX and the supervisor's periodic re-announce,
+    /// so this only caps the *initial* set, not the total peers ever tried.
+    private let maxSwarmReservePeers = 300
+    /// Concurrent peer connections. A download-only client is kept choked by most
+    /// peers (tit-for-tat), so aggregate throughput tracks how many *unchoking*
+    /// seeds we hold at once — hence a fairly wide pool rather than the classic 4–5.
+    private let maxPeerConnections = 16
+    /// Start the swarm as soon as discovery has this many peers instead of waiting
+    /// for every tracker and the DHT to finish, so the first byte isn't gated on
+    /// the slowest source.
+    private static let enoughPeersToStart = 100
+    /// Hard cap on initial peer discovery; late peers (incl. the DHT) still arrive
+    /// via the swarm supervisor's periodic re-announce.
+    private static let peerDiscoveryDeadline: Duration = .seconds(12)
 
     public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient(), session: URLSession = .shared, rateLimiter: RateLimiter? = nil) {
         self.trackerClient = trackerClient
@@ -149,11 +162,24 @@ public struct TorrentDownloader: Sendable {
             selectablePieces: selectablePieces,
             mapper: mapper,
             downloadTotal: downloadTotal,
-            peers: Array(peers.shuffled().prefix(maxPeerAttempts)),
+            peers: Array(peers.shuffled().prefix(maxSwarmReservePeers)),
             peerID: peerID,
             verifiedPieces: verifiedPieces,
             initialDownloaded: verifiedBytes,
             stripRootDirectory: stripRootDirectory,
+            // Periodic re-announce so the swarm reserve never permanently runs dry:
+            // a fresh tracker/DHT lookup (no event — an interval refresh, not
+            // started/stopped) whose peers the supervisor folds into the reserve.
+            // Download-only is preserved: port 0, uploaded 0, as in every announce.
+            refillPeers: {
+                (try? await self.collectPeers(
+                    for: metainfo,
+                    peerID: peerID,
+                    downloaded: verifiedBytes,
+                    left: downloadTotal - verifiedBytes,
+                    event: nil
+                )) ?? []
+            },
             progress: progress
         )
         try writer.finalize(selectedFileIDs: selection)
@@ -172,7 +198,7 @@ public struct TorrentDownloader: Sendable {
         var peers: Set<PeerEndpoint> = []
         var lastError: Error?
 
-        await withTaskGroup(of: Result<[PeerEndpoint], Error>.self) { group in
+        await withTaskGroup(of: Optional<Result<[PeerEndpoint], Error>>.self) { group in
             for url in metainfo.announceURLs {
                 group.addTask {
                     do {
@@ -203,18 +229,34 @@ public struct TorrentDownloader: Sendable {
                 }
             }
 
+            // Deadline sentinel: don't let the whole download wait on the slowest
+            // source (usually the DHT). We stop early once we have enough peers, all
+            // real sources have reported, or this fires — whichever comes first.
+            group.addTask {
+                try? await Task.sleep(for: Self.peerDiscoveryDeadline)
+                return nil
+            }
+
+            let realSources = metainfo.announceURLs.count + (includeDHT ? 1 : 0)
+            var reported = 0
             for await result in group {
                 if Task.isCancelled {
                     group.cancelAll()
                     break
                 }
+                guard let result else { break } // deadline reached
+                reported += 1
                 switch result {
                 case let .success(endpoints):
                     peers.formUnion(endpoints)
                 case let .failure(error):
                     lastError = error
                 }
+                // Stop as soon as we have plenty, or every tracker/DHT has answered
+                // (so a fast small swarm isn't held back by the deadline sentinel).
+                if peers.count >= Self.enoughPeersToStart || reported >= realSources { break }
             }
+            group.cancelAll()
         }
 
         try Task.checkCancellation()

@@ -2,16 +2,10 @@ import CryptoKit
 import Foundation
 import Network
 
-public struct PieceBlock: Sendable {
-    public let begin: Int
-    public let data: Data
-}
-
 public enum PeerWireError: Error, LocalizedError {
     case connectionFailed
     case invalidHandshake
     case disconnected
-    case choked
     case unexpectedMessage
     case invalidPieceHash
     case extensionProtocolUnavailable
@@ -23,7 +17,6 @@ public enum PeerWireError: Error, LocalizedError {
         case .connectionFailed: "Could not connect to peer."
         case .invalidHandshake: "Peer returned an invalid BitTorrent handshake."
         case .disconnected: "Peer disconnected."
-        case .choked: "Peer choked this client."
         case .unexpectedMessage: "Peer returned an unexpected message."
         case .invalidPieceHash: "Downloaded piece failed SHA-1 verification."
         case .extensionProtocolUnavailable: "Peer does not support the BitTorrent extension protocol."
@@ -50,6 +43,13 @@ public actor PeerWireClient {
     /// Cap on peers retained from inbound PEX, so a hostile peer flooding `added`
     /// lists cannot grow this set without bound.
     static let maxDiscoveredPeers = 500
+    /// How many 16 KB block requests to keep outstanding per piece at once.
+    /// BitTorrent throughput is RTT-bound: requesting one block, waiting a full
+    /// round-trip for it, then requesting the next caps a peer at ~one block per
+    /// RTT (≈100–300 KB/s on a typical link) regardless of its real bandwidth.
+    /// Keeping a deep window of requests in flight lets a fast peer stream at line
+    /// rate. 16 blocks = 256 KB in flight, the common client default.
+    static let maxPipelinedBlocks = 16
 
     /// How `connect()` negotiates the transport.
     public enum EncryptionPolicy: Sendable {
@@ -389,36 +389,82 @@ public actor PeerWireClient {
         return Data(metadata.prefix(metadataSize))
     }
 
-    /// Downloads a piece block by block. `onBlock` is awaited after each 16 KB
-    /// block arrives, carrying that block's byte count — the caller uses it to
-    /// charge the shared rate limiter at block granularity, so the throttle holds
-    /// the combined cap smoothly rather than letting a whole piece burst through
-    /// before any pacing is applied.
+    /// Downloads a piece using a **pipelined** window of block requests: up to
+    /// `maxPipelinedBlocks` requests are kept outstanding at once instead of the
+    /// request→wait→request-next round-trip per block, which is what lifts a peer
+    /// from ~one-block-per-RTT (≈100–300 KB/s) to its real line rate. Blocks may
+    /// arrive out of order and are placed by their `begin` offset. On a choke the
+    /// peer discards our outstanding requests, so the still-missing blocks are
+    /// requeued and re-requested once it unchokes. `onBlock` is awaited per block
+    /// with its byte count so the caller can pace the shared rate limiter at block
+    /// granularity and report live speed as bytes land.
     public func downloadPiece(index: Int, length: Int, expectedHash: Data, blockSize: Int = 16 * 1024, onBlock: (@Sendable (Int) async -> Void)? = nil) async throws -> Data {
         try Task.checkCancellation()
         var piece = Data(count: length)
-        var downloaded = 0
 
-        while downloaded < length {
+        // Fixed set of block offsets making up this piece.
+        var blockBegins: [Int] = []
+        var offset = 0
+        while offset < length {
+            blockBegins.append(offset)
+            offset += blockSize
+        }
+
+        var pending = blockBegins       // offsets not yet requested (worklist)
+        var pendingCursor = 0
+        var outstanding = Set<Int>()    // requested, awaiting their data
+        var received = Set<Int>()       // already placed into `piece`
+
+        while received.count < blockBegins.count {
             try Task.checkCancellation()
-            if isChoked {
-                try await drainUntilUnchoked()
+
+            // Refill the pipeline while unchoked. Offsets already received (possible
+            // after a requeue on choke) are skipped rather than re-requested.
+            while !isChoked, outstanding.count < Self.maxPipelinedBlocks, pendingCursor < pending.count {
+                let blockBegin = pending[pendingCursor]
+                pendingCursor += 1
+                if received.contains(blockBegin) { continue }
+                let blockLength = min(blockSize, length - blockBegin)
+                var payload = Data()
+                payload.appendUInt32(UInt32(index))
+                payload.appendUInt32(UInt32(blockBegin))
+                payload.appendUInt32(UInt32(blockLength))
+                try await sendMessage(id: 6, payload: payload)
+                outstanding.insert(blockBegin)
             }
 
-            let requestLength = min(blockSize, length - downloaded)
-            var payload = Data()
-            payload.appendUInt32(UInt32(index))
-            payload.appendUInt32(UInt32(downloaded))
-            payload.appendUInt32(UInt32(requestLength))
-            try await sendMessage(id: 6, payload: payload)
-
-            let block = try await readPieceBlock(expectedIndex: index)
-            guard block.begin >= 0, block.begin + block.data.count <= piece.count else {
-                throw PeerWireError.unexpectedMessage
+            let message = try await readMessage()
+            switch message.id {
+            case 0:
+                // Choke: the peer drops every request we had in flight. Requeue the
+                // blocks we still need so they are re-requested after the unchoke.
+                isChoked = true
+                pending = blockBegins.filter { !received.contains($0) }
+                pendingCursor = 0
+                outstanding.removeAll()
+            case 1:
+                isChoked = false
+            case 4, 5:
+                handlePeerStateMessage(message)
+            case 7:
+                guard message.payload.count >= 8 else { throw PeerWireError.unexpectedMessage }
+                let pieceIndex = Int(message.payload.readUInt32(at: 0))
+                guard pieceIndex == index else { continue }
+                let blockBegin = Int(message.payload.readUInt32(at: 4))
+                let data = Data(message.payload.dropFirst(8))
+                guard blockBegin >= 0, blockBegin + data.count <= piece.count else {
+                    throw PeerWireError.unexpectedMessage
+                }
+                if received.insert(blockBegin).inserted {
+                    piece.replaceSubrange(blockBegin..<(blockBegin + data.count), with: data)
+                    outstanding.remove(blockBegin)
+                    await onBlock?(data.count)
+                }
+            case 20:
+                handleExtendedMessage(message.payload)
+            default:
+                continue
             }
-            piece.replaceSubrange(block.begin..<(block.begin + block.data.count), with: block.data)
-            downloaded += block.data.count
-            await onBlock?(block.data.count)
         }
 
         guard Data(Insecure.SHA1.hash(data: piece)) == expectedHash else {
@@ -430,40 +476,6 @@ public actor PeerWireClient {
     public func close() {
         connection?.cancel()
         connection = nil
-    }
-
-    private func drainUntilUnchoked() async throws {
-        while isChoked {
-            try Task.checkCancellation()
-            let message = try await readMessage()
-            handlePeerStateMessage(message)
-        }
-    }
-
-    private func readPieceBlock(expectedIndex: Int) async throws -> PieceBlock {
-        while true {
-            try Task.checkCancellation()
-            let message = try await readMessage()
-            switch message.id {
-            case 0:
-                isChoked = true
-                throw PeerWireError.choked
-            case 1:
-                isChoked = false
-            case 4, 5:
-                handlePeerStateMessage(message)
-            case 7:
-                guard message.payload.count >= 8 else { throw PeerWireError.unexpectedMessage }
-                let pieceIndex = Int(message.payload.readUInt32(at: 0))
-                guard pieceIndex == expectedIndex else { continue }
-                let begin = Int(message.payload.readUInt32(at: 4))
-                return PieceBlock(begin: begin, data: Data(message.payload.dropFirst(8)))
-            case 20:
-                handleExtendedMessage(message.payload)
-            default:
-                continue
-            }
-        }
     }
 
     private func handlePeerStateMessage(_ message: (id: UInt8, payload: Data), pieceCount: Int? = nil) {

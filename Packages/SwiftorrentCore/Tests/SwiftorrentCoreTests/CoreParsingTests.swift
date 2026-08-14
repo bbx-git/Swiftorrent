@@ -593,6 +593,101 @@ struct CoreParsingTests {
         #expect(resolved == metadata)
     }
 
+    @Test("A peer gossiping PEX during the metadata handshake is captured for the magnet path")
+    func metadataFetchHarvestsInboundPex() async throws {
+        // Magnet-path PEX: while fetching metadata, the peer sends a `ut_pex`
+        // message (tagged with the id *we* advertised for PEX) interleaved with
+        // the metadata exchange. The resolver folds these gossiped peers back into
+        // its probe pool, so `takeDiscoveredPeers` must surface them even though
+        // this connection's only job was the metadata fetch.
+        let infoHash = Data(repeating: 4, count: 20)
+        let metadata = Data((0..<40).map { UInt8($0) })
+        let localMetaID = PeerWireClient.localMetadataExtensionID
+        let localPexID = PeerWireClient.localPexExtensionID
+        // Compact peer list: 5.6.7.8:6881 and 9.10.11.12:51413.
+        let gossiped = Data([5, 6, 7, 8, 0x1A, 0xE1]) + Data([9, 10, 11, 12, 0xC8, 0xD5])
+
+        func be32(_ value: Int) -> Data {
+            let v = UInt32(value)
+            return Data([UInt8(v >> 24 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 8 & 0xff), UInt8(v & 0xff)])
+        }
+        func frame(id: UInt8, payload: Data) -> Data {
+            be32(payload.count + 1) + Data([id]) + payload
+        }
+
+        var reserved = Data(repeating: 0, count: 8)
+        reserved[5] = 0x10
+        let peerHandshake = Data([19]) + Data("BitTorrent protocol".utf8) + reserved + infoHash + Data(repeating: 9, count: 20)
+        let extHandshake = frame(id: 20, payload: Data([0]) + BencodeEncoder.encode([
+            "m": .dictionary(["ut_metadata": .integer(2), "ut_pex": .integer(1)]),
+            "metadata_size": .integer(Int64(metadata.count))
+        ]))
+        let pexMessage = frame(id: 20, payload: Data([localPexID]) + BencodeEncoder.encode([
+            "added": .bytes(gossiped)
+        ]))
+        let metadataReply = frame(id: 20, payload: Data([localMetaID]) + BencodeEncoder.encode([
+            "msg_type": .integer(1),
+            "piece": .integer(0),
+            "total_size": .integer(Int64(metadata.count))
+        ]) + metadata)
+        // PEX arrives between the extension handshake and the metadata reply, so it
+        // is read (and routed) mid-fetch rather than up front.
+        let scriptedBlob = peerHandshake + extHandshake + pexMessage + metadataReply
+
+        let holder = AcceptedConnections()
+        let listener = try NWListener(using: .tcp)
+        listener.newConnectionHandler = { connection in
+            holder.add(connection)
+            connection.stateUpdateHandler = { state in
+                if case .ready = state {
+                    connection.stateUpdateHandler = nil
+                    connection.send(content: scriptedBlob, completion: .contentProcessed { _ in })
+                }
+            }
+            connection.start(queue: .global(qos: .utility))
+        }
+        let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if let port = listener.port {
+                        listener.stateUpdateHandler = nil
+                        continuation.resume(returning: port)
+                    }
+                case let .failed(error):
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default:
+                    break
+                }
+            }
+            listener.start(queue: .global(qos: .utility))
+        }
+        defer {
+            listener.cancel()
+            holder.cancelAll()
+        }
+
+        let client = PeerWireClient(
+            endpoint: PeerEndpoint(host: "127.0.0.1", port: port.rawValue),
+            infoHash: infoHash,
+            peerID: Data(repeating: 1, count: 20),
+            connectTimeout: 2,
+            ioTimeout: 2,
+            encryptionPolicy: .plaintextOnly
+        )
+        try await client.connect()
+        let resolved = try await client.fetchMetadata()
+        let discovered = await client.takeDiscoveredPeers()
+        await client.close()
+
+        #expect(resolved == metadata)
+        #expect(Set(discovered) == [
+            PeerEndpoint(host: "5.6.7.8", port: 6881),
+            PeerEndpoint(host: "9.10.11.12", port: 51413)
+        ])
+    }
+
     @Test("Layout maps selected files onto overlapping pieces, including shared boundaries")
     func layoutSelectsBoundaryPieces() {
         // a.txt = bytes 0..2 (piece 0), b.txt = bytes 2..6 (pieces 0 and 1).
@@ -782,6 +877,25 @@ struct CoreParsingTests {
             PeerEndpoint(host: "192.0.2.2", port: 2),
             PeerEndpoint(host: "198.51.100.9", port: 9)
         ])
+    }
+
+    @Test("Peer supply stays open for refills until explicitly finished")
+    func peerSupplyRefillableUntilFinished() async {
+        // Regression guard for the zero-byte swarm failure: the reserve must not be
+        // one-shot. After the initial peers drain, `next()` returns nil but the
+        // supply is NOT finished, so the supervisor can still `add` re-announced
+        // peers and workers keep going. Only `finish()` closes it for good.
+        let supply = PeerSupply(peers: [PeerEndpoint(host: "192.0.2.1", port: 1)])
+        #expect(await supply.isFinished == false)
+        #expect(await supply.next() != nil)     // drain the initial peer
+        #expect(await supply.next() == nil)      // empty now...
+        #expect(await supply.isFinished == false) // ...but still open for refills
+
+        await supply.add([PeerEndpoint(host: "198.51.100.9", port: 9)]) // re-announce
+        #expect(await supply.next() == PeerEndpoint(host: "198.51.100.9", port: 9))
+
+        await supply.finish()
+        #expect(await supply.isFinished == true)
     }
 
     @Test("PEX message parser reads compact IPv4 added peers and ignores added6")

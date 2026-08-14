@@ -16,12 +16,6 @@ actor PieceDownloadCoordinator {
     private var completedPieces: Set<Int>
     private var completedBytes: Int64
     private var perFileBytes: [Int64]
-    /// Bytes received for pieces still in flight, keyed by piece. Folded into the
-    /// reported total so the download rate tracks bytes as they arrive rather than
-    /// jumping a whole piece at a time when one verifies. Cleared when a piece
-    /// completes (its bytes move into `completedBytes`) or is returned (partial
-    /// bytes are discarded).
-    private var inflightByPiece: [Int: Int64] = [:]
     private let clock = ContinuousClock()
     private var lastReport: ContinuousClock.Instant?
 
@@ -34,20 +28,24 @@ actor PieceDownloadCoordinator {
         self.perFileBytes = layout.completedBytesPerFile(completedPieces: completedPieces)
     }
 
+    /// Bytes of fully downloaded, SHA-1-verified, written pieces. This only ever
+    /// increases: partial bytes of a piece whose peer died mid-transfer are not
+    /// counted (the piece is re-fetched whole), so the reported total never jumps
+    /// backward the way "completed + in-flight" did.
     var downloadedBytes: Int64 {
-        completedBytes + inflightByPiece.values.reduce(0, +)
+        completedBytes
     }
 
-    /// Records freshly received in-flight bytes for an active piece. Returns the
-    /// current overall total (completed + in-flight) when enough time has elapsed
-    /// since the last report to warrant a UI refresh, or `nil` to coalesce this
-    /// update away so a fast unlimited download can't flood the progress channel.
-    func recordInflight(pieceIndex: Int, bytes: Int) -> Int64? {
-        inflightByPiece[pieceIndex, default: 0] += Int64(bytes)
+    /// A throttled progress ping for the per-block download callback: returns the
+    /// current verified total at most every 200 ms (`nil` in between) so a fast
+    /// download can't flood the progress channel. The reported number moves only
+    /// when pieces actually complete, which is fine — with a wide worker pool a
+    /// piece finishes every second or two, keeping the bar lively but monotonic.
+    func progressTick() -> Int64? {
         let now = clock.now
         if let last = lastReport, now - last < .milliseconds(200) { return nil }
         lastReport = now
-        return downloadedBytes
+        return completedBytes
     }
 
     var isComplete: Bool {
@@ -82,9 +80,6 @@ actor PieceDownloadCoordinator {
         guard activePieces.remove(pieceIndex) != nil, !completedPieces.contains(pieceIndex) else {
             return (downloadedBytes, perFileBytes)
         }
-        // Move this piece's bytes from the in-flight tally into the completed
-        // total so the reported total stays continuous across completion.
-        inflightByPiece[pieceIndex] = nil
         completedPieces.insert(pieceIndex)
         completedBytes += Int64(layout.length(ofPiece: pieceIndex))
         // Fold just this piece's slices into the running per-file tally instead
@@ -99,9 +94,6 @@ actor PieceDownloadCoordinator {
         guard activePieces.remove(pieceIndex) != nil, !completedPieces.contains(pieceIndex) else {
             return
         }
-        // Discard any partial bytes downloaded for the abandoned piece so the
-        // total doesn't overcount work that has to be redone.
-        inflightByPiece[pieceIndex] = nil
         pendingPieces.insert(pieceIndex)
     }
 }

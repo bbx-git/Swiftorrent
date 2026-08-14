@@ -71,7 +71,10 @@ public struct MagnetMetadataResolver: Sendable {
         // still fetching metadata itself may serve on a later pass) until one
         // delivers verified metadata or the overall deadline fires. The deadline
         // bounds the whole phase so a dead swarm errors in seconds-to-a-minute
-        // instead of hanging, while a live-but-slow seed still gets found.
+        // instead of hanging, while a live-but-slow seed still gets found. Peers
+        // gossiped by the swarm via inbound PEX during these probes are fed back
+        // into the cursor, so the metadata phase reaches seeds beyond the initial
+        // tracker/DHT set (the swarm-download path already does this).
         await progress(MagnetMetadataProgress(status: "Fetching magnet metadata from \(peers.count) peers"))
         let candidates = Array(peers.prefix(Self.maxMetadataPeers))
         let cursor = PeerCursor(peers: candidates)
@@ -91,6 +94,10 @@ public struct MagnetMetadataResolver: Sendable {
                                     // and never get here; concentrating retries on the reachable
                                     // minority is what finds the rare metadata-serving seed.
                                     await cursor.markReachable(peer)
+                                } onPeersDiscovered: { discovered in
+                                    // Feed PEX-gossiped peers back into the pool so the metadata
+                                    // phase expands beyond the initial tracker/DHT set.
+                                    await cursor.add(discovered)
                                 }
                             }
                             let hash = Data(Insecure.SHA1.hash(data: infoData))
@@ -265,7 +272,8 @@ public struct MagnetMetadataResolver: Sendable {
         from peer: PeerEndpoint,
         magnet: MagnetLink,
         peerID: Data,
-        onConnected: @Sendable () async -> Void = {}
+        onConnected: @Sendable () async -> Void = {},
+        onPeersDiscovered: @Sendable ([PeerEndpoint]) async -> Void = { _ in }
     ) async throws -> Data {
         // A short connect timeout is what keeps a worker slot from being pinned
         // for 10s by an unreachable (NAT/filtered) peer; a peer that actually has
@@ -275,9 +283,14 @@ public struct MagnetMetadataResolver: Sendable {
             try await client.connect()
             await onConnected()
             let metadata = try await client.fetchMetadata()
+            // Harvest any peers this connection gossiped via PEX. Even a leecher
+            // that couldn't serve metadata (the failure path below) may have
+            // pointed us at a seed that can.
+            await onPeersDiscovered(await client.takeDiscoveredPeers())
             await client.close()
             return metadata
         } catch {
+            await onPeersDiscovered(await client.takeDiscoveredPeers())
             await client.close()
             throw error
         }
@@ -291,7 +304,11 @@ public struct MagnetMetadataResolver: Sendable {
 /// only the peers that connected, since re-dialing the ~75% unreachable majority
 /// just burns the metadata-phase budget on connect timeouts. Concentrating
 /// retries on reachable peers is what lets the rare metadata-serving seed be hit
-/// repeatedly until it delivers. Returns nil only when the peer list is empty.
+/// repeatedly until it delivers. Peers gossiped via inbound PEX during the fetch
+/// are folded in through `add` and probed once, just like the first pass, so the
+/// metadata phase reaches seeds that only the swarm's own gossip surfaces — not
+/// just the tracker/DHT peers gathered up front. Returns nil only when every pool
+/// is empty.
 private actor PeerCursor {
     private let all: [PeerEndpoint]
     private var index = 0
@@ -299,9 +316,17 @@ private actor PeerCursor {
     private var reachable: [PeerEndpoint] = []
     private var reachableSeen = Set<PeerEndpoint>()
     private var reachableIndex = 0
+    /// Peers learned from inbound PEX mid-fetch, each probed once before folding
+    /// into the reachable-recycling set if they connect.
+    private var pending: [PeerEndpoint] = []
+    private var pendingIndex = 0
+    /// Every endpoint ever queued (initial candidates plus gossiped peers), so a
+    /// PEX peer already known — or gossiped twice — is not probed again.
+    private var seen: Set<PeerEndpoint>
 
     init(peers: [PeerEndpoint]) {
         all = peers
+        seen = Set(peers)
     }
 
     /// Records that a peer accepted our handshake, so later passes retry it.
@@ -311,8 +336,16 @@ private actor PeerCursor {
         }
     }
 
+    /// Folds peers learned from inbound PEX into the probe queue, deduped against
+    /// everything already seen. Download-only: these come from consuming the
+    /// swarm's `added` gossip, never from advertising ourselves.
+    func add(_ peers: [PeerEndpoint]) {
+        for peer in peers where seen.insert(peer).inserted {
+            pending.append(peer)
+        }
+    }
+
     func next() -> PeerEndpoint? {
-        guard !all.isEmpty else { return nil }
         if !firstPassComplete {
             if index < all.count {
                 defer { index += 1 }
@@ -320,10 +353,17 @@ private actor PeerCursor {
             }
             firstPassComplete = true
         }
+        // Probe freshly gossiped peers once before recycling known-reachable ones:
+        // an untried PEX peer is as likely to be the metadata seed as a re-dial.
+        if pendingIndex < pending.count {
+            defer { pendingIndex += 1 }
+            return pending[pendingIndex]
+        }
         // Retry only reachable peers. Until any are known (in-flight first-pass
         // probes haven't reported yet), fall back to recycling the full list so
         // workers never starve mid-sweep.
         let pool = reachable.isEmpty ? all : reachable
+        guard !pool.isEmpty else { return nil }
         if reachableIndex >= pool.count { reachableIndex = 0 }
         defer { reachableIndex = (reachableIndex + 1) % pool.count }
         return pool[reachableIndex]
