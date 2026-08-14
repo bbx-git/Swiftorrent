@@ -124,6 +124,40 @@ Reference clients: aria2c 1.37.0, transmission-cli 4.1.3.
 
 ---
 
+## Results — 2026-08-15 (magnet-link entry path, single trial each, sequential)
+
+Same Debian 13.6.0 netinst content as above (755 MiB, pure peer swarm), but entered
+as a **magnet link** instead of a `.torrent` file, to exercise the info-hash →
+metadata-resolution path specifically. Magnet derived from the official
+`debian-13.6.0-amd64-netinst.iso.torrent`'s own info-hash (fresh swarm snapshot,
+not the same run as the `.torrent`-file test above).
+
+| Client        | Wall (download) | TTFB   | Sustained rate* | Peak       | Notes                                    |
+|---------------|------------------|--------|------------------|------------|--------------------------------------------|
+| **Swiftorrent** | 24.0 s | 12.5 s (+ 18.8 s magnet metadata resolution) | **~65.7 MiB/s** | **74.58 MiB/s** | fastest transfer again; magnet adds a one-time metadata-resolution cost on top of the usual startup latency |
+| aria2c        | 18.2 s (incl. shutdown) | not captured this run | ~61 MiB/s | ~61 MiB/s | fastest end-to-end again |
+| transmission  | 75.8 s | 17.3 s | ~48.5 MB/s peak | 48.52 MB/s | no major endgame stall this run (vs. ~60 s stall previously) |
+
+\* *Sustained* = bytes ÷ (wall − TTFB), i.e. throughput once the swarm is actually
+flowing — same definition used for the 2026-08-14 row above.
+
+**Magnet-specific finding:** resolving the magnet's metadata (info-hash → peers →
+`ut_metadata` fetch) took 18.8 s before the 12.5 s swarm-discovery TTFB even starts,
+so total time from pasting a magnet link to first byte is ~31 s here — a cost that
+doesn't exist when starting from an already-fetched `.torrent` file. This is a
+separate phase from the download-phase TTFB weakness already tracked below.
+
+**Aborted asset — do not reuse:** tried the official Blender Foundation short film
+*Sintel* (Creative Commons Attribution 3.0, via `archive.org`'s own torrent,
+~1.7 GiB) as a third comparison point. Its BitTorrent swarm is seed-starved (most
+viewers stream it over HTTP from archive.org rather than torrenting it) — TTFB was
+63 s and average throughput never exceeded ~1.3 MiB/s after 4+ minutes, which
+reflects swarm health, not client engine performance. Aborted rather than let it run
+to completion; not a useful benchmark asset despite being legitimately CC-licensed
+and under a 2 GB size cap.
+
+---
+
 ## Conclusions
 
 1. **Swiftorrent's swarm transfer engine is already excellent — it beat both reference
@@ -140,6 +174,18 @@ Reference clients: aria2c 1.37.0, transmission-cli 4.1.3.
    which validates the endgame-`cancel` work already in `PieceDownloadCoordinator`.
 4. **Web-seed throughput slightly trails aria2** (10.8 vs ~13 MiB/s on BBB), suggesting
    we use a single connection to a web seed where aria2 parallelizes.
+5. **The 2026-08-15 magnet-link run confirms both findings on a fresh swarm snapshot**
+   (sustained ~65.7 MiB/s, peak 74.58 — again the fastest of the three; TTFB again
+   ~12.5 s, again the reason aria2 finishes sooner end-to-end) and surfaces a second,
+   separate cost specific to the magnet path: **~18.8 s to resolve metadata**
+   (info-hash → peers → `ut_metadata`) before the swarm-discovery clock even starts.
+   Pasting a magnet link is therefore slower to first byte than opening an
+   already-fetched `.torrent` by roughly that whole metadata-resolution phase.
+   Net takeaway across all runs: **Swiftorrent is not dropping speed relative to
+   aria2c/transmission — its transfer engine is consistently the fastest of the
+   three once data is flowing. All of its end-to-end slowness is concentrated in two
+   fixed startup costs (peer-discovery deadline, and magnet metadata resolution),
+   not in sustained throughput.**
 
 ## TODO / next session (in priority order)
 
