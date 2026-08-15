@@ -10,9 +10,16 @@ import SwiftorrentCore
 // Usage:
 //   swiftorrent-bench --torrent <path> [--dest <dir>] [--label <name>]
 //   swiftorrent-bench --magnet "<magnet:...>" [--dest <dir>] [--label <name>]
+//   swiftorrent-bench --magnet "<magnet:...>" --resolve-only [--label <name>]
 //
 // A fresh unique destination is used per run unless --dest is given, so every
 // benchmark starts from a cold cache.
+//
+// `--resolve-only` stops after the magnet's metadata is resolved and prints a
+// single machine-readable `RESOLVE <label> <seconds> OK|FAIL` line. Resolve
+// speed can't be judged on its own — an over-eager resolver is fast precisely
+// because it gives up early — so this exists to measure **success rate** over
+// many magnets and repeats, which downloading each one in full makes impractical.
 
 // Line-buffer stdout so progress lines stream live even when redirected to a
 // file or pipe (Swift `print` block-buffers to a pipe by default).
@@ -23,6 +30,7 @@ struct Args {
     var magnet: String?
     var dest: String?
     var label: String = "swiftorrent"
+    var resolveOnly = false
 }
 
 func parseArgs() -> Args {
@@ -34,6 +42,7 @@ func parseArgs() -> Args {
         case "--magnet": args.magnet = it.next()
         case "--dest": args.dest = it.next()
         case "--label": args.label = it.next() ?? args.label
+        case "--resolve-only": args.resolveOnly = true
         default:
             FileHandle.standardError.write(Data("Unknown argument: \(flag)\n".utf8))
         }
@@ -128,10 +137,23 @@ do {
         let link = try MagnetLinkParser().parse(magnet)
         print("[\(args.label)] resolving magnet metadata…")
         let resolveStart = ContinuousClock.now
-        metainfo = try await MagnetMetadataResolver().resolve(magnet: link) { prog in
-            FileHandle.standardError.write(Data("  \(prog.status)\r".utf8))
+        do {
+            metainfo = try await MagnetMetadataResolver().resolve(magnet: link) { prog in
+                FileHandle.standardError.write(Data("  \(prog.status)\r".utf8))
+            }
+        } catch {
+            // Report failures on the same machine-readable line as successes, so a
+            // resolve-rate sweep can count both without parsing stderr.
+            let elapsed = seconds(ContinuousClock.now - resolveStart)
+            print(String(format: "RESOLVE %@ %.1f FAIL %@", args.label, elapsed, "\(error)"))
+            exit(1)
         }
-        print(String(format: "[%@] metadata resolved in %.1fs", args.label, seconds(ContinuousClock.now - resolveStart)))
+        let elapsed = seconds(ContinuousClock.now - resolveStart)
+        print(String(format: "[%@] metadata resolved in %.1fs", args.label, elapsed))
+        if args.resolveOnly {
+            print(String(format: "RESOLVE %@ %.1f OK %@", args.label, elapsed, metainfo.name))
+            exit(0)
+        }
     } else {
         FileHandle.standardError.write(Data("Provide --torrent <path> or --magnet <string>\n".utf8))
         exit(2)
@@ -139,6 +161,11 @@ do {
 } catch {
     FileHandle.standardError.write(Data("Failed to obtain metadata: \(error)\n".utf8))
     exit(1)
+}
+
+if args.resolveOnly {
+    FileHandle.standardError.write(Data("--resolve-only requires --magnet\n".utf8))
+    exit(2)
 }
 
 let totalBytes = metainfo.files.reduce(Int64(0)) { $0 + $1.length }

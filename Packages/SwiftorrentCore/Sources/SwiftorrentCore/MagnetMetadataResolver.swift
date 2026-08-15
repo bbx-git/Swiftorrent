@@ -60,32 +60,55 @@ public struct MagnetMetadataResolver: Sendable {
         let peerID = TorrentDownloader.makePeerID()
         let sourceDescription = trackers.isEmpty ? "DHT" : "\(trackers.count) trackers and DHT"
         await progress(MagnetMetadataProgress(status: "Contacting \(sourceDescription) for magnet peers"))
-        let peers = try await collectPeers(trackers: trackers, magnet: magnet, peerID: peerID)
-        guard !peers.isEmpty else { throw MagnetMetadataResolverError.noPeers }
 
-        // Try peers concurrently. Most peers in a public swarm are unreachable
-        // (NAT) or won't serve metadata, and the few that will are often slow
-        // leechers, so probing serially — or giving up after one pass — stalls or
-        // fails. A bounded worker pool pulls from a **recycling** cursor: workers
-        // keep handshaking peers (retrying the pool, since a peer that was busy or
-        // still fetching metadata itself may serve on a later pass) until one
-        // delivers verified metadata or the overall deadline fires. The deadline
-        // bounds the whole phase so a dead swarm errors in seconds-to-a-minute
-        // instead of hanging, while a live-but-slow seed still gets found. Peers
-        // gossiped by the swarm via inbound PEX during these probes are fed back
-        // into the cursor, so the metadata phase reaches seeds beyond the initial
-        // tracker/DHT set (the swarm-download path already does this).
-        await progress(MagnetMetadataProgress(status: "Fetching magnet metadata from \(peers.count) peers"))
-        let candidates = Array(peers.prefix(Self.maxMetadataPeers))
-        let cursor = PeerCursor(peers: candidates)
-        let errorBox = ErrorBox()
-        let workerCount = min(Self.maxConcurrentMetadataFetches, candidates.count)
+        // Peer discovery and metadata fetching run **concurrently**, not in
+        // sequence. Discovery used to be a separate phase that had to complete —
+        // or hit its deadline — before the first peer was ever dialled, and since
+        // the DHT reliably outlives that deadline, every magnet paid the full wait
+        // even when a tracker had answered in a second. Now each source feeds the
+        // shared cursor the moment it reports (trackers first, DHT peers batch by
+        // batch) and the worker pool starts probing whatever has arrived.
+        //
+        // Nothing is given up to buy that: the DHT still runs its whole query
+        // budget and every peer it finds still gets probed, so the set of peers
+        // tried is a superset of the old one — the metadata phase just stops
+        // sitting idle while it is assembled. That matters because the reach of
+        // this phase, not its speed, is what decides whether a magnet resolves at
+        // all: metadata-serving seeds are often reachable only via the DHT.
+        //
+        // Within the pool, most peers in a public swarm are unreachable (NAT) or
+        // won't serve metadata, and the few that will are often slow leechers, so
+        // probing serially — or giving up after one pass — stalls or fails. The
+        // cursor therefore **recycles**: workers keep handshaking peers (a peer
+        // that was busy or still fetching metadata itself may serve on a later
+        // pass) until one delivers verified metadata or the phase deadline fires.
+        // Peers gossiped by the swarm via inbound PEX during these probes are fed
+        // back in too, so the phase reaches seeds beyond the tracker/DHT set (the
+        // swarm-download path already does this).
+        let cursor = PeerCursor(maxPeers: Self.maxMetadataPeers)
+        let fetchErrors = ErrorBox()
+        let discoveryErrors = ErrorBox()
 
-        let metainfo = try await withThrowingTaskGroup(of: TorrentMetainfo?.self) { group in
-            for _ in 0..<workerCount {
+        let metainfo = try await withThrowingTaskGroup(of: ResolveSignal.self) { group in
+            group.addTask {
+                await discoverPeers(
+                    trackers: trackers,
+                    magnet: magnet,
+                    peerID: peerID,
+                    into: cursor,
+                    errors: discoveryErrors,
+                    progress: progress
+                )
+                await cursor.finishDiscovery()
+                return .discoveryFinished
+            }
+
+            for _ in 0..<Self.maxConcurrentMetadataFetches {
                 group.addTask {
-                    while let peer = await cursor.next() {
-                        try Task.checkCancellation()
+                    // `next()` parks the worker while the pool is empty or fully
+                    // in flight, so workers spawned before the first tracker
+                    // answers wait for peers instead of exiting.
+                    while let peer = try await cursor.next() {
                         do {
                             let infoData = try await withTimeout(seconds: .seconds(15)) {
                                 try await fetchMetadata(from: peer, magnet: magnet, peerID: peerID) {
@@ -104,37 +127,54 @@ public struct MagnetMetadataResolver: Sendable {
                             guard hash == magnet.infoHash else {
                                 throw MagnetMetadataResolverError.metadataHashMismatch
                             }
-                            return try parser.parseInfoDictionary(
+                            let metainfo = try parser.parseInfoDictionary(
                                 data: infoData,
                                 announceURLs: trackers,
                                 webSeedURLs: magnet.webSeeds,
                                 preferredName: magnet.displayName
                             )
+                            await cursor.release(peer)
+                            return .resolved(metainfo)
                         } catch is CancellationError {
+                            await cursor.release(peer)
                             throw CancellationError()
                         } catch {
-                            await errorBox.record(error)
+                            await cursor.release(peer)
+                            await fetchErrors.record(error)
                         }
                     }
-                    return nil // recycling cursor only returns nil once cancelled
+                    return .workerFinished
                 }
             }
-            // Deadline sentinel: returns nil to end the phase if no worker has
-            // succeeded by the time it fires.
+
+            // Deadline sentinel bounding the whole phase, so a dead swarm errors in
+            // seconds-to-a-minute instead of hanging while a live-but-slow seed
+            // still gets found.
             group.addTask {
                 try? await Task.sleep(for: Self.metadataPhaseDeadline)
-                return nil
+                return .deadline
             }
 
             var resolved: TorrentMetainfo?
-            for try await result in group {
-                if let result {
-                    resolved = result
-                    break
+            var liveWorkers = Self.maxConcurrentMetadataFetches
+            consume: for try await signal in group {
+                switch signal {
+                case let .resolved(metainfo):
+                    resolved = metainfo
+                    break consume
+                case .deadline:
+                    break consume
+                case .discoveryFinished:
+                    // Sources are done, but peers already found are still being
+                    // probed (and may still gossip more via PEX) — keep going.
+                    continue
+                case .workerFinished:
+                    // A worker only runs out of peers when the cursor is empty and
+                    // discovery is over, i.e. nothing was ever found. Once every
+                    // worker has hit that, there is nothing left to wait for.
+                    liveWorkers -= 1
+                    if liveWorkers == 0 { break consume }
                 }
-                // A nil is either the deadline firing or a worker seeing a
-                // cancelled cursor; both mean we should stop.
-                break
             }
             group.cancelAll()
             return resolved
@@ -145,7 +185,20 @@ public struct MagnetMetadataResolver: Sendable {
             return metainfo
         }
 
-        throw await errorBox.lastError ?? MagnetMetadataResolverError.noPeers
+        // No peer ever reached the cursor means the failure was in discovery, so
+        // surface the tracker/DHT error rather than a stale fetch error.
+        if await cursor.count == 0 {
+            throw await discoveryErrors.lastError ?? MagnetMetadataResolverError.noPeers
+        }
+        throw await fetchErrors.lastError ?? MagnetMetadataResolverError.noPeers
+    }
+
+    /// What a child of the resolve task group reports back.
+    private enum ResolveSignal: Sendable {
+        case resolved(TorrentMetainfo)
+        case discoveryFinished
+        case workerFinished
+        case deadline
     }
 
     /// Upper bound on peers probed for metadata per magnet, how many probes run
@@ -195,17 +248,19 @@ public struct MagnetMetadataResolver: Sendable {
         return nil
     }
 
-    private func collectPeers(trackers: [URL], magnet: MagnetLink, peerID: Data) async throws -> [PeerEndpoint] {
-        var peers: Set<PeerEndpoint> = []
-        var lastError: Error?
-
-        // Each source (tracker or DHT) returns `.some(result)`; a deadline task
-        // returns `nil`. We stop as soon as we have enough peers to start
-        // fetching metadata, or the deadline fires — otherwise a fast tracker's
-        // peers would sit unused for minutes while the DHT exhausts its query
-        // budget (the whole group would only return once its *slowest* source
-        // finished). Stragglers are cancelled on exit.
-        await withTaskGroup(of: Optional<Result<[PeerEndpoint], Error>>.self) { group in
+    /// Runs every peer source concurrently, pushing endpoints into `cursor` as
+    /// soon as each one reports rather than returning a single batch at the end.
+    /// Returns once all sources are done, the cursor is full, or the discovery
+    /// deadline fires; stragglers are cancelled on exit.
+    private func discoverPeers(
+        trackers: [URL],
+        magnet: MagnetLink,
+        peerID: Data,
+        into cursor: PeerCursor,
+        errors: ErrorBox,
+        progress: @Sendable @escaping (MagnetMetadataProgress) async -> Void
+    ) async {
+        await withTaskGroup(of: DiscoverySignal.self) { group in
             for tracker in trackers {
                 group.addTask {
                     do {
@@ -218,61 +273,70 @@ public struct MagnetMetadataResolver: Sendable {
                             left: 0,
                             event: "started"
                         )
-                        return .success(try await trackerClient.announce(request))
+                        await cursor.add(try await trackerClient.announce(request))
+                        return .source(nil)
                     } catch {
-                        return .failure(error)
+                        return .source(error)
                     }
                 }
             }
             group.addTask {
                 do {
                     try Task.checkCancellation()
-                    return .success(try await dhtClient.peers(for: magnet.infoHash))
+                    // Stream the DHT's peers batch by batch instead of waiting on
+                    // its whole query budget: on a trackerless magnet these are the
+                    // only peers there are, and the first batch lands many seconds
+                    // before the last.
+                    _ = try await dhtClient.peers(for: magnet.infoHash) { found in
+                        await cursor.add(found)
+                    }
+                    return .source(nil)
                 } catch {
-                    return .failure(error)
+                    return .source(error)
                 }
             }
             group.addTask {
-                try? await Task.sleep(for: Self.peerCollectionDeadline)
-                return nil
+                try? await Task.sleep(for: Self.peerDiscoveryDeadline)
+                return .deadline
             }
 
             let realSources = trackers.count + 1 // trackers + DHT
             var reported = 0
-            for await result in group {
-                if Task.isCancelled { break }
-                guard let result else { break } // deadline reached
-                reported += 1
-                switch result {
-                case let .success(endpoints):
-                    peers.formUnion(endpoints)
-                case let .failure(error):
-                    lastError = error
+            collect: for await signal in group {
+                if Task.isCancelled { break collect }
+                switch signal {
+                case .deadline:
+                    break collect
+                case let .source(error):
+                    reported += 1
+                    if let error { await errors.record(error) }
+                    let count = await cursor.count
+                    if count > 0 {
+                        await progress(MagnetMetadataProgress(
+                            status: "Fetching magnet metadata from \(count) peers"
+                        ))
+                    }
+                    if reported >= realSources { break collect }
+                    if await cursor.isFull { break collect }
                 }
-                // Stop once we have plenty, or every tracker/DHT has answered — a fast
-                // small swarm shouldn't sit on the 18s deadline waiting for stragglers
-                // that already finished. Mirrors TorrentDownloader.collectPeers.
-                if peers.count >= Self.enoughPeersToStart || reported >= realSources { break }
             }
             group.cancelAll()
         }
-
-        try Task.checkCancellation()
-        if peers.isEmpty, let lastError {
-            throw lastError
-        }
-        return Array(peers).shuffled()
     }
 
-    /// Peer-collection stops early once this many peers are gathered, and never
-    /// runs longer than the deadline even if a slow DHT/tracker is still working.
-    /// The threshold is deliberately high: metadata-serving seeds are often
-    /// reachable only via the DHT or a specific tracker, so quitting the instant
-    /// one fast tracker answers (with mostly unreachable leechers) tanks the
-    /// odds of the metadata phase succeeding. We'd rather spend a few extra
-    /// seconds gathering a diverse set from every source.
-    private static let enoughPeersToStart = 300
-    private static let peerCollectionDeadline: Duration = .seconds(18)
+    /// A discovery source finishing (carrying its error, if it failed), or the
+    /// discovery deadline firing.
+    private enum DiscoverySignal: Sendable {
+        case source(Error?)
+        case deadline
+    }
+
+    /// Hard stop on peer discovery even if a tracker or the DHT is still working.
+    /// Generous on purpose, and much longer than it used to be: discovery no
+    /// longer delays the first probe, so letting the DHT finish its query budget
+    /// costs nothing and only widens the pool a stubborn magnet gets to draw on.
+    /// It stays well inside `metadataPhaseDeadline`, which bounds the phase overall.
+    private static let peerDiscoveryDeadline: Duration = .seconds(60)
 
     private func fetchMetadata(
         from peer: PeerEndpoint,
@@ -304,36 +368,48 @@ public struct MagnetMetadataResolver: Sendable {
 }
 
 /// Hands out swarm peers to a pool of concurrent metadata-fetch workers, learning
-/// reachability as it goes. **First pass:** every candidate is tried once (broad
-/// sweep to discover which peers actually accept a connection — roughly 1 in 4,
-/// the rest being NAT'd and dropping our SYN). **After the first pass:** it cycles
-/// only the peers that connected, since re-dialing the ~75% unreachable majority
-/// just burns the metadata-phase budget on connect timeouts. Concentrating
-/// retries on reachable peers is what lets the rare metadata-serving seed be hit
-/// repeatedly until it delivers. Peers gossiped via inbound PEX during the fetch
-/// are folded in through `add` and probed once, just like the first pass, so the
-/// metadata phase reaches seeds that only the swarm's own gossip surfaces — not
-/// just the tracker/DHT peers gathered up front. Returns nil only when every pool
-/// is empty.
-private actor PeerCursor {
-    private let all: [PeerEndpoint]
-    private var index = 0
-    private var firstPassComplete = false
+/// reachability as it goes.
+///
+/// Peers **stream in** while workers are already probing: trackers and the DHT
+/// call `add` as they report, and inbound PEX gossip folds in the same way, so
+/// the pool keeps widening throughout the phase rather than being fixed up front.
+///
+/// **Untried peers first:** anything never probed is handed out before anything
+/// is retried — a fresh peer is at least as likely to be the metadata seed as a
+/// re-dial. **Then recycling:** once nothing untried is left it cycles the peers
+/// that actually connected, since re-dialing the ~75% NAT'd majority just burns
+/// the phase budget on connect timeouts. Concentrating retries on reachable peers
+/// is what lets the rare metadata-serving seed be hit repeatedly until it
+/// delivers. A peer is never handed to two workers at once, so a pool smaller
+/// than the worker count can't be dogpiled.
+///
+/// `next()` parks the caller while the pool is empty or fully in flight, and
+/// returns nil only when discovery is over and there is genuinely nothing left —
+/// i.e. no peer was ever found.
+actor PeerCursor {
+    /// Every endpoint ever accepted, in arrival order. Doubles as the fallback
+    /// recycling pool before any peer has proved reachable.
+    private var all: [PeerEndpoint] = []
+    /// Endpoints not yet handed to a worker.
+    private var untried: [PeerEndpoint] = []
+    private var untriedIndex = 0
     private var reachable: [PeerEndpoint] = []
     private var reachableSeen = Set<PeerEndpoint>()
-    private var reachableIndex = 0
-    /// Peers learned from inbound PEX mid-fetch, each probed once before folding
-    /// into the reachable-recycling set if they connect.
-    private var pending: [PeerEndpoint] = []
-    private var pendingIndex = 0
-    /// Every endpoint ever queued (initial candidates plus gossiped peers), so a
-    /// PEX peer already known — or gossiped twice — is not probed again.
-    private var seen: Set<PeerEndpoint>
+    private var recycleIndex = 0
+    /// Every endpoint ever queued, so a peer reported by two sources — or
+    /// gossiped twice — is not queued again.
+    private var seen = Set<PeerEndpoint>()
+    /// Peers currently being probed, so no two workers dial the same one.
+    private var inFlight = Set<PeerEndpoint>()
+    private var discoveryFinished = false
+    private let maxPeers: Int
 
-    init(peers: [PeerEndpoint]) {
-        all = peers
-        seen = Set(peers)
+    init(maxPeers: Int) {
+        self.maxPeers = maxPeers
     }
+
+    var count: Int { all.count }
+    var isFull: Bool { all.count >= maxPeers }
 
     /// Records that a peer accepted our handshake, so later passes retry it.
     func markReachable(_ peer: PeerEndpoint) {
@@ -342,37 +418,64 @@ private actor PeerCursor {
         }
     }
 
-    /// Folds peers learned from inbound PEX into the probe queue, deduped against
-    /// everything already seen. Download-only: these come from consuming the
-    /// swarm's `added` gossip, never from advertising ourselves.
+    /// Queues peers from a tracker, the DHT, or inbound PEX gossip, deduped
+    /// against everything already seen and capped so one huge swarm can't grow
+    /// the pool without bound. Download-only: gossiped peers come from consuming
+    /// the swarm's `added` list, never from advertising ourselves.
     func add(_ peers: [PeerEndpoint]) {
-        for peer in peers where seen.insert(peer).inserted {
-            pending.append(peer)
+        for peer in peers {
+            guard all.count < maxPeers else { return }
+            guard seen.insert(peer).inserted else { continue }
+            all.append(peer)
+            untried.append(peer)
         }
     }
 
-    func next() -> PeerEndpoint? {
-        if !firstPassComplete {
-            if index < all.count {
-                defer { index += 1 }
-                return all[index]
-            }
-            firstPassComplete = true
+    /// Marks discovery complete, so workers can tell "no peers yet" from "no
+    /// peers at all".
+    func finishDiscovery() {
+        discoveryFinished = true
+    }
+
+    /// Returns a peer to the pool once its probe finishes, making it eligible for
+    /// a later retry.
+    func release(_ peer: PeerEndpoint) {
+        inFlight.remove(peer)
+    }
+
+    func next() async throws -> PeerEndpoint? {
+        while true {
+            try Task.checkCancellation()
+            if let peer = takeAvailable() { return peer }
+            // Nothing to hand out: either discovery hasn't produced peers yet, or
+            // every known peer is already being probed. Both are temporary unless
+            // discovery is done and the pool is empty.
+            if discoveryFinished, all.isEmpty { return nil }
+            // Polling rather than parking on a continuation keeps this
+            // cancellation-correct without a resume-once guard; at probe
+            // timescales (seconds) the wait granularity is free.
+            try await Task.sleep(for: .milliseconds(100))
         }
-        // Probe freshly gossiped peers once before recycling known-reachable ones:
-        // an untried PEX peer is as likely to be the metadata seed as a re-dial.
-        if pendingIndex < pending.count {
-            defer { pendingIndex += 1 }
-            return pending[pendingIndex]
+    }
+
+    private func takeAvailable() -> PeerEndpoint? {
+        while untriedIndex < untried.count {
+            let peer = untried[untriedIndex]
+            untriedIndex += 1
+            if inFlight.insert(peer).inserted { return peer }
         }
-        // Retry only reachable peers. Until any are known (in-flight first-pass
-        // probes haven't reported yet), fall back to recycling the full list so
-        // workers never starve mid-sweep.
+        // Retry only reachable peers. Until any are known (in-flight probes
+        // haven't reported yet), fall back to recycling everything so workers
+        // never starve mid-sweep.
         let pool = reachable.isEmpty ? all : reachable
         guard !pool.isEmpty else { return nil }
-        if reachableIndex >= pool.count { reachableIndex = 0 }
-        defer { reachableIndex = (reachableIndex + 1) % pool.count }
-        return pool[reachableIndex]
+        for _ in 0..<pool.count {
+            if recycleIndex >= pool.count { recycleIndex = 0 }
+            let peer = pool[recycleIndex]
+            recycleIndex = (recycleIndex + 1) % pool.count
+            if inFlight.insert(peer).inserted { return peer }
+        }
+        return nil // every candidate is already in flight
     }
 }
 

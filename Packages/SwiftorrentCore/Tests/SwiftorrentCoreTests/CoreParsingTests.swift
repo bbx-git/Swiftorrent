@@ -1150,6 +1150,86 @@ struct CoreParsingTests {
         #expect(PeerWireClient.parsePexAddedPeers(body).isEmpty)
     }
 
+    @Test("Magnet peer cursor parks a worker until a source streams peers in")
+    func peerCursorWaitsForStreamedPeers() async throws {
+        // The point of overlapping discovery with fetching: workers start before
+        // any tracker has answered, so `next()` must wait for peers to arrive
+        // rather than reporting the pool empty and letting the worker exit.
+        let cursor = PeerCursor(maxPeers: 300)
+        let peer = PeerEndpoint(host: "192.0.2.1", port: 1)
+
+        async let handed = cursor.next()
+        try await Task.sleep(for: .milliseconds(150)) // worker is parked here
+        await cursor.add([peer])
+
+        #expect(try await handed == peer)
+    }
+
+    @Test("Magnet peer cursor reports exhaustion only once discovery found nothing")
+    func peerCursorEndsOnlyWhenDiscoveryFoundNoPeers() async throws {
+        // The resolver counts workers returning nil to detect "no peers at all",
+        // so an empty-but-still-running discovery must never look exhausted.
+        let cursor = PeerCursor(maxPeers: 300)
+        await cursor.finishDiscovery()
+        #expect(try await cursor.next() == nil)
+
+        let live = PeerCursor(maxPeers: 300)
+        await live.add([PeerEndpoint(host: "192.0.2.2", port: 2)])
+        await live.finishDiscovery()
+        // Discovery is over but a peer exists, so it recycles instead of ending.
+        #expect(try await live.next() != nil)
+    }
+
+    @Test("Magnet peer cursor never hands the same peer to two workers at once")
+    func peerCursorDoesNotDogpileOnePeer() async throws {
+        // 24 workers against a one-peer pool would otherwise all dial it at once.
+        let cursor = PeerCursor(maxPeers: 300)
+        let peer = PeerEndpoint(host: "192.0.2.3", port: 3)
+        await cursor.add([peer])
+
+        #expect(try await cursor.next() == peer)
+        // Second worker finds it in flight and parks rather than re-dialing it.
+        let second = Task { try await cursor.next() }
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(!second.isCancelled)
+
+        await cursor.release(peer)
+        #expect(try await second.value == peer) // eligible for retry once free
+    }
+
+    @Test("Magnet peer cursor tries every new peer before retrying reachable ones")
+    func peerCursorPrefersUntriedPeersThenRecyclesReachable() async throws {
+        let cursor = PeerCursor(maxPeers: 300)
+        let reachable = PeerEndpoint(host: "192.0.2.4", port: 4)
+        let dead = PeerEndpoint(host: "192.0.2.5", port: 5)
+        await cursor.add([reachable, dead])
+
+        #expect(try await cursor.next() == reachable)
+        #expect(try await cursor.next() == dead)
+        await cursor.markReachable(reachable)
+        await cursor.release(reachable)
+        await cursor.release(dead)
+
+        // A peer gossiped mid-phase is untried, so it jumps ahead of any retry.
+        let gossiped = PeerEndpoint(host: "192.0.2.6", port: 6)
+        await cursor.add([gossiped, reachable]) // duplicate is ignored
+        #expect(try await cursor.next() == gossiped)
+        await cursor.release(gossiped)
+
+        // Nothing untried left: only the peer that connected gets re-dialed, not
+        // the NAT'd majority that would burn the budget on connect timeouts.
+        #expect(try await cursor.next() == reachable)
+        #expect(await cursor.count == 3)
+    }
+
+    @Test("Magnet peer cursor stops accepting peers at its cap")
+    func peerCursorCapsPoolSize() async {
+        let cursor = PeerCursor(maxPeers: 2)
+        await cursor.add((1...5).map { PeerEndpoint(host: "192.0.2.\($0)", port: UInt16($0)) })
+        #expect(await cursor.count == 2)
+        #expect(await cursor.isFull)
+    }
+
     private func makeMetainfo(pieceLength: Int, pieces: [Data]) -> TorrentMetainfo {
         TorrentMetainfo(
             name: "Root",

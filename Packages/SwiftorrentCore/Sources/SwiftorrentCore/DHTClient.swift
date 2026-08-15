@@ -40,7 +40,27 @@ public struct DHTClient: Sendable {
         self.parallelQueries = parallelQueries
     }
 
+    /// Queries the DHT for peers on `infoHash`, returning them all at once.
+    ///
+    /// Kept as its own overload rather than a defaulted parameter on the
+    /// streaming variant below, because a default argument does not satisfy the
+    /// `DHTPeerFinding` requirement the download path is written against.
     public func peers(for infoHash: Data) async throws -> [PeerEndpoint] {
+        try await peers(for: infoHash, onPeers: { _ in })
+    }
+
+    /// Queries the DHT for peers on `infoHash`.
+    ///
+    /// - Parameter onPeers: Called with the newly found peers after each query
+    ///   batch, so a caller can start using them while the search continues.
+    ///   Walking the routing table takes tens of seconds, and the first batch
+    ///   usually lands long before the last — a caller that only needs *some*
+    ///   peers shouldn't have to wait for the whole query budget to be spent.
+    ///   The full deduplicated set is still returned at the end.
+    public func peers(
+        for infoHash: Data,
+        onPeers: @Sendable ([PeerEndpoint]) async -> Void
+    ) async throws -> [PeerEndpoint] {
         try Task.checkCancellation()
         let nodeID = Self.makeNodeID()
         var peers = Set<PeerEndpoint>()
@@ -56,6 +76,7 @@ public struct DHTClient: Sendable {
             if batch.isEmpty { continue }
             queried += batch.count
 
+            var fresh: [PeerEndpoint] = []
             await withTaskGroup(of: Result<DHTGetPeersResponse, Error>.self) { group in
                 for node in batch {
                     group.addTask {
@@ -70,7 +91,9 @@ public struct DHTClient: Sendable {
                 for await result in group {
                     switch result {
                     case let .success(response):
-                        peers.formUnion(response.peers)
+                        for peer in response.peers where peers.insert(peer).inserted {
+                            fresh.append(peer)
+                        }
                         for node in response.nodes where !visited.contains(Self.key(for: node)) {
                             queued.append(node)
                         }
@@ -78,6 +101,9 @@ public struct DHTClient: Sendable {
                         lastError = error
                     }
                 }
+            }
+            if !fresh.isEmpty {
+                await onPeers(fresh)
             }
         }
 

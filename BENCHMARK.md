@@ -31,6 +31,21 @@ transmission-cli **sequentially** (never in parallel — they'd compete for
 bandwidth), each into a fresh temp dir (cold cache), and prints each one's wall
 time / time-to-first-byte / speed.
 
+To measure the **magnet metadata-resolve phase on its own** — without downloading
+the payload, so many magnets and repeats stay practical:
+
+```bash
+.build/release/swiftorrent-bench --magnet "magnet:?xt=urn:btih:…" --resolve-only
+# -> RESOLVE swiftorrent 0.9 OK debian-13.6.0-amd64-netinst.iso
+```
+
+It prints one machine-readable `RESOLVE <label> <seconds> OK|FAIL` line per run,
+on failure as well as success. Always read the two together: a resolver that gives
+up early is *fast* exactly when it is broken, so resolve time is only meaningful
+next to the success rate over a set of magnets. Include trackerless (info-hash
+only) magnets in any such sweep — they exercise the DHT-only path, which is where
+resolution breaks first.
+
 ---
 
 ## Test assets
@@ -189,6 +204,11 @@ risks tanking magnet-resolve success rate rather than just its speed. Left as a
 candidate for a future session with room to live-validate the tradeoff, not applied
 blindly by analogy.
 
+> **Resolved 2026-08-15** (see the A/B sweep near the end of this file). The caution
+> was right — the fast-start pattern would have been the wrong fix — but the real
+> problem was that discovery *gated* fetching at all. Overlapping the two keeps every
+> peer the high threshold was protecting and raised success rate 25% → 75%.
+
 ---
 
 ## Results — 2026-08-15 (later: magnet path re-run post TTFB fix, Debian + BBB, single trial each, sequential)
@@ -259,16 +279,68 @@ weather — but Swiftorrent's own numbers are consistent with all prior runs.
    fixed startup costs (peer-discovery deadline, and magnet metadata resolution),
    not in sustained throughput.**
 
+## Results — 2026-08-15 (magnet metadata-resolve: overlapped discovery, A/B vs HEAD)
+
+The last remaining startup cost. Measured with the new `swiftorrent-bench
+--resolve-only` mode, which stops after metadata resolution and prints a
+`RESOLVE <label> <seconds> OK|FAIL` line — resolve *speed alone is not a valid
+metric here*, because a resolver that quits early looks fast precisely when it is
+failing, so every run records success/failure too.
+
+**Method.** 8 magnets — 4 legal, well-seeded Linux ISOs (Debian netinst, Debian
+live XFCE, Ubuntu 24.04.3, Ubuntu 22.04.5), each in two forms: tracker-backed
+(`tr=` from the official torrent's announce list) and **trackerless/DHT-only**
+(info-hash + `dn` only). The DHT-only form is the case the old code's comment
+warned about, so it is tested explicitly rather than assumed. Two binaries — `old`
+(commit `11e111d`) and `new` — run **back-to-back on each magnet** so both see the
+same swarm snapshot, over 2 full rounds: 32 runs total. Info-hashes were verified
+byte-exact against the original `.torrent` info-dict bytes before any run.
+
+| Metric | old (HEAD) | new |
+|---|---|---|
+| **Magnets resolved** | **4/16 (25%)** | **12/16 (75%)** |
+| Resolve time, magnets old could resolve | 18.3 s avg | **0.9 s avg (~20× faster)** |
+| Tracker-backed Debian (4 runs) | 15.3 / 19.8 / 19.0 / 19.2 s | 1.3 / 0.9 / 0.9 / 0.6 s |
+| Trackerless DHT-only (8 runs) | **0/8 resolved** (all ~18.5 s `noPeers`) | **6/8 resolved** |
+
+**Success rate went up, not down** — the outcome the old comment feared. There is
+no run in the sweep that `old` resolved and `new` did not; every difference goes
+the same way. Two causes:
+
+1. **Discovery no longer blocks fetching.** `collectPeers` used to have to finish —
+   in practice always timing out at its 18 s deadline, because the DHT never
+   completes that fast — before the first peer was dialled. Trackers answer in
+   about a second, so that entire wait was dead time. Peers now stream into a
+   shared cursor as each source reports and workers probe immediately, which is
+   the whole ~20× on tracker-backed magnets.
+2. **The DHT gets to finish.** On a trackerless magnet the old 18 s cut-off fired
+   before the DHT walk returned *anything*, so `collectPeers` threw `noPeers` and
+   the magnet simply failed — 0/8 here. Discovery no longer delays the first probe,
+   so its deadline could be raised to 60 s (still inside the 90 s phase budget) at
+   no latency cost, and `DHTClient.peers(for:onPeers:)` now streams peers batch by
+   batch instead of returning one lump at the end.
+
+Caveats: **Ubuntu 22.04.5 (tracker form) failed on both binaries in both rounds** —
+a seed-starved swarm for an old point release, not a resolver defect (its
+info-hash was verified correct; treat it like Sintel above and don't reuse it).
+The two remaining `new` failures are DHT-only runs that hit the 90 s phase
+deadline; the same magnets resolved in the other round, so DHT-only resolution is
+now *possible but variable*, where before it was reliably impossible.
+
+Reproduce: `swift build -c release --product swiftorrent-bench`, then
+`.build/release/swiftorrent-bench --magnet "<magnet>" --resolve-only`.
+
 ## TODO / next session (in priority order)
 
 - [x] **Cut time-to-first-byte (highest value) — DONE 2026-08-15.** Added a fast-start
       sentinel to `TorrentDownloader.collectPeers`: 12.7 s → 3.7 s TTFB. See the
       "Results — 2026-08-15" section above.
-- [ ] **Magnet-path metadata-resolution phase (~18.8 s), separate from the above.**
-      `MagnetMetadataResolver.collectPeers` has the same deadline-sentinel shape but a
-      documented reason for its high peer threshold (metadata-serving peers are often
-      DHT-only) — needs careful tuning + live validation of the *success rate*, not
-      just speed, before changing. See the "Deliberately left alone" note above.
+- [x] **Magnet-path metadata-resolution phase (~18.8 s) — DONE 2026-08-15.** Overlapped
+      peer discovery with metadata fetching instead of running them in sequence:
+      18.3 s → 0.9 s on tracker-backed magnets, and resolve success rate went
+      **up** 25% → 75% (trackerless magnets went from never resolving to usually
+      resolving). The old high peer threshold turned out not to need careful
+      tuning — it needed to stop being a *gate*. See the section directly above.
 - [ ] **Parallelize web-seed connections** (secondary) to close the ~13 vs 10.8 MiB/s
       gap on web-seed torrents. See `WebSeedDownloader`.
 - [ ] **Make the benchmark statistically sound:** have `benchmark.sh` do N trials and
