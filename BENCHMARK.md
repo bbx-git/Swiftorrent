@@ -191,6 +191,45 @@ blindly by analogy.
 
 ---
 
+## Results — 2026-08-15 (later: magnet path re-run post TTFB fix, Debian + BBB, single trial each, sequential)
+
+Full three-way comparison re-run entirely through the **magnet entry path**, now with
+the fast-start TTFB fix in place. Two assets, both under a 2 GB cap: the Debian
+13.6.0 netinst magnet (derived from the official `.torrent`'s info-hash, `tr=` only —
+web seeds stripped for a pure-swarm test) and the in-repo Big Buck Bunny magnet
+(README form, includes `xs=` exact source + web seed).
+
+### Debian netinst magnet — 755 MiB, pure peer swarm
+
+| Client        | Wall (download) | Metadata resolve | TTFB   | Avg rate | Peak | Notes |
+|---------------|-----------------|------------------|--------|----------|------|-------|
+| **Swiftorrent** | 17.1 s | 19.4 s | **3.4 s** | 44.28 MiB/s | **69.54 MiB/s** | fastest transfer + fastest post-resolve start; ~36.5 s end-to-end |
+| aria2c        | 20.1 s end-to-end (incl. metadata + shutdown) | (included) | n/a | 51 MiB/s (self-reported) | — | still fastest end-to-end, purely because its metadata resolve is near-instant |
+| transmission  | 65.4 s | (included) | 17.1 s | — | 51.2 MB/s | no 60 s endgame stall this run |
+
+The swarm-phase **TTFB fix holds on the magnet path: 3.4 s** (vs 12.5 s in the
+previous magnet run). The remaining end-to-end gap vs aria2c is now **entirely** the
+**~19.4 s metadata-resolution phase** (consistent with the ~18.8 s measured
+2026-08-15 earlier) — the top TODO below.
+
+### Big Buck Bunny magnet — 263.6 MiB, `xs=` exact source + web seed
+
+| Client        | Wall (download) | Metadata resolve | TTFB   | Avg rate | Peak | Notes |
+|---------------|-----------------|------------------|--------|----------|------|-------|
+| **Swiftorrent** | 13.0 s | **0.7 s** (via `xs=` exact source) | **0.2 s** | **20.31 MiB/s** | 24.68 MiB/s | fastest end-to-end by ~5x |
+| aria2c        | 76.6 s end-to-end | (included) | n/a | 4.0 MiB/s (self-reported) | — | much slower than its prior ~13 MiB/s BBB run — web seed appears not to have carried it this time |
+| transmission  | 90.0 s | (included) | 25.8 s | — | 18.93 MB/s | slowest again |
+
+First benchmark where **Swiftorrent wins end-to-end outright** on both start latency
+and transfer: when a magnet carries an `xs=` exact source the whole
+metadata-resolution cost collapses to 0.7 s, and the 0.2 s TTFB + ~20 MiB/s
+(roughly double the prior single-web-seed 10.8 MiB/s run — the magnet path pulled
+peers *and* the web seed together) left aria2c and transmission far behind on the
+same link. Single trial, so the aria2c collapse to 4 MiB/s may be swarm/web-seed
+weather — but Swiftorrent's own numbers are consistent with all prior runs.
+
+---
+
 ## Conclusions
 
 1. **Swiftorrent's swarm transfer engine is already excellent — it beat both reference
