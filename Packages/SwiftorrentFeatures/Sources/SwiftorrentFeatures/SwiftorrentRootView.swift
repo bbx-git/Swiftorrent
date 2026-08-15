@@ -3,7 +3,8 @@ import SwiftorrentDomain
 import UniformTypeIdentifiers
 
 public struct SwiftorrentRootView: View {
-    @State private var session = TorrentSession()
+    @Environment(TorrentSession.self) private var session
+    @Environment(\.openWindow) private var openWindow
     @State private var magnetText = ""
     @State private var importerPresented = false
     @State private var selectedItemID: TorrentItem.ID?
@@ -24,15 +25,15 @@ public struct SwiftorrentRootView: View {
         .fileImporter(isPresented: $importerPresented, allowedContentTypes: [.torrent], allowsMultipleSelection: true) { result in
             if case let .success(urls) = result {
                 for url in urls {
-                    session.addTorrentFile(url)
+                    openAddTorrentWindow(for: session.addTorrentFile(url))
                 }
             }
         }
         .onOpenURL { url in
             if url.isFileURL, url.pathExtension.lowercased() == "torrent" {
-                session.addTorrentFile(url)
+                openAddTorrentWindow(for: session.addTorrentFile(url))
             } else if url.scheme?.lowercased() == "magnet" {
-                session.addMagnet(url.absoluteString)
+                openAddTorrentWindow(for: session.addMagnet(url.absoluteString))
             }
         }
         .alert("Remove Torrent?", isPresented: removalAlertPresented, presenting: pendingRemovalItem) { item in
@@ -48,39 +49,10 @@ public struct SwiftorrentRootView: View {
         } message: { item in
             Text("Remove \"\(item.name)\" only from Swiftorrent, or also delete its downloaded and partial files from the drive?")
         }
-        .sheet(item: reviewingBinding) { item in
-            FileSelectionSheet(
-                item: item,
-                setFileSelected: { fileID, isSelected in
-                    session.setFileSelected(itemID: item.id, fileID: fileID, isSelected: isSelected)
-                },
-                setAllSelected: { isSelected in
-                    session.setAllFilesSelected(itemID: item.id, isSelected: isSelected)
-                },
-                start: { createSubfolder in
-                    session.startDownload(itemID: item.id, createSubfolder: createSubfolder)
-                },
-                cancel: {
-                    session.cancelPending(itemID: item.id)
-                }
-            )
-        }
         .tint(.swiftorrentGraphite)
         .frame(minWidth: 940, minHeight: 620)
         .transparentWindow()
-    }
-
-    /// Surfaces the torrent currently in the add dialog (resolving metadata or
-    /// awaiting file selection). It is not yet in the list. Dismissing the dialog
-    /// (Esc / close) cancels adding that torrent.
-    private var reviewingBinding: Binding<TorrentItem?> {
-        Binding {
-            session.pendingItems.first
-        } set: { newValue in
-            if newValue == nil, let pending = session.pendingItems.first {
-                session.cancelPending(itemID: pending.id)
-            }
-        }
+        .keepsDialogsAboveWhenActivated()
     }
 
     private var removalAlertPresented: Binding<Bool> {
@@ -122,7 +94,7 @@ public struct SwiftorrentRootView: View {
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(3...5)
                 Button("Add Magnet") {
-                    session.addMagnet(magnetText)
+                    openAddTorrentWindow(for: session.addMagnet(magnetText))
                     magnetText = ""
                 }
                 .disabled(magnetText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -161,9 +133,16 @@ public struct SwiftorrentRootView: View {
         .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 340)
     }
 
+    private var downloadRateLimitBinding: Binding<Int?> {
+        Binding(
+            get: { session.downloadRateLimit },
+            set: { session.downloadRateLimit = $0 }
+        )
+    }
+
     private var header: some View {
         HStack {
-            SpeedLimitControl(limit: $session.downloadRateLimit)
+            SpeedLimitControl(limit: downloadRateLimitBinding)
             Spacer()
             Metric(title: "Speed", value: session.downloadSpeedDescription, systemImage: "arrow.down.circle")
             Metric(title: "Active", value: "\(session.items.filter { $0.state == .downloading }.count)", systemImage: "arrow.down.to.line")
@@ -250,6 +229,19 @@ public struct SwiftorrentRootView: View {
             selectedItemID = nil
         }
         pendingRemovalItem = nil
+    }
+
+    // `openWindow` called synchronously from `.onOpenURL` during a cold launch
+    // races the main scene's own launch/activation sequence: the add-torrent
+    // window gets created, but the main window's launch-time activation can
+    // still assert itself afterward and end up in front, leaving the new
+    // dialog open but hidden behind an empty "No torrents yet" list — which
+    // reads as "nothing happened". Deferring to the next run-loop turn lets
+    // the initial launch settle first, so the dialog opens on top as intended.
+    private func openAddTorrentWindow(for itemID: TorrentItem.ID) {
+        Task { @MainActor in
+            openWindow(value: itemID)
+        }
     }
 
     private func chooseFolder() {
@@ -468,147 +460,6 @@ private struct FileRow: View {
     }
 }
 
-private struct FileSelectionSheet: View {
-    let item: TorrentItem
-    let setFileSelected: (Int, Bool) -> Void
-    let setAllSelected: (Bool) -> Void
-    let start: (Bool) -> Void
-    let cancel: () -> Void
-
-    @State private var createSubfolder = true
-
-    private var selectedCount: Int { item.files.filter(\.isSelected).count }
-    private var selectedBytes: Int64 {
-        item.files.filter(\.isSelected).reduce(Int64(0)) { $0 + $1.totalBytes }
-    }
-    private var selectedBytesDescription: String {
-        ByteCountFormatter.string(fromByteCount: selectedBytes, countStyle: .file)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(item.state == .reviewing ? "Select Files to Download" : "Add Torrent")
-                    .font(.title3.bold())
-                Text(item.name)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-            }
-
-            switch item.state {
-            case .reviewing:
-                reviewBody
-            case .failed:
-                failureBody
-            default:
-                resolvingBody
-            }
-        }
-        .padding(24)
-        .frame(width: 520)
-    }
-
-    @ViewBuilder private var reviewBody: some View {
-        HStack {
-            Text("\(selectedCount) of \(item.files.count) files · \(selectedBytesDescription)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button("Select All") { setAllSelected(true) }
-                .buttonStyle(.link)
-            Button("Deselect All") { setAllSelected(false) }
-                .buttonStyle(.link)
-        }
-
-        ScrollView {
-            LazyVStack(spacing: 4) {
-                ForEach(item.files) { file in
-                    HStack(spacing: 10) {
-                        Toggle(isOn: Binding(get: { file.isSelected }, set: { setFileSelected(file.id, $0) })) {
-                            EmptyView()
-                        }
-                        .toggleStyle(.checkbox)
-                        .labelsHidden()
-
-                        Text(file.path)
-                            .font(.caption)
-                            .foregroundStyle(file.isSelected ? .primary : .secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                        Text(file.totalDescription)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                    .padding(.vertical, 2)
-                }
-            }
-            .padding(.vertical, 4)
-        }
-        .frame(minHeight: 180, maxHeight: 320)
-        .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
-
-        if item.createsEnclosingDirectory {
-            Toggle("Create a subfolder named \"\(item.name)\"", isOn: $createSubfolder)
-                .toggleStyle(.checkbox)
-                .font(.callout)
-        }
-
-        HStack {
-            Button("Cancel", role: .cancel) { cancel() }
-                .keyboardShortcut(.cancelAction)
-                .buttonStyle(.bordered)
-                .tint(.primary)
-            Spacer()
-            Button("Download") { start(createSubfolder) }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .tint(.swiftorrentGraphite)
-                .disabled(selectedCount == 0)
-        }
-    }
-
-    @ViewBuilder private var resolvingBody: some View {
-        HStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.small)
-            Text(item.status)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 24)
-
-        HStack {
-            Spacer()
-            Button("Cancel", role: .cancel) { cancel() }
-                .keyboardShortcut(.cancelAction)
-                .buttonStyle(.bordered)
-                .tint(.primary)
-        }
-    }
-
-    @ViewBuilder private var failureBody: some View {
-        Label(item.status, systemImage: "exclamationmark.triangle.fill")
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 24)
-
-        HStack {
-            Spacer()
-            Button("Close") { cancel() }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.bordered)
-                .tint(.primary)
-        }
-    }
-}
-
 /// Header control for the global download-speed cap: a menu of presets plus a
 /// "Custom…" popover where the user types an exact value in KB/s or MB/s. The
 /// limit is bytes per second; `nil` means unlimited.
@@ -757,7 +608,7 @@ private struct Metric: View {
     }
 }
 
-private extension Color {
+extension Color {
     static let swiftorrentGraphite = Color(red: 0.18, green: 0.18, blue: 0.19)
     static let swiftorrentSmoke = Color(red: 0.46, green: 0.46, blue: 0.48)
     static let swiftorrentPanel = Color.black.opacity(0.08)

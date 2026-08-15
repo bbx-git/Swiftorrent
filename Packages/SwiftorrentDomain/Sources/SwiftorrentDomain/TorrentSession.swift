@@ -146,7 +146,8 @@ public final class TorrentSession {
         persist()
     }
 
-    public func addTorrentFile(_ url: URL) {
+    @discardableResult
+    public func addTorrentFile(_ url: URL) -> TorrentItem.ID {
         var item = TorrentItem(name: url.lastPathComponent, source: .torrentFile(url), destination: destination, totalBytes: 0)
         item.status = "Reading torrent…"
         let id = item.id
@@ -165,9 +166,11 @@ public final class TorrentSession {
                 failPending(id, message: error.localizedDescription)
             }
         }
+        return id
     }
 
-    public func addMagnet(_ text: String) {
+    @discardableResult
+    public func addMagnet(_ text: String) -> TorrentItem.ID {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var item = TorrentItem(name: "Magnet link", source: .magnet(trimmedText), destination: destination, totalBytes: 0)
         item.status = "Resolving metadata…"
@@ -195,6 +198,7 @@ public final class TorrentSession {
                 failPending(id, message: error.localizedDescription)
             }
         }
+        return id
     }
 
     public func remove(_ item: TorrentItem, deleteFiles: Bool = false) {

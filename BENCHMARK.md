@@ -158,6 +158,39 @@ and under a 2 GB size cap.
 
 ---
 
+## Results — 2026-08-15 (post TTFB fix, single trial, Debian netinst)
+
+Re-ran the same Debian 13.6.0 netinst `.torrent` (755 MiB, pure peer swarm) after
+adding a **fast-start sentinel** to `TorrentDownloader.collectPeers`: once a short
+3 s grace period elapses, the swarm starts as soon as *any* peer is known instead of
+waiting out the full 12 s deadline for every source (in practice always the DHT) to
+report. Late/DHT peers still arrive afterward via the existing swarm supervisor
+re-announce.
+
+| Metric | Before (2026-08-14) | After (2026-08-15) |
+|---|---|---|
+| Time to first byte | 12.7 s | **3.7 s** |
+| Wall time (755 MiB) | 27.3 s | **17.3 s** |
+| Average throughput | ~52 MiB/s | 43.6 MiB/s |
+| Peak (1 s) | 60.4 MiB/s | 71.3 MiB/s |
+
+TTFB target (< 4 s) hit without hurting steady-state throughput — average dipped
+slightly (single-trial noise; peak is actually higher this run) but wall time still
+dropped by ~10 s because first byte lands over 3x sooner. 61 offline tests green
+(no regression — the mocked tests' trackers/DHT both answer near-instantly, so
+`reported >= realSources` still wins the race before the fast-start grace period
+matters).
+
+**Deliberately left alone:** `MagnetMetadataResolver.collectPeers` has the same
+deadline-sentinel shape but a documented rationale for its high threshold (300 peers
+before considering an early stop) — metadata-serving peers are often reachable only
+via the DHT, so applying the same "any peer + short grace period" fast-start there
+risks tanking magnet-resolve success rate rather than just its speed. Left as a
+candidate for a future session with room to live-validate the tradeoff, not applied
+blindly by analogy.
+
+---
+
 ## Conclusions
 
 1. **Swiftorrent's swarm transfer engine is already excellent — it beat both reference
@@ -189,13 +222,14 @@ and under a 2 GB size cap.
 
 ## TODO / next session (in priority order)
 
-- [ ] **Cut time-to-first-byte (highest value).** Start the swarm as soon as a small
-      number of peers are in hand instead of waiting the full 12 s deadline. Levers in
-      `SwiftorrentCore/TorrentDownloader.swift`: lower `peerDiscoveryDeadline` (12 s) and/or
-      `enoughPeersToStart` (100), or begin downloading on the first ~10-20 peers and let
-      the swarm supervisor's re-announce top the pool up. **Validate with
-      `swiftorrent-bench` — this is a Core change, so no Xcode needed.** Target: TTFB
-      < 4 s without hurting steady-state throughput.
+- [x] **Cut time-to-first-byte (highest value) — DONE 2026-08-15.** Added a fast-start
+      sentinel to `TorrentDownloader.collectPeers`: 12.7 s → 3.7 s TTFB. See the
+      "Results — 2026-08-15" section above.
+- [ ] **Magnet-path metadata-resolution phase (~18.8 s), separate from the above.**
+      `MagnetMetadataResolver.collectPeers` has the same deadline-sentinel shape but a
+      documented reason for its high peer threshold (metadata-serving peers are often
+      DHT-only) — needs careful tuning + live validation of the *success rate*, not
+      just speed, before changing. See the "Deliberately left alone" note above.
 - [ ] **Parallelize web-seed connections** (secondary) to close the ~13 vs 10.8 MiB/s
       gap on web-seed torrents. See `WebSeedDownloader`.
 - [ ] **Make the benchmark statistically sound:** have `benchmark.sh` do N trials and
@@ -204,10 +238,9 @@ and under a 2 GB size cap.
       forced down the peer pipeline for an apples-to-apples swarm comparison with
       transmission on the same content.
 
-## Blocker note
+## Blocker note (RESOLVED 2026-08-15)
 
-Full Xcode is currently uninstalled (`xcode-select -p` → CommandLineTools), so the
-**SwiftUI app can't be built or deployed** (SwiftUI macros missing) — but the bench
-harness and any `SwiftorrentCore` engine change build and run fine. Reinstall Xcode +
-`sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` to restore app
-build/deploy. See `SESSION_STATE.md`.
+Full Xcode was briefly uninstalled; the SwiftUI app now builds via **Xcode-beta 27.0**
+(`xcode-select -p` → `/Applications/Xcode-beta.app/Contents/Developer`) — on a macOS
+beta, only the matching Xcode beta has working SwiftUI macro plugins. App build/deploy
+via `Scripts/package_app.sh` is back to normal. See `SESSION_STATE.md`.

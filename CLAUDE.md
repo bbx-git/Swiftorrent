@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-**Method:** Use the Write tool to overwrite .swift and .md files. **No sed!**
+**Method:** For small, surgical changes to .swift and .md files, use targeted find/replace edits. For larger rewrites, overwrite the whole file instead. **No sed!** (regex-based find/replace is too easy to mismatch against Swift's brace-heavy structure and silently corrupt code).
 
 Act as a Senior iOS Engineer. Use **Swift 6.3** and the latest SwiftUI standards. Prioritize the **Observation framework**, **Swift Concurrency** (async/await), and **Swift Testing**. Avoid deprecated patterns like `@Published` or `XCTest` unless explicitly asked.
 

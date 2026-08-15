@@ -32,7 +32,8 @@ let package = Package(
         .executableTarget(
             name: "SwiftorrentApp",
             dependencies: [
-                "SwiftorrentFeatures"
+                "SwiftorrentFeatures",
+                "SwiftorrentDomain"
             ],
             path: "App/Sources/SwiftorrentApp"
         ),

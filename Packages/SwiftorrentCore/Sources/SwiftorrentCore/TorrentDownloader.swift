@@ -31,6 +31,14 @@ public struct TorrentDownloader: Sendable {
     /// Hard cap on initial peer discovery; late peers (incl. the DHT) still arrive
     /// via the swarm supervisor's periodic re-announce.
     private static let peerDiscoveryDeadline: Duration = .seconds(12)
+    /// Once this short grace period has elapsed, stop waiting for stragglers (in
+    /// practice almost always the DHT, which the swarm supervisor's re-announce
+    /// will fold in later anyway) as soon as *any* peer is known — trackers
+    /// typically answer in well under a second, so gating first byte on the DHT's
+    /// much slower query budget wastes most of `peerDiscoveryDeadline` for no
+    /// benefit. A pure-DHT magnet (no trackers, zero peers yet) is unaffected:
+    /// this only fires once at least one peer has already been found.
+    private static let fastStartDeadline: Duration = .seconds(3)
 
     public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient(), session: URLSession = .shared, rateLimiter: RateLimiter? = nil) {
         self.trackerClient = trackerClient
@@ -190,6 +198,15 @@ public struct TorrentDownloader: Sendable {
         await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: selectablePieces)))
     }
 
+    /// A peer-discovery task-group signal: either a source (tracker or DHT)
+    /// reporting in, the short fast-start grace period elapsing, or the hard
+    /// deadline firing.
+    private enum CollectSignal {
+        case source(Result<[PeerEndpoint], Error>)
+        case fastStartElapsed
+        case deadline
+    }
+
     func collectPeers(
         for metainfo: TorrentMetainfo,
         peerID: Data,
@@ -201,7 +218,7 @@ public struct TorrentDownloader: Sendable {
         var peers: Set<PeerEndpoint> = []
         var lastError: Error?
 
-        await withTaskGroup(of: Optional<Result<[PeerEndpoint], Error>>.self) { group in
+        await withTaskGroup(of: CollectSignal.self) { group in
             for url in metainfo.announceURLs {
                 group.addTask {
                     do {
@@ -214,9 +231,9 @@ public struct TorrentDownloader: Sendable {
                             left: left ?? metainfo.totalSize,
                             event: event
                         )
-                        return .success(try await trackerClient.announce(request))
+                        return .source(.success(try await trackerClient.announce(request)))
                     } catch {
-                        return .failure(error)
+                        return .source(.failure(error))
                     }
                 }
             }
@@ -225,39 +242,59 @@ public struct TorrentDownloader: Sendable {
                 group.addTask {
                     do {
                         try Task.checkCancellation()
-                        return .success(try await dhtClient.peers(for: metainfo.infoHash))
+                        return .source(.success(try await dhtClient.peers(for: metainfo.infoHash)))
                     } catch {
-                        return .failure(error)
+                        return .source(.failure(error))
                     }
                 }
             }
 
+            // Fast-start sentinel: once this short grace period elapses, stop
+            // waiting on stragglers (usually the DHT) as soon as we already have
+            // some peers to work with.
+            group.addTask {
+                try? await Task.sleep(for: Self.fastStartDeadline)
+                return .fastStartElapsed
+            }
+
             // Deadline sentinel: don't let the whole download wait on the slowest
             // source (usually the DHT). We stop early once we have enough peers, all
-            // real sources have reported, or this fires — whichever comes first.
+            // real sources have reported, the fast-start grace period has passed
+            // with peers in hand, or this fires — whichever comes first.
             group.addTask {
                 try? await Task.sleep(for: Self.peerDiscoveryDeadline)
-                return nil
+                return .deadline
             }
 
             let realSources = metainfo.announceURLs.count + (includeDHT ? 1 : 0)
             var reported = 0
-            for await result in group {
+            var fastStartElapsed = false
+            collectLoop: for await signal in group {
                 if Task.isCancelled {
-                    group.cancelAll()
-                    break
+                    break collectLoop
                 }
-                guard let result else { break } // deadline reached
-                reported += 1
-                switch result {
-                case let .success(endpoints):
-                    peers.formUnion(endpoints)
-                case let .failure(error):
-                    lastError = error
+                switch signal {
+                case .deadline:
+                    break collectLoop
+                case .fastStartElapsed:
+                    fastStartElapsed = true
+                case let .source(result):
+                    reported += 1
+                    switch result {
+                    case let .success(endpoints):
+                        peers.formUnion(endpoints)
+                    case let .failure(error):
+                        lastError = error
+                    }
                 }
-                // Stop as soon as we have plenty, or every tracker/DHT has answered
-                // (so a fast small swarm isn't held back by the deadline sentinel).
-                if peers.count >= Self.enoughPeersToStart || reported >= realSources { break }
+                // Stop as soon as we have plenty, every tracker/DHT has answered, or
+                // the fast-start grace period has passed and we already have some
+                // peers (so first byte isn't gated on a slow straggler, typically
+                // the DHT — its peers still arrive later via the swarm supervisor's
+                // periodic re-announce).
+                if peers.count >= Self.enoughPeersToStart || reported >= realSources || (fastStartElapsed && !peers.isEmpty) {
+                    break collectLoop
+                }
             }
             group.cancelAll()
         }
