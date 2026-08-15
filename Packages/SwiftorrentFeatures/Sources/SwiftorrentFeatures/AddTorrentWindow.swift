@@ -48,8 +48,9 @@ public struct AddTorrentWindow: View {
             .navigationTitle(item.name)
             .registersAsDialogWindow()
             // Catches every dismissal path that isn't the explicit Cancel/Download
-            // buttons below (titlebar close, ⌘W): `cancelPending` is idempotent, so
-            // this is a safe no-op if the item was already removed by one of them.
+            // buttons below (titlebar close, ⌘W). This also fires when Download
+            // moves the item out of `pendingItems`; `cancelPending` ignores
+            // non-pending items, so the just-launched download is untouched.
             .onDisappear {
                 session.cancelPending(itemID: itemID)
             }

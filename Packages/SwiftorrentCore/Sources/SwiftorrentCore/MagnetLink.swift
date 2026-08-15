@@ -45,10 +45,20 @@ public struct MagnetLinkParser: Sendable {
         var webSeeds: [URL] = []
         var infoHash: Data?
 
+        // `dn` is parsed from the raw (still percent-encoded) query because
+        // magnet display names conventionally use form encoding, where `+`
+        // means space; a literal plus arrives as `%2B`. `URLComponents`'
+        // decoded `queryItems` can't distinguish the two.
+        for item in components.percentEncodedQueryItems ?? [] where item.name == "dn" {
+            displayName = item.value?
+                .replacingOccurrences(of: "+", with: "%20")
+                .removingPercentEncoding
+        }
+
         for item in components.queryItems ?? [] {
             switch item.name {
             case "dn":
-                displayName = item.value
+                continue
             case "tr":
                 if let value = item.value, let url = URL(string: value) {
                     trackers.append(url)

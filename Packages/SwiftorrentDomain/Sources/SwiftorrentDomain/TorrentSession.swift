@@ -215,7 +215,11 @@ public final class TorrentSession {
 
     /// Discards a torrent still in the add dialog (resolution failed, or the user
     /// dismissed the dialog without starting). Nothing was written to disk yet.
+    /// A no-op for anything not in `pendingItems`: once `startDownload` moves the
+    /// item into `items`, `tasks[itemID]` holds the live download task, so the
+    /// add window's catch-all `.onDisappear` cancel must not touch it.
     public func cancelPending(itemID: TorrentItem.ID) {
+        guard pendingItems.contains(where: { $0.id == itemID }) else { return }
         tasks[itemID]?.cancel()
         tasks[itemID] = nil
         metainfos[itemID] = nil

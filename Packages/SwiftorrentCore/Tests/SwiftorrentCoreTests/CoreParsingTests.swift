@@ -62,6 +62,17 @@ struct CoreParsingTests {
         #expect(magnet.webSeeds == [URL(string: "https://example.invalid/downloads/")!])
     }
 
+    @Test("Magnet parser decodes form-encoded display names")
+    func magnetFormEncodedDisplayName() throws {
+        // Torrent sites conventionally form-encode `dn`: `+` means space, a
+        // literal plus arrives as `%2B`.
+        let magnet = try MagnetLinkParser().parse(
+            "magnet:?xt=urn:btih:6A8F134C989C1ECF961CED4AC0B32CC5B615B287&dn=Example+Movie+%282026%29+C%2B%2B+1080p&tr=udp%3A%2F%2Ftracker.example.invalid%3A1337%2Fannounce"
+        )
+        #expect(magnet.displayName == "Example Movie (2026) C++ 1080p")
+        #expect(magnet.trackers.count == 1)
+    }
+
     @Test("Bencode encoder sorts dictionary keys")
     func bencodeEncoder() {
         let encoded = BencodeEncoder.encode([
