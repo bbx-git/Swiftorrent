@@ -298,6 +298,7 @@ public struct TrackerClient: Sendable {
                     return nil
                 }
                 guard portValue > 0, portValue <= Int64(UInt16.max) else { return nil }
+                guard Self.isDialable(host: host) else { return nil }
                 return PeerEndpoint(host: host, port: UInt16(portValue))
             }
         }
@@ -309,9 +310,27 @@ public struct TrackerClient: Sendable {
         stride(from: 0, to: data.count - (data.count % 6), by: 6).compactMap { offset in
             let host = "\(data[offset]).\(data[offset + 1]).\(data[offset + 2]).\(data[offset + 3])"
             let port = UInt16(data[offset + 4]) << 8 | UInt16(data[offset + 5])
-            guard port > 0 else { return nil }
+            guard port > 0, isDialable(ipv4: data[offset], data[offset + 1], data[offset + 2], data[offset + 3]) else { return nil }
             return PeerEndpoint(host: host, port: port)
         }
+    }
+
+    /// Whether an IPv4 address could be a real unicast peer. A hostile tracker, PEX
+    /// peer or DHT node can list unspecified, multicast, broadcast or reserved
+    /// addresses; dialling them only wastes a connection slot. Loopback and
+    /// private ranges stay valid (local swarms).
+    static func isDialable(ipv4 a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Bool {
+        if a == 0 { return false }      // 0.0.0.0/8, "this network"
+        if a >= 224 { return false }    // multicast, reserved and broadcast
+        return true
+    }
+
+    /// Applies `isDialable(ipv4:)` to a dotted-quad host string; anything that is not
+    /// an IPv4 literal (a hostname, IPv6) is left for the connection to resolve.
+    static func isDialable(host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false).compactMap { UInt8($0) }
+        guard parts.count == 4, host.split(separator: ".").count == 4 else { return true }
+        return isDialable(ipv4: parts[0], parts[1], parts[2], parts[3])
     }
 
     static func percentEncode(_ data: Data) -> String {

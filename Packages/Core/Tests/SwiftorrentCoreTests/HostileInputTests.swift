@@ -345,3 +345,49 @@ struct HostilePeerTests {
         }
     }
 }
+
+@Suite("Peer address hygiene")
+struct PeerAddressTests {
+    @Test("Compact peers that can never be dialled are dropped")
+    func compactPeersDropUnroutable() {
+        let peers = TrackerClient.parseCompactPeers(Data([
+            0, 0, 0, 0, 0x1A, 0xE1,          // unspecified
+            224, 0, 0, 1, 0x1A, 0xE1,        // multicast
+            239, 255, 255, 250, 0x1A, 0xE1,  // multicast
+            255, 255, 255, 255, 0x1A, 0xE1,  // broadcast
+            240, 0, 0, 1, 0x1A, 0xE1,        // reserved
+            8, 8, 8, 8, 0x1A, 0xE1,          // public
+            192, 168, 1, 10, 0x1A, 0xE1,     // LAN peers are legitimate
+            127, 0, 0, 1, 0x1A, 0xE1         // loopback is kept (local swarms, tests)
+        ]))
+
+        #expect(peers.map(\.host) == ["8.8.8.8", "192.168.1.10", "127.0.0.1"])
+    }
+
+    @Test("DHT nodes that can never be dialled are dropped")
+    func dhtNodesDropUnroutable() {
+        var data = Data()
+        for host in [[0, 0, 0, 0], [224, 0, 0, 1], [255, 255, 255, 255], [1, 2, 3, 4]] as [[UInt8]] {
+            data.append(Data(repeating: 9, count: 20))
+            data.append(contentsOf: host)
+            data.append(contentsOf: [0x1A, 0xE1])
+        }
+
+        let nodes = DHTClient.parseCompactIPv4Nodes(data)
+
+        #expect(nodes.map(\.host) == ["1.2.3.4"])
+    }
+
+    @Test("The swarm reserve stops growing at its cap")
+    func peerSupplyIsCapped() async {
+        let supply = PeerSupply(peers: [])
+        let flood = (0..<20_000).map { PeerEndpoint(host: "10.\($0 >> 16 & 255).\($0 >> 8 & 255).\($0 & 255)", port: 6881) }
+
+        await supply.add(flood)
+        var handed = 0
+        while await supply.next() != nil { handed += 1 }
+
+        #expect(handed <= PeerSupply.maxPeers)
+        #expect(handed > 0)
+    }
+}

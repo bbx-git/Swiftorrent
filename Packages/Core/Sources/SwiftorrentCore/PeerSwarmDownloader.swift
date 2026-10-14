@@ -350,6 +350,10 @@ actor ActivePeerCounter {
 /// peer-pool replenishment: as workers' peers die they pull fresh ones from here
 /// without ever handing the same endpoint to two workers.
 actor PeerSupply {
+    /// Most endpoints ever queued. PEX and re-announces keep feeding the reserve
+    /// for the life of a download; a hostile peer must not make it grow forever.
+    static let maxPeers = 5_000
+
     private var remaining: [PeerEndpoint]
     private var index = 0
     /// Every endpoint ever queued, so PEX-discovered peers that are already in the
@@ -380,6 +384,7 @@ actor PeerSupply {
     func add(_ peers: [PeerEndpoint]) -> Int {
         var added = 0
         for peer in peers where !seen.contains(peer) {
+            guard seen.count < Self.maxPeers else { break }
             seen.insert(peer)
             remaining.append(peer)
             added += 1

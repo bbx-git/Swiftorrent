@@ -297,7 +297,10 @@ public struct DHTClient: Sendable {
             let host = "\(data[hostOffset]).\(data[hostOffset + 1]).\(data[hostOffset + 2]).\(data[hostOffset + 3])"
             let portOffset = offset + 24
             let port = UInt16(data[portOffset]) << 8 | UInt16(data[portOffset + 1])
-            guard port > 0 else { return nil }
+            guard port > 0,
+                  TrackerClient.isDialable(ipv4: data[hostOffset], data[hostOffset + 1], data[hostOffset + 2], data[hostOffset + 3]) else {
+                return nil
+            }
             return DHTNodeEndpoint(host: host, port: port, id: id)
         }
     }
