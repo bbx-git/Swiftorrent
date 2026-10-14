@@ -12,6 +12,7 @@ import SwiftorrentCore
 //   swiftorrent-bench --magnet "<magnet:...>" [--dest <dir>] [--label <name>]
 //   swiftorrent-bench --magnet "<magnet:...>" --resolve-only [--label <name>]
 //   swiftorrent-bench --torrent <path> --strip-web-seeds   (force the peer swarm)
+//   swiftorrent-bench --torrent <path> --utp-probe          (count peers reachable over TCP / uTP)
 //
 // A fresh unique destination is used per run unless --dest is given, so every
 // benchmark starts from a cold cache.
@@ -33,6 +34,7 @@ struct Args {
     var label: String = "swiftorrent"
     var resolveOnly = false
     var stripWebSeeds = false
+    var utpProbe = false
 }
 
 func parseArgs() -> Args {
@@ -46,6 +48,7 @@ func parseArgs() -> Args {
         case "--label": args.label = it.next() ?? args.label
         case "--resolve-only": args.resolveOnly = true
         case "--strip-web-seeds": args.stripWebSeeds = true
+        case "--utp-probe": args.utpProbe = true
         default:
             FileHandle.standardError.write(Data("Unknown argument: \(flag)\n".utf8))
         }
@@ -169,6 +172,12 @@ do {
 if args.resolveOnly {
     FileHandle.standardError.write(Data("--resolve-only requires --magnet\n".utf8))
     exit(2)
+}
+
+if args.utpProbe {
+    let result = await UTPProbe.run(metainfo: metainfo, peerID: TorrentDownloader.makePeerID())
+    print("UTPPROBE \(args.label) peers=\(result.peers) tcp=\(result.tcpReachable) utp=\(result.utpReachable) utp_only=\(result.utpOnly)")
+    exit(0)
 }
 
 if args.stripWebSeeds {
