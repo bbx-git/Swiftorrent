@@ -1354,18 +1354,18 @@ private struct StreamingThenHangingDHT: DHTPeerFinding {
 
 /// Big-endian 4-byte encoding of a small non-negative integer, for scripting wire
 /// messages in tests.
-private func be32Data(_ value: Int) -> Data {
+func be32Data(_ value: Int) -> Data {
     let v = UInt32(value)
     return Data([UInt8(v >> 24 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 8 & 0xff), UInt8(v & 0xff)])
 }
 
 /// A length-prefixed BitTorrent wire message: `<len><id><payload>`.
-private func wireFrame(_ id: UInt8, _ payload: Data = Data()) -> Data {
+func wireFrame(_ id: UInt8, _ payload: Data = Data()) -> Data {
     be32Data(payload.count + 1) + Data([id]) + payload
 }
 
 /// Starts an `NWListener` and resolves once it is ready, returning its bound port.
-private func startLoopbackListener(_ listener: NWListener) async throws -> NWEndpoint.Port {
+func startLoopbackListener(_ listener: NWListener) async throws -> NWEndpoint.Port {
     try await withCheckedThrowingContinuation { continuation in
         listener.stateUpdateHandler = { state in
             switch state {
@@ -1387,7 +1387,7 @@ private func startLoopbackListener(_ listener: NWListener) async throws -> NWEnd
 
 /// Hands out piece indices 0..<total once each, then nil — a scripted piece picker
 /// for driving `downloadPieces` in tests.
-private actor SequentialClaimer {
+actor SequentialClaimer {
     private var next = 0
     private let total: Int
     init(total: Int) { self.total = total }
@@ -1405,7 +1405,7 @@ private actor PieceSink {
 }
 
 /// Collects the pieces `downloadPieces` hands back via `onReturnPiece`.
-private actor ReturnedPieces {
+actor ReturnedPieces {
     private(set) var all: [Int] = []
     func add(_ index: Int) { all.append(index) }
 }
@@ -1415,20 +1415,32 @@ private actor ReturnedPieces {
 /// requests) followed by `postHandshake` (a bitfield and whatever choke/unchoke
 /// script the test needs). When `respondToRequests` is set it parses inbound
 /// `request` messages and serves the matching block from `pieces`.
-private final class RespondingSeed: @unchecked Sendable {
+final class RespondingSeed: @unchecked Sendable {
     private let infoHash: Data
     private let pieces: [Data]
     private let postHandshake: Data
     private let respondToRequests: Bool
     private let unchokeAfter: TimeInterval?
+    /// When set, sends a `have 0` this often for as long as the connection lives:
+    /// a chatty peer that never unchokes.
+    private let haveEvery: TimeInterval?
     private let queue = DispatchQueue(label: "responding-seed")
 
-    init(infoHash: Data, pieces: [Data], postHandshake: Data, respondToRequests: Bool, unchokeAfter: TimeInterval? = nil) {
+    init(infoHash: Data, pieces: [Data], postHandshake: Data, respondToRequests: Bool, unchokeAfter: TimeInterval? = nil, haveEvery: TimeInterval? = nil) {
         self.infoHash = infoHash
         self.pieces = pieces
         self.postHandshake = postHandshake
         self.respondToRequests = respondToRequests
         self.unchokeAfter = unchokeAfter
+        self.haveEvery = haveEvery
+    }
+
+    private func sendHaves(_ connection: NWConnection, every interval: TimeInterval) {
+        queue.asyncAfter(deadline: .now() + interval) { [self] in
+            guard connection.state != .cancelled else { return }
+            connection.send(content: wireFrame(4, be32Data(0)), completion: .contentProcessed { _ in })
+            sendHaves(connection, every: interval)
+        }
     }
 
     /// Per-connection parse state. The first 68 bytes (the client's handshake) are
@@ -1452,6 +1464,7 @@ private final class RespondingSeed: @unchecked Sendable {
                         connection.send(content: wireFrame(1), completion: .contentProcessed { _ in })
                     }
                 }
+                if let haveEvery { sendHaves(connection, every: haveEvery) }
                 receive(connection, state)
             }
         }
@@ -1495,7 +1508,7 @@ private final class RespondingSeed: @unchecked Sendable {
 
 /// Retains accepted loopback connections so they stay open for the duration of
 /// a timeout test, then tears them down on cleanup.
-private final class AcceptedConnections: @unchecked Sendable {
+final class AcceptedConnections: @unchecked Sendable {
     private let lock = NSLock()
     private var connections: [NWConnection] = []
 

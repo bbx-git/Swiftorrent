@@ -165,12 +165,13 @@ struct PeerSwarmDownloader: Sendable {
                 continue
             }
 
-            let activeNow = await context.active.increment()
-            await context.progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: activeNow), downloadedBytes: await coordinator.downloadedBytes, totalBytes: context.downloadTotal))
+            _ = await context.active.increment(client)
+            let peers = await context.active.snapshot()
+            await context.progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: await coordinator.downloadedBytes, totalBytes: context.downloadTotal, connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
 
             let outcome = await drainPeer(client: client, supply: supply, coordinator: coordinator, writer: writer, context: context)
             await client.close()
-            _ = await context.active.decrement()
+            await context.active.decrement(client)
             switch outcome {
             case .cancelled:
                 return CancellationError()
@@ -270,7 +271,8 @@ struct PeerSwarmDownloader: Sendable {
                     try await writer.write(piece: piece, pieceIndex: pieceIndex)
                     let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
                     guard let perFileBytes else { return }
-                    await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: await active.count), downloadedBytes: downloaded, totalBytes: downloadTotal, files: mapper.snapshot(perFileBytes: perFileBytes)))
+                    let peers = await active.snapshot()
+                    await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: downloaded, totalBytes: downloadTotal, files: mapper.snapshot(perFileBytes: perFileBytes), connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
                 },
                 onReturnPiece: { pieceIndex in
                     await coordinator.returnPiece(pieceIndex)
@@ -280,7 +282,8 @@ struct PeerSwarmDownloader: Sendable {
                     // refresh the verified total on a throttle so the row stays lively.
                     await limiter?.consume(blockBytes)
                     if let verified = await coordinator.progressTick() {
-                        await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: await active.count), downloadedBytes: verified, totalBytes: downloadTotal))
+                        let peers = await active.snapshot()
+                        await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: verified, totalBytes: downloadTotal, connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
                     }
                 },
                 onPeersDiscovered: { peers in
@@ -342,9 +345,23 @@ private struct WorkerContext: Sendable {
 /// the same aggregate status rather than each worker's momentary per-peer state,
 /// which otherwise flickers between "Connecting" and "Downloading".
 actor ActivePeerCounter {
-    private(set) var count = 0
-    func increment() -> Int { count += 1; return count }
-    func decrement() -> Int { count = max(0, count - 1); return count }
+    private var clients: [ObjectIdentifier: PeerWireClient] = [:]
+    var count: Int { clients.count }
+    func increment(_ client: PeerWireClient) -> Int {
+        clients[ObjectIdentifier(client)] = client
+        return clients.count
+    }
+    func decrement(_ client: PeerWireClient) {
+        clients.removeValue(forKey: ObjectIdentifier(client))
+    }
+    /// Connected and unchoked-us counts, read live from the clients: tells a swarm
+    /// full of peers apart from one where few of them will send us data.
+    func snapshot() async -> (connected: Int, unchoked: Int) {
+        let live = Array(clients.values)
+        var unchoked = 0
+        for client in live where await !client.isChokingUs { unchoked += 1 }
+        return (live.count, unchoked)
+    }
 }
 
 /// Shared reserve of candidate peers handed out to workers one at a time. Backs
@@ -371,6 +388,9 @@ actor PeerSupply {
     }
 
     var isFinished: Bool { finished }
+
+    /// Whether any peer is still waiting to be handed out.
+    var hasUntriedPeers: Bool { index < remaining.count }
 
     func next() -> PeerEndpoint? {
         guard index < remaining.count else { return nil }

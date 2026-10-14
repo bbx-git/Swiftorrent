@@ -27,16 +27,22 @@ public struct TorrentDownloadProgress: Sendable {
     /// frequent status-only ticks (connecting, contacting trackers) don't have
     /// to recompute the whole table; consumers keep the last non-empty value.
     public let files: [TorrentFileProgress]
+    /// Peers connected, and how many of them have unchoked us (0 outside the
+    /// peer swarm phase).
+    public let connectedPeers: Int
+    public let unchokedPeers: Int
 
     public var fractionCompleted: Double {
         guard totalBytes > 0 else { return 0 }
         return min(1, max(0, Double(downloadedBytes) / Double(totalBytes)))
     }
 
-    public init(status: String, downloadedBytes: Int64, totalBytes: Int64, files: [TorrentFileProgress] = []) {
+    public init(status: String, downloadedBytes: Int64, totalBytes: Int64, files: [TorrentFileProgress] = [], connectedPeers: Int = 0, unchokedPeers: Int = 0) {
         self.status = status
         self.downloadedBytes = downloadedBytes
         self.totalBytes = totalBytes
         self.files = files
+        self.connectedPeers = connectedPeers
+        self.unchokedPeers = unchokedPeers
     }
 }

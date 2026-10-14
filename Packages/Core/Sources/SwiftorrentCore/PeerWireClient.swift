@@ -39,6 +39,11 @@ public actor PeerWireClient {
     /// under the ~2-minute peer keep-alive interval so a still-alive peer that
     /// keep-alives is retained while a truly dead socket is reaped.
     public static let idleTimeoutSeconds: TimeInterval = 90
+    /// Choke timeout: a peer that has kept us choked this long gives its slot to a
+    /// not-yet-tried peer from the reserve, even if it keeps sending HAVEs or
+    /// keep-alives (which `idleTimeout` alone cannot see through). Without waiting
+    /// peers the choked peer is kept.
+    public static let chokeTimeoutSeconds: TimeInterval = 60
 
     /// Which transports a connection may use. `.auto` is the default; the other
     /// two exist so the benchmark can measure each transport on its own.
@@ -101,6 +106,8 @@ public actor PeerWireClient {
     /// scanning without losing the payload bytes that follow.
     var inputBuffer = [UInt8]()
     var isChoked = true
+    /// Read-only view of `isChoked` for the swarm's unchoked-peer count.
+    var isChokingUs: Bool { isChoked }
     var peerSupportsExtensions = false
     var peerMetadataExtensionID: UInt8?
     var metadataSize: Int?

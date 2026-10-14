@@ -51,7 +51,9 @@ extension PeerWireClient {
         onReturnPiece: @Sendable (Int) async -> Void,
         onBlock: (@Sendable (Int) async -> Void)? = nil,
         onPeersDiscovered: (@Sendable ([PeerEndpoint]) async -> Void)? = nil,
-        completedElsewhere: (@Sendable (_ held: Set<Int>) async -> Set<Int>)? = nil
+        completedElsewhere: (@Sendable (_ held: Set<Int>) async -> Set<Int>)? = nil,
+        chokeTimeout: TimeInterval? = nil,
+        hasUntriedPeers: (@Sendable () async -> Bool)? = nil
     ) async throws {
         if let pieceCount { knownPieceCount = pieceCount }
         var active: [Int: PieceAssembly] = [:]           // claimed, still assembling
@@ -73,6 +75,8 @@ extension PeerWireClient {
         // one). The snub deadline runs from here and is NOT extended by keep-alives
         // or other chatter, so a peer cannot hold a worker slot without sending data.
         var lastDataAt = clock.now
+        // When we were last choked: `chokeTimeout` runs from here.
+        var chokedSince = clock.now
 
         func returnAll() async {
             for index in active.keys { await onReturnPiece(index) }
@@ -161,16 +165,29 @@ extension PeerWireClient {
                 // possible unchoke rather than dropping it. A fired timeout throws
                 // `.timedOut`, which the outer catch turns into a peer replacement.
                 let readTimeout = outstanding.isEmpty ? idleTimeout : snubTimeout
-                let snubDeadline: ContinuousClock.Instant? = outstanding.isEmpty
+                var readDeadline: ContinuousClock.Instant? = outstanding.isEmpty
                     ? nil
                     : lastDataAt + .seconds(snubTimeout)
-                let message = try await readMessage(timeout: readTimeout, deadline: snubDeadline)
+
+                // A peer that has kept us choked past `chokeTimeout` gives its slot to
+                // an untried peer, if one is waiting. Chatter (HAVEs, keep-alives)
+                // doesn't reset this clock; only an unchoke does. The check runs before
+                // each read, and also bounds that read when someone is waiting (a
+                // timed-out read closes the socket, so it can't be re-armed). With
+                // nobody waiting the peer is kept and checked again on its next message.
+                if let chokeTimeout, isChoked, let hasUntriedPeers, await hasUntriedPeers() {
+                    let chokeDeadline = chokedSince + .seconds(chokeTimeout)
+                    guard clock.now < chokeDeadline else { throw PeerWireError.timedOut }
+                    if readDeadline.map({ chokeDeadline < $0 }) ?? true { readDeadline = chokeDeadline }
+                }
+                let message = try await readMessage(timeout: readTimeout, deadline: readDeadline)
 
                 switch message.id {
                 case 0:
                     // Choke: the peer drops every request in flight. Requeue the
                     // still-missing blocks (front of the queue) to re-send on unchoke.
                     isChoked = true
+                    chokedSince = clock.now
                     for key in outstanding {
                         guard let asm = active[key.piece] else { continue }
                         requestQueue.insert((key.piece, key.begin, min(blockSize, asm.length - key.begin)), at: 0)

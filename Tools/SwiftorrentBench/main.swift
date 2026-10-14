@@ -113,10 +113,11 @@ actor Meter {
         let elapsed = seconds(now - start)
         let avg = elapsed > 0 ? Double(p.downloadedBytes) / elapsed : 0
         let pct = total > 0 ? Double(p.downloadedBytes) / Double(total) * 100 : 0
-        print(String(format: "[%@] %5.1fs  %6.1f%%  %@ / %@  inst %@  avg %@",
+        let peers = p.connectedPeers > 0 ? "  peers \(p.connectedPeers), unchoked \(p.unchokedPeers)" : ""
+        print(String(format: "[%@] %5.1fs  %6.1f%%  %@ / %@  inst %@  avg %@%@",
                      label, elapsed, pct,
                      mibSize(p.downloadedBytes), mibSize(total),
-                     mib(inst), mib(avg)))
+                     mib(inst), mib(avg), peers))
         lastTime = now
         lastBytes = p.downloadedBytes
     }
