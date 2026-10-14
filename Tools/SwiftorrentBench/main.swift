@@ -12,6 +12,7 @@ import SwiftorrentCore
 //   swiftorrent-bench --magnet "<magnet:...>" [--dest <dir>] [--label <name>]
 //   swiftorrent-bench --magnet "<magnet:...>" --resolve-only [--label <name>]
 //   swiftorrent-bench --torrent <path> --strip-web-seeds   (force the peer swarm)
+//   swiftorrent-bench --torrent <path> --transport tcp|utp|auto   (default auto: TCP, uTP fallback)
 //   swiftorrent-bench --torrent <path> --utp-probe          (count peers reachable over TCP / uTP)
 //
 // A fresh unique destination is used per run unless --dest is given, so every
@@ -35,6 +36,7 @@ struct Args {
     var resolveOnly = false
     var stripWebSeeds = false
     var utpProbe = false
+    var transport: PeerWireClient.TransportPolicy = .auto
 }
 
 func parseArgs() -> Args {
@@ -49,6 +51,12 @@ func parseArgs() -> Args {
         case "--resolve-only": args.resolveOnly = true
         case "--strip-web-seeds": args.stripWebSeeds = true
         case "--utp-probe": args.utpProbe = true
+        case "--transport":
+            switch it.next() {
+            case "tcp": args.transport = .tcpOnly
+            case "utp": args.transport = .utpOnly
+            default: args.transport = .auto
+            }
         default:
             FileHandle.standardError.write(Data("Unknown argument: \(flag)\n".utf8))
         }
@@ -125,6 +133,7 @@ actor Meter {
 // MARK: - Main
 
 let args = parseArgs()
+PeerWireClient.defaultTransportPolicy = args.transport
 
 let destURL: URL
 if let d = args.dest {

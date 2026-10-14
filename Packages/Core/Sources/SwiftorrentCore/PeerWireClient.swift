@@ -66,6 +66,19 @@ public actor PeerWireClient {
     /// keep-alives is retained while a truly dead socket is reaped.
     public static let idleTimeoutSeconds: TimeInterval = 90
 
+    /// Which transports a connection may use. `.auto` is the default; the other
+    /// two exist so the benchmark can measure each transport on its own.
+    public enum TransportPolicy: Sendable {
+        /// TCP first, uTP when TCP cannot connect.
+        case auto
+        case tcpOnly
+        case utpOnly
+    }
+
+    /// Policy for clients that don't pass one. Set once at startup (by the
+    /// benchmark) before any connection is made.
+    nonisolated(unsafe) public static var defaultTransportPolicy = TransportPolicy.auto
+
     /// How `connect()` negotiates the transport.
     public enum EncryptionPolicy: Sendable {
         /// Try the MSE/PE encrypted handshake first; if the peer isn't MSE-capable,
@@ -104,9 +117,11 @@ public actor PeerWireClient {
     private let snubTimeout: TimeInterval
     private let idleTimeout: TimeInterval
     private let encryptionPolicy: EncryptionPolicy
+    private let transportPolicy: TransportPolicy
     private var transport: (any PeerTransport)?
-    /// Set once TCP failed to connect and uTP was used instead.
-    private var usesUTP = false
+    /// Set once TCP failed to connect and uTP was used instead (or from the start
+    /// under `.utpOnly`).
+    private var usesUTP: Bool
     /// Once the MSE handshake selects RC4, `sendCipher` encrypts our outgoing
     /// bytes and `recvCipher` decrypts the peer's — both `nil` on a plaintext
     /// connection. RC4 is a stream cipher, so running bytes through in order works
@@ -142,7 +157,8 @@ public actor PeerWireClient {
         ioTimeout: TimeInterval = 30,
         snubTimeout: TimeInterval = PeerWireClient.snubTimeoutSeconds,
         idleTimeout: TimeInterval = PeerWireClient.idleTimeoutSeconds,
-        encryptionPolicy: EncryptionPolicy = .preferEncrypted
+        encryptionPolicy: EncryptionPolicy = .preferEncrypted,
+        transportPolicy: TransportPolicy = PeerWireClient.defaultTransportPolicy
     ) {
         self.endpoint = endpoint
         self.infoHash = infoHash
@@ -152,6 +168,8 @@ public actor PeerWireClient {
         self.snubTimeout = snubTimeout
         self.idleTimeout = idleTimeout
         self.encryptionPolicy = encryptionPolicy
+        self.transportPolicy = transportPolicy
+        usesUTP = transportPolicy == .utpOnly
     }
 
     /// Whether the active connection negotiated MSE/RC4 encryption rather than
@@ -197,6 +215,7 @@ public actor PeerWireClient {
                 throw CancellationError()
             } catch {
                 tcp.close()
+                guard transportPolicy == .auto else { throw error }
                 usesUTP = true
             }
         }

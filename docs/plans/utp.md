@@ -16,7 +16,7 @@ Peers that don't answer on TCP (firewalled, TCP-throttled, uTP-preferring) becom
 - [x] 2. `UTPConnection` state machine (SYN/STATE/DATA/FIN/RST, seq/ack, reorder buffer, selective ACK, RTO retransmit, window) driven through a `DatagramChannel` protocol; loopback tests with simulated loss, reorder and duplication.
 - [x] 3. Extract `PeerTransport` from `PeerWireClient` with a TCP implementation; existing tests pass unchanged, no behaviour change.
 - [x] 4. uTP transport on UDP `NWConnection`, TCP-then-uTP fallback in `connect()`; covers swarm and magnet metadata paths.
-- [ ] 5. Bench flag to force uTP, live validation against the Debian torrent, docs (`FEATURES.md`, `ARCHITECTURE.md`), decision `0006`, delete this plan.
+- [ ] 5. (in progress: bench `--transport tcp|utp|auto` and live A/B done, see results; docs, decision and plan deletion wait on the keep/drop call) Bench flag to force uTP, live validation against the Debian torrent, docs (`FEATURES.md`, `ARCHITECTURE.md`), decision `0006`, delete this plan.
 
 ## Done when
 - Packet and connection tests pass, including 10% loss plus reordering over the in-memory channel, and a transfer of several MB arrives byte-identical.
@@ -26,3 +26,9 @@ Peers that don't answer on TCP (firewalled, TCP-throttled, uTP-preferring) becom
 ## Risks
 - Real-world gain is uncertain: it only helps peers whose TCP fails but whose uTP answers. Step 5 measures how many peers that is; if it is near zero, say so and keep the code only if it stays small.
 - Some peers expect uTP packets from a stable UDP source port; per-peer sockets satisfy that.
+
+## Step 5 results (2026-10-14, Release, web seeds stripped, tmp/utp-*.log)
+- Forced uTP (`--transport utp`) works on live swarms: Debian netinst, 756 MiB hash-verified, 32 s / 24 MiB/s in the best run, 68 s in the worst (TCP: 17-20 s).
+- `auto` (TCP, uTP fallback) vs `tcp`, data-transfer time, Big Buck Bunny, 5 runs each: tcp 7.0-9.4 s, auto 6.4-7.1 s in 3 runs, 9.1 s, and one 15.4 s outlier where 36 pieces came over uTP. Debian: no difference. uTP supplied 0 pieces in most runs.
+- Bug found by the A/B and fixed: `UTPPeerTransport.receive` parked forever if a cancellation closed the transport before the waiter registered (`receiveAfterCloseFailsPromptly`).
+- Unrelated, pre-existing: wall time varies 10-23 s because the final `stopped` announce (`collectPeers`, up to `peerDiscoveryDeadline` 12 s) runs before "Complete", in every transport mode.

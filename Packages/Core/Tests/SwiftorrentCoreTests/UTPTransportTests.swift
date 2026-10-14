@@ -123,4 +123,29 @@ private final class LoopbackUTPPeer: @unchecked Sendable {
         #expect(received.prefix(20) == Data([19]) + Data("BitTorrent protocol".utf8))
         #expect(Data(received[28..<48]) == infoHash)
     }
+
+    /// A cancellation can close the transport before `receive` registers its
+    /// waiter; the call must then fail at once instead of parking until a timeout.
+    @Test func receiveAfterCloseFailsPromptly() async throws {
+        let peer = try LoopbackUTPPeer(infoHash: Data(repeating: 0, count: 20))
+        defer { peer.stop() }
+        let transport = try UTPPeerTransport(endpoint: PeerEndpoint(host: "127.0.0.1", port: peer.port))
+        try await transport.open()
+        transport.close()
+
+        let failedPromptly = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do { _ = try await transport.receive() } catch { return true }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(2))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(failedPromptly)
+    }
 }

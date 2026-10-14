@@ -195,6 +195,12 @@ final class UTPPeerTransport: PeerTransport, @unchecked Sendable {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
                 let waiter = ResumeOnce(continuation)
                 queue.async { [self] in
+                    // A cancellation can shut the transport down before this runs;
+                    // nothing would wake the waiter after that.
+                    guard !isShutDown else {
+                        waiter.resume(throwing: PeerWireError.disconnected)
+                        return
+                    }
                     readWaiter = waiter
                     serviceWaiters()
                 }
