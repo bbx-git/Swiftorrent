@@ -269,6 +269,7 @@ struct PeerSwarmDownloader: Sendable {
                 onPieceComplete: { pieceIndex, piece in
                     try await writer.write(piece: piece, pieceIndex: pieceIndex)
                     let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
+                    guard await coordinator.pieceProgressDue() else { return }
                     await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: await active.count), downloadedBytes: downloaded, totalBytes: downloadTotal, files: mapper.snapshot(perFileBytes: perFileBytes)))
                 },
                 onReturnPiece: { pieceIndex in

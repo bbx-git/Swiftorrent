@@ -23,6 +23,7 @@ actor PieceDownloadCoordinator {
     private var perFileBytes: [Int64]
     private let clock = ContinuousClock()
     private var lastReport: ContinuousClock.Instant?
+    private var lastPieceReport: ContinuousClock.Instant?
 
     init(layout: TorrentLayout, selectablePieces: Set<Int>, completedPieces: Set<Int>, initialDownloaded: Int64, availabilityCounts: [Int: Int]) {
         self.layout = layout
@@ -51,6 +52,17 @@ actor PieceDownloadCoordinator {
         if let last = lastReport, now - last < .milliseconds(200) { return nil }
         lastReport = now
         return completedBytes
+    }
+
+    /// Whether a piece-completion progress update should be sent now: true at most
+    /// every 200 ms. Each update carries an all-files snapshot that the UI folds in
+    /// on the main thread, so a fast download of a many-file torrent must not send
+    /// one per piece. The final state is reported separately on completion.
+    func pieceProgressDue() -> Bool {
+        let now = clock.now
+        if let last = lastPieceReport, now - last < .milliseconds(200) { return false }
+        lastPieceReport = now
+        return true
     }
 
     var isComplete: Bool {
