@@ -3,24 +3,25 @@
 import PackageDescription
 
 let package = Package(
-    name: "SwiftorrentFeatures",
+    name: "Features",
     platforms: [
-        .macOS(.v15)
+        .macOS(.v26)
     ],
     products: [
         .library(name: "SwiftorrentFeatures", targets: ["SwiftorrentFeatures"])
     ],
     dependencies: [
-        .package(path: "../SwiftorrentCore"),
-        .package(path: "../SwiftorrentDomain")
+        .package(path: "../Core"),
+        .package(path: "../Domain")
     ],
     targets: [
         .target(
             name: "SwiftorrentFeatures",
             dependencies: [
-                .product(name: "SwiftorrentCore", package: "SwiftorrentCore"),
-                .product(name: "SwiftorrentDomain", package: "SwiftorrentDomain")
-            ]
+                .product(name: "SwiftorrentCore", package: "Core"),
+                .product(name: "SwiftorrentDomain", package: "Domain")
+            ],
+            swiftSettings: [.defaultIsolation(MainActor.self)]
         )
     ]
 )

@@ -8,49 +8,29 @@ let package = Package(
         .macOS(.v26)
     ],
     products: [
-        .executable(name: "Swiftorrent", targets: ["SwiftorrentApp"]),
-        .executable(name: "swiftorrent-bench", targets: ["SwiftorrentBench"]),
-        .library(name: "SwiftorrentCore", targets: ["SwiftorrentCore"]),
-        .library(name: "SwiftorrentDomain", targets: ["SwiftorrentDomain"]),
-        .library(name: "SwiftorrentFeatures", targets: ["SwiftorrentFeatures"])
+        .executable(name: "Swiftorrent", targets: ["Swiftorrent"]),
+        .executable(name: "swiftorrent-bench", targets: ["SwiftorrentBench"])
+    ],
+    dependencies: [
+        .package(path: "Packages/Core"),
+        .package(path: "Packages/Domain"),
+        .package(path: "Packages/Features")
     ],
     targets: [
-        .target(
-            name: "SwiftorrentCore",
-            path: "Packages/SwiftorrentCore/Sources/SwiftorrentCore"
-        ),
-        .target(
-            name: "SwiftorrentDomain",
-            dependencies: ["SwiftorrentCore"],
-            path: "Packages/SwiftorrentDomain/Sources/SwiftorrentDomain"
-        ),
-        .target(
-            name: "SwiftorrentFeatures",
-            dependencies: ["SwiftorrentCore", "SwiftorrentDomain"],
-            path: "Packages/SwiftorrentFeatures/Sources/SwiftorrentFeatures"
-        ),
         .executableTarget(
-            name: "SwiftorrentApp",
+            name: "Swiftorrent",
             dependencies: [
-                "SwiftorrentFeatures",
-                "SwiftorrentDomain"
+                .product(name: "SwiftorrentFeatures", package: "Features"),
+                .product(name: "SwiftorrentDomain", package: "Domain")
             ],
-            path: "App/Sources/SwiftorrentApp"
+            path: "App/Swiftorrent"
         ),
         .executableTarget(
             name: "SwiftorrentBench",
-            dependencies: ["SwiftorrentCore"],
+            dependencies: [
+                .product(name: "SwiftorrentCore", package: "Core")
+            ],
             path: "Tools/SwiftorrentBench"
-        ),
-        .testTarget(
-            name: "SwiftorrentCoreTests",
-            dependencies: ["SwiftorrentCore"],
-            path: "Packages/SwiftorrentCore/Tests/SwiftorrentCoreTests"
-        ),
-        .testTarget(
-            name: "SwiftorrentDomainTests",
-            dependencies: ["SwiftorrentDomain"],
-            path: "Packages/SwiftorrentDomain/Tests/SwiftorrentDomainTests"
         )
     ]
 )

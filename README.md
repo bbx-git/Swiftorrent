@@ -41,7 +41,7 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 - **Outbound protocol encryption (MSE/PE, BEP-8 Message Stream Encryption).** Every peer connection first attempts the MSE handshake — Diffie-Hellman key exchange over MSE's fixed 768-bit group followed by an RC4-encrypted stream — and only falls back to a plaintext handshake if the peer isn't MSE-capable. This reaches the encryption-required majority of public-swarm peers that accept a TCP connection but stay silent on a plaintext handshake. Both `.torrent` and magnet swarm downloads use it (they share the peer-wire layer). The DH modular exponentiation and RC4 are implemented in pure Swift (`MSECrypto.swift`); SHA-1 comes from CryptoKit. Live-validated against the Big Buck Bunny swarm: of 13 peers that connected, 12 negotiated RC4 encryption and 11 downloaded and SHA-1-verified real pieces. Encryption changes only the transport — Swiftorrent stays strictly download-only, with no listening port and no upload.
 - **Still no listening port.** We never accept inbound connections, so NAT'd peers that only accept inbound remain unreachable. With MSE now in place, the remaining reach gap is these inbound-only peers plus swarms with no reachable seed at all.
 - Magnet links fetch metadata (BEP 9 `ut_metadata`) from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT, and also from peers those peers gossip via BEP 11 PEX during the exchange (folded back into the metadata-probe pool); once metadata is resolved the swarm download uses the same tracker/DHT/PEX peer discovery as `.torrent` files. Live-validated end-to-end: a real multi-file magnet resolves in ~24s and Big Buck Bunny resolves from many peers with SHA-1-verified metadata pieces (the metadata-path PEX feed is covered by offline tests but not yet separately live-validated).
-- The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app`; there is no `.xcodeproj` app target yet.
+- The app is packaged from the Swift Package executable into a drag-and-drop `Swiftorrent.app` by `Scripts/build.sh`; there is no Xcode project by design (see `docs/decisions/0001-swiftpm-script-build.md`).
 
 ## Requirements
 
@@ -53,29 +53,24 @@ Swiftorrent is a simple macOS torrent client built in 100% Swift and SwiftUI. Th
 
 ## Build, Test, and Deploy
 
-Build Release with local DerivedData/output:
+Run tests (each package under `Packages/`; `-enable-testing` keeps `@testable import` working in Release):
 
 ```sh
-xcodebuild -scheme Swiftorrent -destination 'platform=macOS,arch=arm64' -configuration Release -derivedDataPath .build/DerivedData SYMROOT=.build/output
+swift test -c release -Xswiftc -enable-testing --package-path Packages/Core
+swift test -c release -Xswiftc -enable-testing --package-path Packages/Domain
 ```
 
-Run tests:
+Build, wrap into a drag-and-drop app bundle, sign ad hoc and install:
 
 ```sh
-swift test -c release
+Scripts/build.sh
 ```
 
-Package the drag-and-drop app bundle:
-
-```sh
-Scripts/package_app.sh
-```
-
-The packaged app is written to `.build/output/Release/Swiftorrent.app` and copied to `~/Applications/Swiftorrent.app`.
+The app name comes from `CFBundleExecutable` in `App/Resources/Info.plist`. The bundle is written to `.build/output/Swiftorrent.app` and copied to `~/Applications/Swiftorrent.app`; the log is `tmp/build.log`.
 
 ### Opening the app on another Mac
 
-`package_app.sh` **ad-hoc signs** the bundle, which is enough to run on the machine
+`Scripts/build.sh` **ad-hoc signs** the bundle, which is enough to run on the machine
 that built it but not to pass Gatekeeper on someone else's Mac. When you copy the
 `.app` to another Mac it will be quarantined, so the first launch needs one of:
 
@@ -95,7 +90,7 @@ Swift Package build from the command line (`codesign` + `xcrun notarytool` +
 
 ### Live download smoke test
 
-`big-buck-bunny.torrent` in the repository root is a well-seeded public-domain
+`Fixtures/big-buck-bunny.torrent` is a well-seeded public-domain
 torrent kept for end-to-end download testing (real tracker/DHT/peer swarm).
 Open it in the packaged app to verify the download path against a live swarm —
 e.g. that the peer pool replenishes and the transfer completes and verifies
@@ -117,10 +112,10 @@ real `SwiftorrentCore.TorrentDownloader` and builds **without full Xcode**):
 ```bash
 brew install aria2 transmission-cli
 swift build -c release --product swiftorrent-bench
-Scripts/benchmark.sh big-buck-bunny.torrent bbb
+Scripts/benchmark.sh Fixtures/big-buck-bunny.torrent bbb
 ```
 
-See **[BENCHMARK.md](BENCHMARK.md)** for the full procedure, latest results,
+See **[docs/BENCHMARK.md](docs/BENCHMARK.md)** for the full procedure, latest results,
 conclusions, and the optimization TODO.
 
 ## Usage
@@ -135,32 +130,24 @@ conclusions, and the optimization TODO.
 
 ```text
 Swiftorrent/
-├── Package.swift
+├── Package.swift                root package: executable `Swiftorrent` + `swiftorrent-bench`
 ├── App/
 │   ├── Resources/Info.plist
-│   └── Sources/SwiftorrentApp/
+│   └── Swiftorrent/             @main entry, dependency wiring, Incubator/
 ├── Packages/
-│   ├── SwiftorrentCore/
-│   │   ├── Sources/SwiftorrentCore/
-│   │   │   ├── Bencode.swift
-│   │   │   ├── DHTClient.swift
-│   │   │   ├── MagnetLink.swift
-│   │   │   ├── MagnetMetadataResolver.swift
-│   │   │   ├── PeerWireClient.swift
-│   │   │   ├── TorrentDownloader.swift
-│   │   │   ├── TorrentMetainfo.swift
-│   │   │   └── TrackerClient.swift
-│   │   └── Tests/SwiftorrentCoreTests/
-│   ├── SwiftorrentDomain/
-│   │   └── Sources/SwiftorrentDomain/TorrentSession.swift
-│   └── SwiftorrentFeatures/
-│       └── Sources/SwiftorrentFeatures/SwiftorrentRootView.swift
+│   ├── Core/                    module SwiftorrentCore: bencode, DHT, trackers, peer wire, downloader
+│   ├── Domain/                  module SwiftorrentDomain: TorrentSession, session store
+│   └── Features/                module SwiftorrentFeatures: SwiftUI views
+├── Tools/SwiftorrentBench/      headless benchmark executable
+├── Fixtures/                    big-buck-bunny.torrent (local/ is gitignored)
+├── Scripts/                     build.sh, benchmark.sh
+├── docs/                        ARCHITECTURE, BENCHMARK, WORKFLOW, decisions/, plans/
 ├── CLAUDE.md
 ├── README.md
 └── SESSION_STATE.md
 ```
 
-The root manifest is an umbrella manifest for reliable `xcodebuild` schemes. The local package manifests remain under `Packages/` so each layer can still be developed independently.
+Layer rules and package conventions are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the build decision is in [docs/decisions/0001-swiftpm-script-build.md](docs/decisions/0001-swiftpm-script-build.md).
 
 ## Protocol Notes
 
@@ -182,4 +169,9 @@ All items preserve the download-only policy (no seeding, uploading, or sharing).
 
 - Endgame mode (re-request the last in-flight pieces across peers so the tail doesn't stall).
 - uTP transport for networks that throttle plain BitTorrent TCP.
-- Migrate to a native Xcode app target to drop the manual `.app` bundling step.
+- Developer ID signing and notarization via `Scripts/notarize.sh` (see "Opening the app on another Mac").
+
+## More
+- Project layout and module rules: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Current status and next steps: [SESSION_STATE.md](SESSION_STATE.md)
+- How to work with Claude Code here: [docs/WORKFLOW.md](docs/WORKFLOW.md)

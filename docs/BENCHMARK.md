@@ -354,4 +354,4 @@ Reproduce: `swift build -c release --product swiftorrent-bench`, then
 Full Xcode was briefly uninstalled; the SwiftUI app now builds via **Xcode-beta 27.0**
 (`xcode-select -p` → `/Applications/Xcode-beta.app/Contents/Developer`) — on a macOS
 beta, only the matching Xcode beta has working SwiftUI macro plugins. App build/deploy
-via `Scripts/package_app.sh` is back to normal. See `SESSION_STATE.md`.
+via `Scripts/build.sh` is back to normal. See `SESSION_STATE.md`.

@@ -9,11 +9,11 @@
 #   Scripts/benchmark.sh <torrent-path | magnet-uri> [label]
 #
 # Examples:
-#   Scripts/benchmark.sh big-buck-bunny.torrent bbb
-#   Scripts/benchmark.sh /tmp/debian-13.6.0-amd64-netinst.iso.torrent debian
+#   Scripts/benchmark.sh Fixtures/big-buck-bunny.torrent bbb
+#   Scripts/benchmark.sh Fixtures/local/debian-13.6.0-amd64-netinst.iso.torrent debian
 #   Scripts/benchmark.sh "magnet:?xt=urn:btih:..." mymagnet
 #
-# Prereqs (see BENCHMARK.md):
+# Prereqs (see docs/BENCHMARK.md):
 #   - swiftorrent-bench built:  swift build -c release --product swiftorrent-bench
 #     (this builds WITHOUT full Xcode — it only depends on SwiftorrentCore)
 #   - brew install aria2 transmission-cli
@@ -82,4 +82,4 @@ peak=$(tr '\r' '\n' < "$LOG" | grep -oE '\([0-9.]+ [kM]B/s\)' | tr -d '()' \
 [ -n "$peak" ] && echo "  transmission peak speed seen: $peak"
 
 hr "done"
-echo "See BENCHMARK.md for how to read these numbers and the known caveats."
+echo "See docs/BENCHMARK.md for how to read these numbers and the known caveats."

@@ -1,99 +1,58 @@
 # CLAUDE.md
 
-**Method:** For small, surgical changes to .swift and .md files, use targeted find/replace edits. For larger rewrites, overwrite the whole file instead. **No sed!** (regex-based find/replace is too easy to mismatch against Swift's brace-heavy structure and silently corrupt code).
+Act as a senior macOS engineer. Use the latest stable Swift and SwiftUI. The app is a SwiftPM package built by script; there is no Xcode project. Minimum OS versions are in `README.md`.
 
-Act as a Senior iOS Engineer. Use **Swift 6.3** and the latest SwiftUI standards. Prioritize the **Observation framework**, **Swift Concurrency** (async/await), and **Swift Testing**. Avoid deprecated patterns like `@Published` or `XCTest` unless explicitly asked.
+## Session start
+1. Current state (loaded automatically): @SESSION_STATE.md
+2. Run `git status -s && git log --oneline -5`. Treat the state as claims, not facts: before the first code change, run the tests so you know which failures were already there.
+3. Before adding or moving code, read `docs/ARCHITECTURE.md` (layout, packages, dependency rules).
+4. `docs/WORKFLOW.md` is the user's own guide: don't read it unless asked.
 
----
+## Everything stays in this repo
+- Plans: `docs/plans/<topic>.md`, never `~/.claude/plans`. Sections: **Goal** (2–3 sentences, what the user gets), **Steps** (checkboxes, one commit each), **Done when** (which tests exist, what to check by hand). Show the user the plan before writing code. Tick steps as they land; when scope changes, add a dated line saying why. When done, move any lasting "why" to `docs/decisions/`, then delete the plan.
+- Decisions between real alternatives (storage, architecture, a dependency): `docs/decisions/NNNN-short-title.md` with context, decision, consequences; 20 lines max.
+- Don't save Claude Code auto memories. Anything worth remembering goes in `SESSION_STATE.md` or `docs/`.
+- Scratch files, logs, downloads: `tmp/` (gitignored). Never `/tmp`, `~` or any other folder.
+- Sample media: `Fixtures/` (large files in `Fixtures/local/`, gitignored). Never look for media elsewhere on disk; if a file is missing, ask.
+- The only thing written outside the repo is the deployed app in `~/Applications/`.
 
-## Project Defaults
-- Build with **Swift only**, preferably **Swift 6.3**.
-- Only Apple frameworks and pure Swift.
-- **No third-party dependencies** unless explicitly approved by the user.
-- Default macOS/iOS/Xcode/Swift requirements must be documented in `README.md`.
-- Always remove all copyrights/licenses if you are "translating" from other source code.
+## Swift standards
+- Latest Swift language mode with strict concurrency: async/await and actors, explicit `Sendable`, UI types on `@MainActor`.
+- Observation (`@Observable`), not `ObservableObject`/`@Published`.
+- Swift Testing for unit tests; XCTest only for UI and performance tests. Every bug fix starts with a failing regression test.
+- `struct` by default; `final class` only when reference semantics are essential.
+- One file per responsibility; no god files.
+- Apple frameworks and pure Swift only. No third-party dependencies unless the user approves.
+- No copyright/license headers or author names (real or fake) in any file. Remove them from code you write, port or touch.
+- App runtime: check free disk space before large file writes; put temporary output in a unique subfolder of `FileManager.default.temporaryDirectory`.
 
----
+## While working
+- Ambiguous requirement or a hard-to-undo choice: ask first. Otherwise state your assumptions in one line and go.
+- Make the smallest clean change that fits the architecture: no speculative abstractions, options or error handling for cases that can't happen.
+- Touch only what the task needs: no drive-by refactors or reformatting. Match the surrounding style; remove anything your change left unused.
+- After code changes: test, build and deploy (below). Docs-only changes need no build.
+- Update `README.md` or `docs/ARCHITECTURE.md` when reality changes.
+- When the user corrects something that will come up again, add one line under Lessons.
+- Context nearly full: stop, overwrite `SESSION_STATE.md`, ask the user to `/clear`.
 
-## Test Data & Assets
-- **In-Repo Test Assets:** Live download/smoke testing uses assets committed to the repository root:
-    - **Torrent file:** `big-buck-bunny.torrent` (well-seeded, public-domain) — documented in `README.md`.
-    - **Magnet link:** the Big Buck Bunny magnet documented in `README.md` (under "Live download smoke test").
-- **Constraint:** Do not search for or assume the existence of external sample files on disk (e.g., Downloads, Desktop, Pictures). If a test needs an asset not already in the repo, ask the user to provide it.
+## Build, test, deploy
+Always Release, tests included. Build output lives in `.build/` (gitignored), never the default DerivedData. Logs go to `tmp/` and are overwritten each run; read past the summary only on failure.
 
----
+```sh
+mkdir -p tmp
+# Unit tests: the root package and each package under Packages/ (-enable-testing keeps @testable import working in Release)
+swift test -q -c release -Xswiftc -enable-testing --package-path <.|Packages/Package> > tmp/test.log 2>&1; echo "exit $?"; tail -20 tmp/test.log
+# Build, wrap into a .app, install to ~/Applications, then double-click to test
+Scripts/build.sh
+```
+- `Scripts/build.sh` is app-agnostic: it takes the app name from `CFBundleExecutable` in `App/Resources/Info.plist`, which must match the executable target in `Package.swift`. Errors are printed; the full log is `tmp/build.log`. Keep it generic; never hardcode an app name in it.
+- No macOS toolchain (Linux/cloud session): skip build and deploy, and say so.
 
-## Architecture Rules
-- **Package-First Modular Design:** The codebase must be strictly modularized using local Swift Packages. Organize packages into layers: `Core` (low-level), `Domain` (business logic), and `Features` (UI modules).
-- **Zero Target Copying:** Reusable logic/models must live in packages. App and extension targets must never share source files directly via target membership.
-- **The Scratchpad Exception:** New, experimental features or tiny helpers may live in the App target under `Sources/Scratchpad/`. 
-    - **The Promotion Rule:** Promote scratchpad code to a package as soon as it stabilizes or needs to be shared.
-- **Thin Targets:** App and extension targets must remain thin, acting only as orchestrators.
+## Wrap-up: when the user says "git commit push main" or ends the session
+1. If code changed since the last build: test, build, deploy. Fix obvious errors or report them.
+2. Overwrite `SESSION_STATE.md` (its format is in the file).
+3. Commit all changes with a descriptive message and push to `main`.
+4. Finish with a one-line summary.
 
----
-
-## Build & Deployment Rules
-To avoid stale builds and DerivedData issues:
-- **Build Directory:** Use a local `.build` folder in the project root.
-- **Configuration:** Always build using the **Release** configuration.
-- **Build Command:** Use `xcodebuild` with `SYMROOT` and `DSTROOT` pointing to the local `.build` folder.
-    - `xcodebuild -scheme <Scheme> -configuration Release -derivedDataPath .build/DerivedData SYMROOT=.build/output`
-- **Deployment:** After a successful build, the `.app` bundle must be copied to `~/Applications/`.
-    - `cp -R .build/output/Release/<App>.app ~/Applications/`
-
----
-
-## Code Style
-- **Strict Isolation:** Adhere to Swift 6 isolation; prefer `@MainActor` on UI-bound types and explicit `Sendable` conformance.
-- **Reference vs Value:** Prefer `struct` by default; use `final class` only when reference semantics are essential.
-- **File Discipline:** One file per meaningful responsibility; no "god" files.
-- **Resource Safety:** Check volume capacity before large file operations.
-- **Temp Paths:** Use `FileManager.default.temporaryDirectory` with uniquely named subdirectories for session-specific outputs.
-
----
-
-## Workflow for Every Task
-1. **The Re-entry Protocol (Critical after /clear):** If your memory is blank, you **must** ground yourself before coding:
-    - **Check History:** Run `git log -n 1 -p` to see the code changes the user just committed from the previous session.
-    - **Check State:** Read `SESSION_STATE.md` to identify the architectural "why" and the next immediate step.
-2. Read `CLAUDE.md` and skim `README.md`.
-3. Make the smallest clean change that fits the architecture.
-4. **Build and Deploy** according to the "Build & Deployment Rules" above.
-5. Update docs if reality changed.
-6. **Compaction Warning:** When approaching context limits, STOP coding, update `SESSION_STATE.md` thoroughly, and wait for the user to `/clear`.
-
----
-
-## End-of-Session Ritual
-Before stopping work or letting the user run `/clear`, always:
-1. **Build and Deploy** to guarantee a functional app in `~/Applications/`.
-2. **Fix obvious errors** or report remaining failures.
-3. **Update SESSION_STATE.md**: Document what was accomplished, current status, and the **exact** next command or step.
-4. **Update README.md** if features or requirements changed.
-5. **Handoff Note:** Leave a final summary line for the user to see before they commit and clear.
-
----
-
-## SESSION_STATE.md Rules
-Keep it short and factual. It must contain:
-- Current architecture/modules.
-- What is implemented / What is in progress.
-- **Recent Fixes:** List the last 3 bug fixes to prevent regressions after a context clear.
-- Known bugs/limitations.
-- Immediate next steps.
-- Build/run status.
-
----
-
-## Review Checklist
-- Is logic modularized in a package (or in `Scratchpad`)?
-- Are targets thin?
-- Is it Swift 6.3 compatible?
-- App built in **Release** mode and moved to `~/Applications/`?
-- Are test assets pulled from the in-repo files (`big-buck-bunny.torrent` / documented magnet)?
-- `SESSION_STATE.md` contains the "next step" for the next session?
-
-## Current Project Note
-- Swiftorrent currently uses an umbrella `Package.swift` for reliable `xcodebuild` schemes while keeping local package manifests under `Packages/`.
-- The app is deployed by bundling the Release Swift Package executable into `Swiftorrent.app` with `App/Resources/Info.plist`, then copying it to `~/Applications/`.
-- To avoid stale app installs, remove `.build/DerivedData`, `.build/output/Release/Swiftorrent*`, and `~/Applications/Swiftorrent.app` before the final Release build/deploy pass.
+## Lessons
+- _none yet_

@@ -3,22 +3,26 @@
 import PackageDescription
 
 let package = Package(
-    name: "SwiftorrentDomain",
+    name: "Domain",
     platforms: [
-        .macOS(.v15)
+        .macOS(.v26)
     ],
     products: [
         .library(name: "SwiftorrentDomain", targets: ["SwiftorrentDomain"])
     ],
     dependencies: [
-        .package(path: "../SwiftorrentCore")
+        .package(path: "../Core")
     ],
     targets: [
         .target(
             name: "SwiftorrentDomain",
             dependencies: [
-                .product(name: "SwiftorrentCore", package: "SwiftorrentCore")
+                .product(name: "SwiftorrentCore", package: "Core")
             ]
+        ),
+        .testTarget(
+            name: "SwiftorrentDomainTests",
+            dependencies: ["SwiftorrentDomain"]
         )
     ]
 )

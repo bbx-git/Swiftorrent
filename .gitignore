@@ -1,5 +1,51 @@
 .DS_Store
-.build
-.debug
-tmp
-temp
+
+# Build output
+.build/
+build/
+dist/
+DerivedData/
+*.xcresult
+.debug/
+
+# Xcode and SwiftPM user state
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# C / C++
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dSYM/
+*.out
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.cache/
+
+# Editors
+.vscode/
+.idea/
+
+# Scratch and large local media
+tmp/
+temp/
+Fixtures/local/

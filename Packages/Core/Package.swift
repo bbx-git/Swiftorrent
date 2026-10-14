@@ -3,9 +3,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "SwiftorrentCore",
+    name: "Core",
     platforms: [
-        .macOS(.v15)
+        .macOS(.v26)
     ],
     products: [
         .library(name: "SwiftorrentCore", targets: ["SwiftorrentCore"])
