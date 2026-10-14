@@ -360,10 +360,3 @@ Debian 13.7.0 netinst (756 MiB, pure swarm), single trial, sequential, after the
 | transmission-cli | 93.4 s | 6.4 s | n/a | 52 MB/s |
 
 Swiftorrent is on par with aria2c and finished well ahead of transmission. The swarm path is unaffected by the restructure.
-
-## Blocker note (RESOLVED 2026-08-15)
-
-Full Xcode was briefly uninstalled; the SwiftUI app now builds via **Xcode-beta 27.0**
-(`xcode-select -p` → `/Applications/Xcode-beta.app/Contents/Developer`) — on a macOS
-beta, only the matching Xcode beta has working SwiftUI macro plugins. App build/deploy
-via `Scripts/build.sh` is back to normal. See `SESSION_STATE.md`.
