@@ -21,8 +21,7 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 - `collectPeers` takes DHT peers streamed via `onPeers`; don't go back to waiting for the full walk (tracker-less torrents' first byte 4.5 s -> 1.7 s; test `streamedDHTPeersDoNotWaitForTheWalk`).
 
 ## Next
-1. Optional: if a 10+ s tail with uTP pieces recurs, deprioritise uTP peers in piece assignment.
-2. Optional: trackerless sweep over a thin swarm (4 well-seeded distro ISOs resolved 20/20, `docs/BENCHMARK.md`).
+Nothing queued. Add items from real bugs or features, not speculation.
 
 ## Open problems
 - Inbound-only peers unreachable by design (`docs/decisions/0002-download-only-policy.md`).
