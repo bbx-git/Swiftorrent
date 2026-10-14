@@ -161,7 +161,7 @@ public struct TorrentDownloader: Sendable {
         let verifiedBytes = bytesCompleted(for: verifiedPieces, layout: layout)
         if verifiedBytes >= downloadTotal {
             try writer.finalize(selectedFileIDs: selection)
-            _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: verifiedBytes, left: 0, event: "stopped", includeDHT: false)
+            await announceStopped(for: metainfo, peerID: peerID, downloaded: verifiedBytes)
             await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
             return
         }
@@ -194,8 +194,28 @@ public struct TorrentDownloader: Sendable {
             progress: progress
         )
         try writer.finalize(selectedFileIDs: selection)
-        _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped", includeDHT: false)
+        await announceStopped(for: metainfo, peerID: peerID, downloaded: downloaded)
         await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: selectablePieces)))
+    }
+
+    /// Best-effort final announce. Capped so a slow or dead tracker can't delay
+    /// "Complete" by the full discovery deadline.
+    func announceStopped(
+        for metainfo: TorrentMetainfo,
+        peerID: Data,
+        downloaded: Int64,
+        cap: Duration = .seconds(3)
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped", includeDHT: false)
+            }
+            group.addTask {
+                try? await Task.sleep(for: cap)
+            }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     /// A peer-discovery task-group signal: either a source (tracker or DHT)

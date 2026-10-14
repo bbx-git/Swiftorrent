@@ -53,6 +53,7 @@ public struct SwiftorrentRootView: View {
         .frame(minWidth: 940, minHeight: 620)
         .transparentWindow()
         .keepsDialogsAboveWhenActivated()
+        .showsSpeedInDockBadge()
     }
 
     private var removalAlertPresented: Binding<Bool> {

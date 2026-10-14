@@ -454,6 +454,25 @@ struct CoreParsingTests {
         #expect(peers == [trackerPeer])
     }
 
+    @Test("Stopped announce is capped when the tracker never answers")
+    func stoppedAnnounceIsCapped() async throws {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8)])
+        let downloader = TorrentDownloader(
+            trackerClient: HangingTrackerAnnouncer(),
+            dhtClient: MockDHTPeerFinder(peers: [])
+        )
+
+        let started = ContinuousClock.now
+        await downloader.announceStopped(
+            for: metainfo,
+            peerID: Data(repeating: 1, count: 20),
+            downloaded: 4,
+            cap: .milliseconds(200)
+        )
+
+        #expect(ContinuousClock.now - started < .seconds(3))
+    }
+
     @Test("Peer wire tears down a silent peer within the timeout window")
     func peerWireTimesOutOnSilentPeer() async throws {
         // A loopback listener that accepts the connection but never sends a
@@ -1252,6 +1271,13 @@ private struct MockTrackerAnnouncer: TrackerAnnouncing {
 
     func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
         peers
+    }
+}
+
+private struct HangingTrackerAnnouncer: TrackerAnnouncing {
+    func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
+        try await Task.sleep(for: .seconds(60))
+        return []
     }
 }
 
