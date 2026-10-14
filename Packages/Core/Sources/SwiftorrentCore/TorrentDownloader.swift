@@ -40,14 +40,14 @@ public struct TorrentDownloader: Sendable {
     /// this only fires once at least one peer has already been found.
     private static let fastStartDeadline: Duration = .seconds(3)
 
-    public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient(), session: URLSession = .shared, rateLimiter: RateLimiter? = nil) {
+    public init(trackerClient: TrackerClient = TrackerClient(), dhtClient: DHTClient = DHTClient(), session: URLSession = .traceless, rateLimiter: RateLimiter? = nil) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
         self.session = session
         self.rateLimiter = rateLimiter
     }
 
-    init(trackerClient: any TrackerAnnouncing, dhtClient: any DHTPeerFinding, session: URLSession = .shared, rateLimiter: RateLimiter? = nil) {
+    init(trackerClient: any TrackerAnnouncing, dhtClient: any DHTPeerFinding, session: URLSession = .traceless, rateLimiter: RateLimiter? = nil) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
         self.session = session

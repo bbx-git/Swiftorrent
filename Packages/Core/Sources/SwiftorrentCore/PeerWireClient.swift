@@ -882,26 +882,14 @@ public actor PeerWireClient {
         inputBuffer.append(contentsOf: chunk)
     }
 
-    /// Races `operation` against a sleeping timer. If the timer wins, the
-    /// structured task group cancels the operation task on scope exit, whose
-    /// cancellation handler closes the underlying transport, so the parked
-    /// continuation resumes and nothing leaks. Surfaced error is `.timedOut`.
+    /// Fails with `.timedOut` after `seconds`. Cancelling the operation runs the
+    /// transport's cancellation handler, which closes it, so a parked receive
+    /// resumes and nothing leaks.
     private func withTimeout<T: Sendable>(
         _ seconds: TimeInterval,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(for: .seconds(seconds))
-                throw PeerWireError.timedOut
-            }
-            defer { group.cancelAll() }
-            guard let result = try await group.next() else {
-                throw PeerWireError.timedOut
-            }
-            return result
-        }
+        try await withDeadline(.seconds(seconds), timeoutError: PeerWireError.timedOut, operation: operation)
     }
 }
 

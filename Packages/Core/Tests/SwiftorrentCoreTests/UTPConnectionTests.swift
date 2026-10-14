@@ -122,6 +122,19 @@ private func pattern(_ count: Int) -> Data {
         #expect(link.transferToA(payload) == payload)
     }
 
+    /// `Data.removeFirst` only moves `startIndex`, so a `Data` receive buffer kept
+    /// every byte the peer ever sent (hundreds of MB on a long download).
+    @Test func receiveBufferDoesNotKeepConsumedBytes() throws {
+        let link = Link()
+        link.connect()
+        let payload = pattern(4 << 20)
+        #expect(link.transferToA(payload) == payload)
+
+        let inbound = Mirror(reflecting: link.a).descendant("inbound")
+        let retained = try #require((inbound as? [UInt8])?.capacity ?? (inbound as? Data)?.endIndex)
+        #expect(retained <= 2 * UTPConnectionCore.receiveBufferLimit, "array growth may round capacity up")
+    }
+
     @Test func survivesLossReorderingAndDuplication() {
         let link = Link()
         link.loss = 0.10

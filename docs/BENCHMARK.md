@@ -443,3 +443,9 @@ Smoke runs with `swiftorrent-bench` on `Fixtures/big-buck-bunny.torrent` (263.6 
 
 Magnet `--resolve-only` (two UDP trackers + DHT): 0.5 s OK. No regression against the numbers above. Resume verification of a 16,000-file torrent went from 34.6 s to 1.1 s (see `ManyFilesTests`).
 
+
+## Sanitizers, memory and profile (2026-10-14)
+Arch ISO without web seeds (1.56 GB, peers only), `swiftorrent-bench`, M-series Mac.
+- Thread Sanitizer over a full download and 3 trackerless magnet resolves: one report (per-file progress array shared out of `PieceDownloadCoordinator`), fixed; then clean. Address Sanitizer over a full magnet download: clean.
+- Memory before: RSS 545 MB at 75 %, heap 702 MB in 3.1 M objects. Two causes: about 510k cancelled `Task.sleep` timeouts kept alive until their 30 s deadline (one per socket read), and uTP receive buffers (`Data.removeFirst`) keeping every byte received (single buffers up to 98 MB). After `withDeadline` (dispatch timer) and byte-array uTP buffers: RSS 100 MB at 75 %, peak 117 MB, heap 44 MB / 20k objects. Throughput unchanged (18.7 MiB/s, swarm-bound).
+- Time Profiler, 45 s: about half a core at about 20 MiB/s. RC4 12 % → rewritten in place over buffer pointers (515 → 1046 MB/s). MSE Diffie-Hellman 7 % (9.4 ms per handshake, bit-serial `BigUInt.mod`) and `rawReceive` memmove 1.7 % left as is: not worth the risk at this CPU cost.

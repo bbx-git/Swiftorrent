@@ -119,25 +119,44 @@ struct RC4 {
         }
     }
 
-    private mutating func nextByte() -> UInt8 {
-        i = (i + 1) & 0xFF
-        j = (j + Int(s[i])) & 0xFF
-        s.swapAt(i, j)
-        return s[(Int(s[i]) + Int(s[j])) & 0xFF]
-    }
-
     mutating func process(_ data: [UInt8]) -> [UInt8] {
-        data.map { $0 ^ nextByte() }
+        var output = data
+        output.withUnsafeMutableBytes { apply(to: $0) }
+        return output
     }
 
     mutating func process(_ data: Data) -> Data {
-        Data(process([UInt8](data)))
+        var output = data
+        output.withUnsafeMutableBytes { apply(to: $0) }
+        return output
     }
 
     /// Advances the keystream by `count` bytes without producing output — MSE
     /// discards the first 1024 bytes of each direction's keystream.
     mutating func discard(_ count: Int) {
-        for _ in 0..<count { _ = nextByte() }
+        var scratch = [UInt8](repeating: 0, count: count)
+        scratch.withUnsafeMutableBytes { apply(to: $0) }
+    }
+
+    /// XORs the keystream into `bytes` in place. Every peer byte on an encrypted
+    /// connection passes through here, so the state is walked through a buffer
+    /// pointer (indices are masked to 0...255) instead of per-byte array calls.
+    private mutating func apply(to bytes: UnsafeMutableRawBufferPointer) {
+        var i = self.i
+        var j = self.j
+        s.withUnsafeMutableBufferPointer { s in
+            for index in bytes.indices {
+                i = (i + 1) & 0xFF
+                let si = s[i]
+                j = (j + Int(si)) & 0xFF
+                let sj = s[j]
+                s[i] = sj
+                s[j] = si
+                bytes[index] ^= s[Int(si &+ sj)]
+            }
+        }
+        self.i = i
+        self.j = j
     }
 }
 

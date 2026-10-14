@@ -24,14 +24,14 @@ struct ProgressThrottleTests {
     func pieceProgressIsThrottled() async throws {
         let coordinator = makeCoordinator()
 
-        let first = await coordinator.pieceProgressDue()
-        let burst = await (0..<50).asyncMap { _ in await coordinator.pieceProgressDue() }
+        let first = await coordinator.complete(pieceIndex: 0).perFileBytes
+        let burst = await (1..<9).asyncMap { await coordinator.complete(pieceIndex: $0).perFileBytes }
         try await Task.sleep(for: .milliseconds(250))
-        let later = await coordinator.pieceProgressDue()
+        let later = await coordinator.complete(pieceIndex: 9).perFileBytes
 
-        #expect(first)
-        #expect(!burst.contains(true))
-        #expect(later)
+        #expect(first == [10])
+        #expect(burst.allSatisfy { $0 == nil })
+        #expect(later == [100])
     }
 }
 

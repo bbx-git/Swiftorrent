@@ -60,17 +60,6 @@ actor PieceDownloadCoordinator {
         return completedBytes
     }
 
-    /// Whether a piece-completion progress update should be sent now: true at most
-    /// every 200 ms. Each update carries an all-files snapshot that the UI folds in
-    /// on the main thread, so a fast download of a many-file torrent must not send
-    /// one per piece. The final state is reported separately on completion.
-    func pieceProgressDue() -> Bool {
-        let now = clock.now
-        if let last = lastPieceReport, now - last < .milliseconds(200) { return false }
-        lastPieceReport = now
-        return true
-    }
-
     var isComplete: Bool {
         pendingPieces.isEmpty && assignments.isEmpty
     }
@@ -125,12 +114,16 @@ actor PieceDownloadCoordinator {
         return piece
     }
 
-    func complete(pieceIndex: Int) -> (downloadedBytes: Int64, perFileBytes: [Int64]) {
+    /// Records a verified piece. `perFileBytes` is set at most every 200 ms: each
+    /// update carries an all-files snapshot that the UI folds in on the main
+    /// thread, so a fast download of a many-file torrent must not send one per
+    /// piece. The final state is reported separately on completion.
+    func complete(pieceIndex: Int) -> (downloadedBytes: Int64, perFileBytes: [Int64]?) {
         // Guard on completion, not membership: with endgame duplicates a second peer
         // may report the same piece, and it may even have been requeued meanwhile.
         // The first completion counts; the rest are harmless no-ops.
         guard !completedPieces.contains(pieceIndex) else {
-            return (downloadedBytes, perFileBytes)
+            return (downloadedBytes, perFileProgressIfDue())
         }
         assignments[pieceIndex] = nil
         pendingPieces.remove(pieceIndex)
@@ -141,7 +134,16 @@ actor PieceDownloadCoordinator {
         for (id, bytes) in layout.completedBytesPerFile(completedPieces: [pieceIndex]).enumerated() where bytes > 0 {
             perFileBytes[id] += bytes
         }
-        return (downloadedBytes, perFileBytes)
+        return (downloadedBytes, perFileProgressIfDue())
+    }
+
+    /// A fresh copy, not the actor's own storage: a shared copy-on-write buffer
+    /// that this actor keeps mutating is reported as a race by Thread Sanitizer.
+    private func perFileProgressIfDue() -> [Int64]? {
+        let now = clock.now
+        if let last = lastPieceReport, now - last < .milliseconds(200) { return nil }
+        lastPieceReport = now
+        return perFileBytes.map { $0 }
     }
 
     /// Endgame support: of the pieces a peer is still assembling, which have already

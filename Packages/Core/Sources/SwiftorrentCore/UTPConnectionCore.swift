@@ -47,14 +47,16 @@ final class UTPConnectionCore {
     private var peerWindow = UInt32(UTPConnectionCore.maxSendWindow)
     private var lastTimestampDifference: UInt32 = 0
 
-    private var pendingSend = Data()
+    // Byte arrays, not `Data`: `Data.removeFirst` only moves `startIndex`, so a
+    // `Data` buffer keeps every byte that ever passed through it.
+    private var pendingSend: [UInt8] = []
     private var inFlight: [InFlight] = []
     private var rtt: Double?
     private var rttVariance: Double = 0
     private var rto = UTPConnectionCore.initialRTO
     private var consecutiveTimeouts = 0
 
-    private var inbound = Data()
+    private var inbound: [UInt8] = []
     private var reorder: [UInt16: Incoming] = [:]
     private var reorderBytes = 0
     private var lastAdvertisedWindow: UInt32 = 0
@@ -115,7 +117,7 @@ final class UTPConnectionCore {
     /// Queues `data` for sending and transmits what the window allows.
     func write(_ data: Data, now: UInt64) -> [UTPPacket] {
         guard state == .connected, !data.isEmpty else { return [] }
-        pendingSend.append(data)
+        pendingSend.append(contentsOf: data)
         return flush(now: now)
     }
 
@@ -325,7 +327,7 @@ final class UTPConnectionCore {
     }
 
     private func deliver(_ incoming: Incoming) {
-        inbound.append(incoming.payload)
+        inbound.append(contentsOf: incoming.payload)
         if incoming.isFin { remoteFinished = true }
     }
 

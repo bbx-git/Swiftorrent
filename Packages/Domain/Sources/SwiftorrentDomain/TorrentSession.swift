@@ -189,8 +189,8 @@ public final class TorrentSession {
                     $0.name = name
                     $0.status = "Resolving metadata…"
                 }
-                let metainfo = try await magnetResolver.resolve(magnet: magnet) { [weak self] progress in
-                    await self?.update(id) {
+                let metainfo = try await magnetResolver.resolve(magnet: magnet) { progress in
+                    await self.update(id) {
                         $0.status = progress.status
                     }
                 }
@@ -463,7 +463,7 @@ public final class TorrentSession {
         // unrelated file that happens to share the display name.
         let relativePaths = item.outputRelativePaths
         guard !relativePaths.isEmpty else {
-            logger.notice("Skipping disk deletion for unresolved row \"\(item.name, privacy: .public)\": no resolved output paths")
+            logger.notice("Skipping disk deletion for unresolved row \"\(item.name, privacy: .private)\": no resolved output paths")
             return
         }
         let destination = item.destination.standardizedFileURL
@@ -484,7 +484,7 @@ public final class TorrentSession {
         do {
             try FileManager.default.removeItem(at: url)
         } catch {
-            logger.error("Failed to delete \(path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            logger.error("Failed to delete \(path, privacy: .private): \(error.localizedDescription, privacy: .private)")
         }
     }
 
@@ -594,7 +594,7 @@ public final class TorrentSession {
                 preferredName: persisted.name
             )
         } catch {
-            logger.error("Dropping restored row \"\(persisted.name, privacy: .public)\": stored info dict failed to parse: \(error.localizedDescription, privacy: .public)")
+            logger.error("Dropping restored row \"\(persisted.name, privacy: .private)\": stored info dict failed to parse: \(error.localizedDescription, privacy: .public)")
             return nil
         }
 

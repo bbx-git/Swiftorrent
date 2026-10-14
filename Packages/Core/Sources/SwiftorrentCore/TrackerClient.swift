@@ -55,7 +55,7 @@ public struct TrackerClient: Sendable {
 
     private let http: BoundedHTTPClient
 
-    public init(session: URLSession = .shared) {
+    public init(session: URLSession = .traceless) {
         http = BoundedHTTPClient(session: session)
     }
 

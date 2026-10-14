@@ -37,7 +37,7 @@ public struct MagnetMetadataResolver: Sendable {
         trackerClient: TrackerClient = TrackerClient(),
         dhtClient: DHTClient = DHTClient(),
         parser: TorrentMetainfoParser = TorrentMetainfoParser(),
-        session: URLSession = .shared
+        session: URLSession = .traceless
     ) {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
@@ -502,19 +502,5 @@ public func withTimeout<T: Sendable>(
     seconds: Duration,
     operation: @Sendable @escaping () async throws -> T
 ) async throws -> T {
-    try await withThrowingTaskGroup(of: T.self) { group in
-        group.addTask {
-            try Task.checkCancellation()
-            return try await operation()
-        }
-        group.addTask {
-            try await Task.sleep(for: seconds)
-            throw TimeoutError.timedOut
-        }
-        guard let result = try await group.next() else {
-            throw TimeoutError.timedOut
-        }
-        group.cancelAll()
-        return result
-    }
+    try await withDeadline(seconds, timeoutError: TimeoutError.timedOut, operation: operation)
 }
