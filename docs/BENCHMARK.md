@@ -345,8 +345,8 @@ Reproduce: `swift build -c release --product swiftorrent-bench`, then
       range segments, 8 in flight, written in order (resume stays a contiguous prefix);
       servers that ignore `Range` fall back to one stream. BBB: 10.8 -> 18.0 MiB/s avg
       (2 runs). See `WebSeedDownloader`.
-- [ ] **Make the benchmark statistically sound:** have `benchmark.sh` do N trials and
-      alternate client order; report median. Currently single-trial/directional.
+- [x] **Multi-trial benchmark — DONE 2026-10-14.** `TRIALS=3 Scripts/benchmark.sh ...`
+      alternates client order per trial and reports the median wall time.
 - [x] **`--strip-web-seeds` — DONE 2026-10-14.** `swiftorrent-bench --torrent <path>
       --strip-web-seeds` drops the HTTP sources so the same content comes from the swarm.
 
