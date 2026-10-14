@@ -34,6 +34,7 @@ public enum BencodeError: Error, LocalizedError, Equatable {
     case invalidByteStringLength
     case invalidDictionaryKey
     case trailingData
+    case nestingTooDeep
 
     public var errorDescription: String? {
         switch self {
@@ -43,11 +44,16 @@ public enum BencodeError: Error, LocalizedError, Equatable {
         case .invalidByteStringLength: "Invalid bencode byte string length."
         case .invalidDictionaryKey: "Bencode dictionary keys must be UTF-8 byte strings."
         case .trailingData: "Bencoded payload contains trailing data."
+        case .nestingTooDeep: "Bencoded payload is nested too deeply."
         }
     }
 }
 
 public struct BencodeParser: Sendable {
+    /// Real torrents and protocol messages nest a handful of levels; this bound
+    /// keeps hostile input from exhausting the (small) task stack.
+    static let maxDepth = 64
+
     private let data: Data
     private var index: Data.Index
 
@@ -68,7 +74,8 @@ public struct BencodeParser: Sendable {
         return try parser.parseNode()
     }
 
-    private mutating func parseNode() throws -> BencodeNode {
+    private mutating func parseNode(depth: Int = 0) throws -> BencodeNode {
+        guard depth <= Self.maxDepth else { throw BencodeError.nestingTooDeep }
         guard index < data.endIndex else { throw BencodeError.unexpectedEnd }
         let start = index
         let byte = data[index]
@@ -81,7 +88,7 @@ public struct BencodeParser: Sendable {
             data.formIndex(after: &index)
             var values: [BencodeNode] = []
             while try currentByte() != UInt8(ascii: "e") {
-                values.append(try parseNode())
+                values.append(try parseNode(depth: depth + 1))
             }
             data.formIndex(after: &index)
             return BencodeNode(value: .list(values), range: start..<index)
@@ -94,7 +101,7 @@ public struct BencodeParser: Sendable {
                       let key = String(data: keyData, encoding: .utf8) else {
                     throw BencodeError.invalidDictionaryKey
                 }
-                values[key] = try parseNode()
+                values[key] = try parseNode(depth: depth + 1)
             }
             data.formIndex(after: &index)
             return BencodeNode(value: .dictionary(values), range: start..<index)

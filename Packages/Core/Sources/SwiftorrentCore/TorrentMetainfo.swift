@@ -108,6 +108,8 @@ public enum TorrentMetainfoError: Error, LocalizedError, Equatable {
     case missingPieceLength
     case invalidPieces
     case missingLength
+    case invalidFileLength
+    case invalidPieceLength
 
     public var errorDescription: String? {
         switch self {
@@ -117,11 +119,17 @@ public enum TorrentMetainfoError: Error, LocalizedError, Equatable {
         case .missingPieceLength: "The torrent info dictionary is missing a piece length."
         case .invalidPieces: "The torrent contains invalid piece hashes."
         case .missingLength: "The torrent is missing file length data."
+        case .invalidFileLength: "The torrent contains an invalid file length."
+        case .invalidPieceLength: "The torrent has an unsupported piece length."
         }
     }
 }
 
 public struct TorrentMetainfoParser: Sendable {
+    /// Largest piece length accepted. Real torrents stay at or below 16 MiB; the
+    /// downloader allocates one buffer of this size per in-flight piece.
+    static let maxPieceLength: Int64 = 128 * 1024 * 1024
+
     public init() {}
 
     public func parse(data: Data) throws -> TorrentMetainfo {
@@ -167,13 +175,26 @@ public struct TorrentMetainfoParser: Sendable {
               pieceLengthValue > 0 else {
             throw TorrentMetainfoError.missingPieceLength
         }
+        guard pieceLengthValue <= Self.maxPieceLength else {
+            throw TorrentMetainfoError.invalidPieceLength
+        }
         guard case let .bytes(pieceBlob)? = info["pieces"]?.value,
               pieceBlob.count.isMultiple(of: 20) else {
             throw TorrentMetainfoError.invalidPieces
         }
 
         let files = try parseFiles(info: info, name: name)
-        let totalSize = files.reduce(Int64(0)) { $0 + $1.length }
+        var totalSize: Int64 = 0
+        for file in files {
+            guard file.length >= 0 else { throw TorrentMetainfoError.invalidFileLength }
+            let (sum, overflow) = totalSize.addingReportingOverflow(file.length)
+            guard !overflow else { throw TorrentMetainfoError.invalidFileLength }
+            totalSize = sum
+        }
+        let expectedPieces = (totalSize + pieceLengthValue - 1) / pieceLengthValue
+        guard Int64(pieceBlob.count / 20) == expectedPieces else {
+            throw TorrentMetainfoError.invalidPieces
+        }
         let infoData = Data(sourceData[infoNode.range])
         let digest = Insecure.SHA1.hash(data: infoData)
         var pieces: [Data] = []
