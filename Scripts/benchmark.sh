@@ -34,7 +34,8 @@ if [ ! -x "$BENCH" ]; then
     exit 1
 fi
 
-WORK="$(mktemp -d /tmp/sw-bench.XXXXXX)"
+mkdir -p "$ROOT/tmp"
+WORK="$(mktemp -d "$ROOT/tmp/sw-bench.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 if [[ "$SRC" == magnet:* ]]; then SWFLAG=--magnet; else SWFLAG=--torrent; fi
 

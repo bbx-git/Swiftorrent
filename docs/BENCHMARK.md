@@ -23,7 +23,7 @@ swift build -c release --product swiftorrent-bench
 
 # 2. run all three clients back-to-back on a torrent or magnet
 Scripts/benchmark.sh big-buck-bunny.torrent bbb                 # in-repo, web-seed heavy
-Scripts/benchmark.sh /tmp/debian-13.6.0-amd64-netinst.iso.torrent debian   # real swarm
+Scripts/benchmark.sh Fixtures/local/debian-13.7.0-amd64-netinst.iso.torrent debian   # real swarm
 ```
 
 `Scripts/benchmark.sh <torrent-or-magnet> [label]` runs Swiftorrent, aria2c, then
@@ -58,8 +58,8 @@ resolution breaks first.
   current Debian netinst torrent (no web seed → pure swarm):
 
   ```bash
-  curl -sSL -o /tmp/debian-13.6.0-amd64-netinst.iso.torrent \
-    "https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/debian-13.6.0-amd64-netinst.iso.torrent"
+  curl -sSL -o Fixtures/local/debian-13.7.0-amd64-netinst.iso.torrent \
+    "https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/debian-13.7.0-amd64-netinst.iso.torrent"
   ```
   (Bump the version if `current/` has moved on; list the dir to check.)
 
@@ -88,7 +88,7 @@ aria2c --seed-time=0 --dir=OUT --console-log-level=warn --summary-interval=5 \
 # transmission-cli — does NOT self-exit; time launch until the first "Seeding" line.
 # Use a throwaway --config-dir (see caveats) so a stale default config can't make it
 # exit instantly and so your real transmission config is untouched.
-transmission-cli --config-dir /tmp/tr-cfg -w OUT <torrent-or-magnet>
+transmission-cli --config-dir tmp/tr-cfg -w OUT <torrent-or-magnet>
 ```
 
 ---
@@ -348,6 +348,18 @@ Reproduce: `swift build -c release --product swiftorrent-bench`, then
 - [ ] **Optional:** teach `swiftorrent-bench` a `--strip-web-seeds` flag so BBB can be
       forced down the peer pipeline for an apples-to-apples swarm comparison with
       transmission on the same content.
+
+## Post-restructure re-run (2026-10-14)
+
+Debian 13.7.0 netinst (756 MiB, pure swarm), single trial, sequential, after the move to the template layout:
+
+| Client | Wall | TTFB | Avg | Peak |
+|---|---|---|---|---|
+| Swiftorrent | 20.6 s | 4.1 s | 36.7 MiB/s | 59.0 MiB/s |
+| aria2c | 21.6 s | n/a | 39 MiB/s | n/a |
+| transmission-cli | 93.4 s | 6.4 s | n/a | 52 MB/s |
+
+Swiftorrent is on par with aria2c and finished well ahead of transmission. The swarm path is unaffected by the restructure.
 
 ## Blocker note (RESOLVED 2026-08-15)
 
