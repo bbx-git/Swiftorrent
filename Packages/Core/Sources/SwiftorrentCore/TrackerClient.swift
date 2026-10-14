@@ -48,10 +48,14 @@ public enum TrackerClientError: Error, LocalizedError {
 }
 
 public struct TrackerClient: Sendable {
-    private let session: URLSession
+    /// Largest HTTP announce reply accepted. A compact reply for 48 peers is a few
+    /// hundred bytes; this leaves room for verbose dictionary-form replies.
+    private static let maxReplyBytes = 1 << 20
+
+    private let http: BoundedHTTPClient
 
     public init(session: URLSession = .shared) {
-        self.session = session
+        http = BoundedHTTPClient(session: session)
     }
 
     public func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
@@ -74,9 +78,8 @@ public struct TrackerClient: Sendable {
         var urlRequest = URLRequest(url: url)
         urlRequest.timeoutInterval = 20
         urlRequest.setValue("Swiftorrent/0.1", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: urlRequest)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode) else {
+        let (data, httpResponse) = try await http.data(for: urlRequest, limit: Self.maxReplyBytes)
+        guard (200..<300).contains(httpResponse.statusCode) else {
             throw TrackerClientError.invalidResponse
         }
         return try parsePeers(from: data)

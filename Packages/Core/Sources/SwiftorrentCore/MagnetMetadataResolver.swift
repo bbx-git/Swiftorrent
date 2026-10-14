@@ -29,7 +29,9 @@ public struct MagnetMetadataResolver: Sendable {
     private let trackerClient: TrackerClient
     private let dhtClient: DHTClient
     private let parser: TorrentMetainfoParser
-    private let session: URLSession
+    private let http: BoundedHTTPClient
+    /// Largest exact-source `.torrent` accepted (real ones are a few MB at most).
+    private static let maxExactSourceBytes = 32 << 20
 
     public init(
         trackerClient: TrackerClient = TrackerClient(),
@@ -40,7 +42,7 @@ public struct MagnetMetadataResolver: Sendable {
         self.trackerClient = trackerClient
         self.dhtClient = dhtClient
         self.parser = parser
-        self.session = session
+        self.http = BoundedHTTPClient(session: session)
     }
 
     public func resolve(
@@ -221,9 +223,8 @@ public struct MagnetMetadataResolver: Sendable {
                 await progress(MagnetMetadataProgress(status: "Fetching metadata from exact source"))
                 var request = URLRequest(url: source)
                 request.timeoutInterval = 20
-                let (data, response) = try await session.data(for: request)
-                guard let httpResponse = response as? HTTPURLResponse,
-                      (200..<300).contains(httpResponse.statusCode) else {
+                let (data, httpResponse) = try await http.data(for: request, limit: Self.maxExactSourceBytes)
+                guard (200..<300).contains(httpResponse.statusCode) else {
                     throw MagnetMetadataResolverError.exactSourceInvalid
                 }
                 let metainfo = try parser.parse(data: data).adding(

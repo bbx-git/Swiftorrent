@@ -8,10 +8,21 @@ import Foundation
 struct WebSeedDownloader: Sendable {
     let session: URLSession
     var rateLimiter: RateLimiter? = nil
+    /// Bounded loader for range requests, so a server cannot make us buffer more
+    /// than the bytes we asked for.
+    private let http: BoundedHTTPClient
+    /// Most we will read from a server that ignores `Range` on a slice request.
+    private static let maxIgnoredRangePrefix: Int64 = 64 << 20
     /// Size of one range request when a file is fetched over several connections.
     var segmentSize: Int64 = 1 << 20
     /// Concurrent range requests per file; 1 disables segmenting.
     var maxConnections = 8
+
+    init(session: URLSession, rateLimiter: RateLimiter? = nil) {
+        self.session = session
+        self.rateLimiter = rateLimiter
+        http = BoundedHTTPClient(session: session)
+    }
 
     /// Raised by the segmented path when the file should go through the single
     /// stream instead (server ignores `Range`, or the file is too small to split).
@@ -152,10 +163,11 @@ struct WebSeedDownloader: Sendable {
         var request = URLRequest(url: sourceURL)
         request.timeoutInterval = 30
         request.setValue("bytes=\(offset)-\(offset + length - 1)", forHTTPHeaderField: "Range")
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw TrackerClientError.invalidResponse
-        }
+        // A server that ignores `Range` answers 200 with the whole file, of which we
+        // only need the first `offset + length` bytes; refuse to read past a sane
+        // prefix. A 206 must be at most the `length` we asked for.
+        guard offset + length <= Self.maxIgnoredRangePrefix else { throw BoundedHTTPError.tooLarge }
+        let (data, httpResponse) = try await http.data(for: request, limit: Int(offset + length))
         switch httpResponse.statusCode {
         case 206:
             guard data.count >= Int(length) else { throw TrackerClientError.invalidResponse }
@@ -240,12 +252,14 @@ struct WebSeedDownloader: Sendable {
         var request = URLRequest(url: sourceURL)
         request.timeoutInterval = 30
         request.setValue("bytes=\(offset)-\(offset + length - 1)", forHTTPHeaderField: "Range")
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw TrackerClientError.invalidResponse
-        }
-        switch httpResponse.statusCode {
+        // A 200 means the server ignores `Range` and is sending the whole file;
+        // truncate it at the segment size rather than buffering it, then fall back
+        // to the single stream. A 206 that overruns what we asked for is an error.
+        let reply = try await http.load(request, limit: Int(length), truncating: true)
+        let data = reply.data
+        switch reply.response.statusCode {
         case 206:
+            if reply.truncated { throw BoundedHTTPError.tooLarge }
             guard Int64(data.count) == length else { throw TrackerClientError.invalidResponse }
             return data
         case 200:
@@ -302,6 +316,10 @@ struct WebSeedDownloader: Sendable {
             for try await byte in bytes {
                 try Task.checkCancellation()
                 buffer.append(byte)
+                // A server may stream past the declared length; never write beyond it.
+                guard fileDownloadedBytes + Int64(buffer.count) <= file.length else {
+                    throw BoundedHTTPError.tooLarge
+                }
                 if buffer.count >= 64 * 1024 {
                     try handle.write(contentsOf: buffer)
                     fileDownloadedBytes += Int64(buffer.count)
