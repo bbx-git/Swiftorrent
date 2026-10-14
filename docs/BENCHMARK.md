@@ -72,6 +72,8 @@ Per project rules, don't assume other sample files exist on disk — use these o
 ```bash
 .build/release/swiftorrent-bench --torrent <path>   [--dest <dir>] [--label <name>]
 .build/release/swiftorrent-bench --magnet  "<uri>"  [--dest <dir>] [--label <name>]
+# --transport tcp|utp|auto   restrict peer connections (default auto: TCP, uTP fallback)
+# --utp-probe                 count listed peers answering TCP / uTP, then exit
 ```
 Output is line-buffered, so progress streams live even when piped to a file. It
 logs, once per second: elapsed, %, downloaded/total, instantaneous MiB/s, average

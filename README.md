@@ -4,7 +4,7 @@ A download-only BitTorrent client for macOS, built in pure Swift and SwiftUI wit
 
 ## Features
 - Open `.torrent` files or paste `magnet:` links; pick files in an add dialog before anything downloads
-- HTTP/UDP trackers, DHT, PEX, web seeds, and MSE/PE encryption
+- HTTP/UDP trackers, DHT, PEX, web seeds, MSE/PE encryption, and uTP fallback for peers TCP can't reach
 - Pause/resume, global speed cap, per-file progress, list restored across launches
 - Never seeds or uploads: no listening port, stops when a download completes
 

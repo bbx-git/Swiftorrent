@@ -30,7 +30,7 @@ Full feature and protocol reference. The short list is in [README.md](../README.
 
 ## Limitations
 
-- Downloads (both `.torrent` and resolved magnets) use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. The downloader does not yet use local peer discovery, NAT traversal or uTP (endgame mode is implemented).
+- Downloads (both `.torrent` and resolved magnets) use a self-replenishing pool of concurrent tracker/DHT/PEX peers with basic piece availability tracking, support per-file selection (full and partial), and honor a global download-speed cap. Peers whose TCP connect fails are retried once over uTP (BEP 29, outbound only, one UDP socket per peer); see [decision 0006](decisions/0006-utp-outbound-fallback.md). The downloader does not yet use local peer discovery or NAT traversal (endgame mode is implemented).
 - **Outbound protocol encryption (MSE/PE, BEP-8 Message Stream Encryption).** Every peer connection first attempts the MSE handshake — Diffie-Hellman key exchange over MSE's fixed 768-bit group followed by an RC4-encrypted stream — and only falls back to a plaintext handshake if the peer isn't MSE-capable. This reaches the encryption-required majority of public-swarm peers that accept a TCP connection but stay silent on a plaintext handshake. Both `.torrent` and magnet swarm downloads use it (they share the peer-wire layer). The DH modular exponentiation and RC4 are implemented in pure Swift (`MSECrypto.swift`); SHA-1 comes from CryptoKit. Live-validated against the Big Buck Bunny swarm: of 13 peers that connected, 12 negotiated RC4 encryption and 11 downloaded and SHA-1-verified real pieces. Encryption changes only the transport — Swiftorrent stays strictly download-only, with no listening port and no upload.
 - **Still no listening port.** We never accept inbound connections, so NAT'd peers that only accept inbound remain unreachable. With MSE now in place, the remaining reach gap is these inbound-only peers plus swarms with no reachable seed at all.
 - Magnet links fetch metadata (BEP 9 `ut_metadata`) from peers discovered through HTTP/HTTPS trackers, UDP trackers, or DHT, and also from peers those peers gossip via BEP 11 PEX during the exchange (folded back into the metadata-probe pool); once metadata is resolved the swarm download uses the same tracker/DHT/PEX peer discovery as `.torrent` files. Live-validated end-to-end: a real multi-file magnet resolves in ~24s and Big Buck Bunny resolves from many peers with SHA-1-verified metadata pieces (the metadata-path PEX feed is covered by offline tests but not yet separately live-validated).
@@ -42,7 +42,3 @@ Full feature and protocol reference. The short list is in [README.md](../README.
 - DHT support uses BEP 5 `get_peers` queries against public bootstrap nodes and consumes compact IPv4 peers/nodes for magnet metadata and `.torrent` downloads.
 - Magnet metadata resolution uses the extension-protocol reserved bit, extended handshake message ID `20`, and `ut_metadata` request/data messages.
 - Transmission was used only as protocol/architecture reference. No Transmission source code was copied or translated.
-
-## Future work
-
-- **uTP (BEP 29).** Peers that prefer or require uTP over TCP are unreachable today.
