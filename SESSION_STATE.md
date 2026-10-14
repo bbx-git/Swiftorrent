@@ -15,7 +15,7 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 - Web-seed segments are written strictly in order; resume depends on the partial file being a contiguous prefix (`docs/decisions/0004-web-seed-ordered-segments.md`).
 - uTP is outbound-only, TCP first. `UTPPeerTransport.receive` must fail when the transport was closed before the waiter registered (parked a worker for a full timeout); regression test `receiveAfterCloseFailsPromptly` (`docs/decisions/0006-utp-outbound-fallback.md`).
 - The final `stopped` announce is capped at 3 s (`announceStopped`); it must not wait for the full discovery deadline again (test `stoppedAnnounceIsCapped`).
-- Dock speed badge is a hand-drawn fixed-size tile (`DockBadge`; the system badge resizes with its text); it is driven by the main window, so it goes stale if that window is closed mid-download.
+- Dock speed badge is a hand-drawn fixed-size tile (`DockBadge`; the system badge resizes with its text); `DockBadge.followSession` is an app-lifetime observation loop (no view), so it keeps updating with the main window closed.
 - "Clear Completed" (`removeCompleted`) removes only complete rows. Header glass controls need `.tint(.primary)`: the window-wide graphite tint makes their labels near-black while the window is active.
 
 ## Next

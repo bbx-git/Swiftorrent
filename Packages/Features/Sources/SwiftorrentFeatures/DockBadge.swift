@@ -10,6 +10,29 @@ enum DockBadge {
         guard bytesPerSecond > 0 else { return nil }
         return ByteCountFormatter.string(fromByteCount: bytesPerSecond, countStyle: .file) + "/s"
     }
+
+    /// Calls `show` with the current label now and again after every change of
+    /// whatever `speed` reads. It re-arms itself, so it needs no view and keeps
+    /// running when the main window is closed.
+    @MainActor
+    static func follow(speed: @escaping @MainActor () -> Int64, show: @escaping @MainActor (String?) -> Void) {
+        let label = withObservationTracking {
+            label(forSpeed: speed())
+        } onChange: {
+            Task { @MainActor in follow(speed: speed, show: show) }
+        }
+        show(label)
+    }
+
+    private static var isFollowingSession = false
+
+    /// Starts mirroring the session's speed onto the Dock tile; later calls do nothing.
+    @MainActor
+    static func followSession(_ session: TorrentSession) {
+        guard !isFollowingSession else { return }
+        isFollowingSession = true
+        follow(speed: { session.downloadSpeed }, show: DockTile.show)
+    }
 }
 
 /// Draws the Dock icon with a badge of constant size. The system badge
@@ -50,39 +73,20 @@ private struct DockTileView: View {
     var body: some View {
         GeometryReader { proxy in
             let side = min(proxy.size.width, proxy.size.height)
-            ZStack(alignment: .bottom) {
+            ZStack(alignment: .top) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
                     .scaledToFit()
-                // Fixed box for every value; long labels shrink to fit it.
+                // Fixed font size and box for every value, so nothing jumps.
                 Text(model.label)
-                    .font(.system(size: side * 0.2, weight: .semibold, design: .rounded).monospacedDigit())
-                    .minimumScaleFactor(0.5)
+                    .font(.system(size: side * 0.15, weight: .semibold, design: .rounded).monospacedDigit())
                     .lineLimit(1)
                     .foregroundStyle(.white)
-                    .frame(width: side * 0.8, height: side * 0.3)
+                    .frame(width: side * 0.92, height: side * 0.26)
                     .background(Capsule().fill(.red))
-                    .padding(.bottom, side * 0.04)
+                    .padding(.top, side * 0.04)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
-    }
-}
-
-private struct DockBadgeModifier: ViewModifier {
-    @Environment(TorrentSession.self) private var session
-
-    func body(content: Content) -> some View {
-        content
-            .onChange(of: DockBadge.label(forSpeed: session.downloadSpeed), initial: true) { _, label in
-                DockTile.show(label)
-            }
-    }
-}
-
-extension View {
-    /// Mirrors the session's download speed onto the Dock icon badge.
-    func showsSpeedInDockBadge() -> some View {
-        modifier(DockBadgeModifier())
     }
 }
