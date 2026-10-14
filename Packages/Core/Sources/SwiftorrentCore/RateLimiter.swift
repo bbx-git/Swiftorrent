@@ -43,8 +43,6 @@ public actor RateLimiter {
         lastRefill = clock.now
     }
 
-    public var currentLimit: Int? { bytesPerSecond }
-
     /// Charges `bytes` against the budget, awaiting if necessary to stay under
     /// the cap. Returns immediately when unlimited. The charge drives the budget
     /// negative when over capacity; the caller then sleeps off the resulting

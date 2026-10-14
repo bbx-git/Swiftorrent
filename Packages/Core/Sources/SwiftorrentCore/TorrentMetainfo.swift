@@ -24,10 +24,6 @@ public struct TorrentMetainfo: Equatable, Sendable {
     public let infoDictionaryData: Data
     public let webSeedURLs: [URL]
 
-    public var displaySize: String {
-        ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)
-    }
-
     public init(
         name: String,
         announceURLs: [URL],

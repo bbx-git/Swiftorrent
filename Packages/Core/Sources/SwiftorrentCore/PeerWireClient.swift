@@ -175,10 +175,6 @@ public actor PeerWireClient {
         usesUTP = transportPolicy == .utpOnly
     }
 
-    /// Whether the active connection negotiated MSE/RC4 encryption rather than
-    /// falling back to (or being configured for) plaintext.
-    public var isEncrypted: Bool { sendCipher != nil }
-
     public func connect() async throws {
         try await openConnection()
         switch encryptionPolicy {
@@ -383,16 +379,6 @@ public actor PeerWireClient {
             handlePeerStateMessage(message, pieceCount: pieceCount)
         }
         return availablePieces
-    }
-
-    /// Current piece availability for this peer, plus whether the peer has
-    /// actually declared it. `isKnown` is `false` only when the peer unchoked
-    /// before sending any `bitfield`/`have`, so the caller can decide how to
-    /// treat the ambiguous case instead of assuming an empty set means "no
-    /// pieces". Availability stays current because `bitfield`/`have` messages
-    /// received while downloading also update `availablePieces`.
-    public func currentAvailability() -> (pieces: Set<Int>, isKnown: Bool) {
-        (availablePieces, availabilityIsKnown)
     }
 
     public func fetchMetadata(pieceSize: Int = 16 * 1024) async throws -> Data {

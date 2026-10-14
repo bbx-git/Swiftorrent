@@ -106,16 +106,6 @@ struct TorrentFileWriter: Sendable {
         }
     }
 
-    func preparePartialFile(for file: TorrentFile) throws -> URL {
-        let partialURL = try outputURL(for: file, partial: true)
-        try FileManager.default.createDirectory(at: partialURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: partialURL.path) {
-            try FileManager.default.removeItem(at: partialURL)
-        }
-        FileManager.default.createFile(atPath: partialURL.path, contents: nil)
-        return partialURL
-    }
-
     /// Determines where an interrupted web-seed download of `file` should resume.
     /// Returns the URL to append to and the byte offset already on disk, so the
     /// caller can issue an HTTP `Range: bytes=offset-` request instead of

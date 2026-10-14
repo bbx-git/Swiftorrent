@@ -27,8 +27,6 @@ public struct TorrentLayout: Sendable, Equatable {
         self.fileLengths = metainfo.files.map(\.length)
     }
 
-    public var fileCount: Int { fileLengths.count }
-
     /// The trailing piece is shorter whenever the total size is not an exact
     /// multiple of the piece length.
     public func length(ofPiece index: Int) -> Int {
