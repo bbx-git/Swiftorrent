@@ -13,9 +13,9 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 - `NWConnection` continuations are resume-once (`ResumeOnce`); a double resume crashed under cancellation.
 
 ## Next
-1. Live-validate on a real swarm: Debian netinst magnet (`docs/BENCHMARK.md`) with the new layout.
+1. Magnet path on the new layout: `swiftorrent-bench --magnet ... --resolve-only` on the Debian magnet (`docs/BENCHMARK.md`). The `.torrent` swarm path is validated (2026-10-14).
 2. Magnet-path TTFB follow-ups listed in `docs/BENCHMARK.md`.
+3. Add a test target to `Packages/Features`; record uTP and notarization (`Scripts/notarize.sh`) as future work.
 
 ## Open problems
 - Inbound-only peers unreachable by design (`docs/decisions/0002-download-only-policy.md`).
-- Restructure to the template was not committed yet; review `git status`, then "git commit push main".
