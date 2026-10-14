@@ -341,8 +341,10 @@ Reproduce: `swift build -c release --product swiftorrent-bench`, then
       **up** 25% → 75% (trackerless magnets went from never resolving to usually
       resolving). The old high peer threshold turned out not to need careful
       tuning — it needed to stop being a *gate*. See the section directly above.
-- [ ] **Parallelize web-seed connections** (secondary) to close the ~13 vs 10.8 MiB/s
-      gap on web-seed torrents. See `WebSeedDownloader`.
+- [x] **Parallelize web-seed connections — DONE 2026-10-14.** Files are fetched as 1 MiB
+      range segments, 8 in flight, written in order (resume stays a contiguous prefix);
+      servers that ignore `Range` fall back to one stream. BBB: 10.8 -> 18.0 MiB/s avg
+      (2 runs). See `WebSeedDownloader`.
 - [ ] **Make the benchmark statistically sound:** have `benchmark.sh` do N trials and
       alternate client order; report median. Currently single-trial/directional.
 - [ ] **Optional:** teach `swiftorrent-bench` a `--strip-web-seeds` flag so BBB can be

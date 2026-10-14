@@ -6,7 +6,7 @@ Close the remaining open items from the benchmark TODO and give `Packages/Featur
 ## Steps
 - [x] Add `SwiftorrentFeaturesTests` target to `Packages/Features` with a first test over add-window state logic (needs a look at `AddTorrentWindow.swift` for what is testable without UI).
 - [x] Record uTP and notarization (`Scripts/notarize.sh`) as future work in `docs/FEATURES.md`.
-- [ ] Parallelize web-seed connections in `WebSeedDownloader` (BBB: 10.8 vs ~13 MiB/s). Regression-style test with a mocked HTTP source.
+- [x] Parallelize web-seed connections in `WebSeedDownloader` (BBB: 10.8 vs ~13 MiB/s). Regression-style test with a mocked HTTP source.
 - [ ] `swiftorrent-bench --strip-web-seeds` for apples-to-apples swarm comparisons.
 - [ ] `Scripts/benchmark.sh`: N trials, alternating client order, report median.
 

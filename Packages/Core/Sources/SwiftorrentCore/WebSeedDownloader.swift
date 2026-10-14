@@ -8,6 +8,14 @@ import Foundation
 struct WebSeedDownloader: Sendable {
     let session: URLSession
     var rateLimiter: RateLimiter? = nil
+    /// Size of one range request when a file is fetched over several connections.
+    var segmentSize: Int64 = 1 << 20
+    /// Concurrent range requests per file; 1 disables segmenting.
+    var maxConnections = 8
+
+    /// Raised by the segmented path when the file should go through the single
+    /// stream instead (server ignores `Range`, or the file is too small to split).
+    private struct UseSequentialStream: Error {}
 
     /// Streams every file in `metainfo` whole from the first working web seed.
     func downloadAll(
@@ -163,6 +171,91 @@ struct WebSeedDownloader: Sendable {
     }
 
     private func downloadFile(
+        from sourceURL: URL,
+        file: TorrentFile,
+        writer: TorrentFileWriter,
+        progressDownloadedBytes: Int64,
+        progress: @Sendable @escaping (Int64) async -> Void
+    ) async throws -> Int64 {
+        do {
+            return try await downloadFileSegmented(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: progressDownloadedBytes, progress: progress)
+        } catch is UseSequentialStream {
+            // Resume state is size-based and the segmented path only ever writes a
+            // contiguous prefix, so the sequential path picks up where it stopped.
+            return try await downloadFileSequential(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: progressDownloadedBytes, progress: progress)
+        }
+    }
+
+    /// Fetches the missing tail of `file` as `segmentSize` range requests, up to
+    /// `maxConnections` in flight, and writes them strictly in order so the partial
+    /// file is always a contiguous prefix (what `partialFileResumeOffset` assumes).
+    private func downloadFileSegmented(
+        from sourceURL: URL,
+        file: TorrentFile,
+        writer: TorrentFileWriter,
+        progressDownloadedBytes: Int64,
+        progress: @Sendable @escaping (Int64) async -> Void
+    ) async throws -> Int64 {
+        let (partialURL, resumeOffset) = try writer.partialFileResumeOffset(for: file)
+        if resumeOffset >= file.length { return file.length }
+        guard maxConnections > 1, file.length - resumeOffset > segmentSize else { throw UseSequentialStream() }
+
+        let segmentCount = Int((file.length - resumeOffset + segmentSize - 1) / segmentSize)
+        let handle = try FileHandle(forWritingTo: partialURL)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(resumeOffset))
+
+        var written = resumeOffset
+        try await withThrowingTaskGroup(of: (Int, Data).self) { group in
+            var nextToStart = 0
+            var nextToWrite = 0
+            var ready: [Int: Data] = [:]
+            while nextToWrite < segmentCount {
+                while nextToStart < segmentCount, nextToStart - nextToWrite - ready.count < maxConnections,
+                      nextToStart - nextToWrite < maxConnections * 2 {
+                    let index = nextToStart
+                    let offset = resumeOffset + Int64(index) * segmentSize
+                    let length = min(segmentSize, file.length - offset)
+                    group.addTask { (index, try await self.fetchSegment(from: sourceURL, offset: offset, length: length)) }
+                    nextToStart += 1
+                }
+                guard let (index, data) = try await group.next() else { break }
+                ready[index] = data
+                while let next = ready.removeValue(forKey: nextToWrite) {
+                    try handle.write(contentsOf: next)
+                    written += Int64(next.count)
+                    nextToWrite += 1
+                    await rateLimiter?.consume(next.count)
+                    await progress(progressDownloadedBytes + written)
+                }
+            }
+        }
+        guard written == file.length else { throw TrackerClientError.invalidResponse }
+        return file.length
+    }
+
+    /// One range request that must be answered with exactly `length` bytes of `206`.
+    /// A `200` means the server ignores `Range`; the caller falls back to one stream.
+    private func fetchSegment(from sourceURL: URL, offset: Int64, length: Int64) async throws -> Data {
+        var request = URLRequest(url: sourceURL)
+        request.timeoutInterval = 30
+        request.setValue("bytes=\(offset)-\(offset + length - 1)", forHTTPHeaderField: "Range")
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TrackerClientError.invalidResponse
+        }
+        switch httpResponse.statusCode {
+        case 206:
+            guard Int64(data.count) == length else { throw TrackerClientError.invalidResponse }
+            return data
+        case 200:
+            throw UseSequentialStream()
+        default:
+            throw TrackerClientError.invalidResponse
+        }
+    }
+
+    private func downloadFileSequential(
         from sourceURL: URL,
         file: TorrentFile,
         writer: TorrentFileWriter,
