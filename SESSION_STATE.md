@@ -2,7 +2,7 @@
 
 _Overwritten at every wrap-up, never appended. Under 30 lines; git has the history. Don't record build or test status._
 
-- **Active plan:** none. Hardening 2 finished (last step split `PeerWireClient`, `TorrentSession`, `SwiftorrentRootView` into per-concern files).
+- **Active plan:** `docs/plans/choked-peer-slots.md`, not started. It still needs the user's OK, including using Internet Archive torrents in `Fixtures/` as thin swarms (no copyrighted torrents).
 
 ## What this is
 Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages/Core` (SwiftorrentCore: bencode, trackers, DHT, peer wire over TCP/uTP, MSE, downloader), `Domain` (TorrentSession, store), `Features` (SwiftUI, has a test target), app in `App/Swiftorrent`, bench in `Tools/SwiftorrentBench`.
@@ -21,8 +21,9 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 - Dock badge is a fixed-size `DockBadge` tile; header glass controls need `.tint(.primary)`.
 
 ## Next
-- Bench: `--utp-probe` prints TCP connect percentiles; download runs print each status change with its time.
+- Get the user's OK on the plan, then step 1: report the unchoked-peer count in `TorrentDownloadProgress` and print it in the bench.
 
 ## Open problems
 - Inbound-only peers unreachable by design; tracker `port` is 0 (decision 0002).
-- Suspected, unmeasured: choked peers that keep sending HAVEs are never dropped (90 s idle timer resets), so in a thin swarm they could hold all 100 slots.
+- Confirmed in code, impact not measured: the 90 s idle timeout is a per-read timeout (`PeerWireClient+Download.swift:163`), so a choked peer that keeps sending HAVEs or keep-alives never loses its slot. The active plan measures this first.
+- Root package has no test target; `swift test --package-path .` exits 1 with "no tests found" (expected).
