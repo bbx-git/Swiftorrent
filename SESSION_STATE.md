@@ -2,7 +2,7 @@
 
 _Overwritten at every wrap-up, never appended. Under 30 lines; git has the history. Don't record build or test status._
 
-- **Active plan:** `docs/plans/clear-completed.md` (not started; awaiting user's go and the "all complete" rule)
+- **Active plan:** none
 
 ## What this is
 Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages/Core` (SwiftorrentCore: bencode, trackers, DHT, peer wire over TCP/uTP, MSE, downloader), `Domain` (TorrentSession, store), `Features` (SwiftUI, has a test target), app in `App/Swiftorrent`, bench in `Tools/SwiftorrentBench`.
@@ -15,7 +15,8 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 - Web-seed segments are written strictly in order; resume depends on the partial file being a contiguous prefix (`docs/decisions/0004-web-seed-ordered-segments.md`).
 - uTP is outbound-only, TCP first. `UTPPeerTransport.receive` must fail when the transport was closed before the waiter registered (parked a worker for a full timeout); regression test `receiveAfterCloseFailsPromptly` (`docs/decisions/0006-utp-outbound-fallback.md`).
 - The final `stopped` announce is capped at 3 s (`announceStopped`); it must not wait for the full discovery deadline again (test `stoppedAnnounceIsCapped`).
-- Dock badge shows combined speed via `DockBadge` (nil at 0); it's driven by the main window, so it goes stale if that window is closed mid-download.
+- Dock speed badge is a hand-drawn fixed-size tile (`DockBadge`; the system badge resizes with its text); it is driven by the main window, so it goes stale if that window is closed mid-download.
+- "Clear Completed" (`removeCompleted`) removes only complete rows. Header glass controls need `.tint(.primary)`: the window-wide graphite tint makes their labels near-black while the window is active.
 
 ## Next
 1. Optional: if a 10+ s tail with uTP pieces recurs, deprioritise uTP peers in piece assignment.

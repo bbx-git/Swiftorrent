@@ -124,10 +124,6 @@ public struct SwiftorrentRootView: View {
             .glassEffect(.regular.tint(.swiftorrentPanel), in: RoundedRectangle(cornerRadius: 8))
 
             Spacer()
-
-            Label("Download-only mode. No seeding.", systemImage: "lock.shield")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
         .padding(20)
         .background(Color.black.opacity(0.045))
@@ -144,6 +140,12 @@ public struct SwiftorrentRootView: View {
     private var header: some View {
         HStack {
             SpeedLimitControl(limit: downloadRateLimitBinding)
+            Button("Clear Completed", systemImage: "checkmark.circle.badge.xmark") {
+                session.removeCompleted()
+            }
+            .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.16)).interactive()))
+            .tint(.primary)
+            .disabled(!session.hasCompleted)
             Spacer()
             Metric(title: "Speed", value: session.downloadSpeedDescription, systemImage: "arrow.down.circle")
             Metric(title: "Active", value: "\(session.items.filter { $0.state == .downloading }.count)", systemImage: "arrow.down.to.line")
@@ -508,6 +510,9 @@ private struct SpeedLimitControl: View {
         }
         .menuStyle(.button)
         .buttonStyle(.glass(.regular.tint(Color.swiftorrentGraphite.opacity(0.16)).interactive()))
+        // The window-wide graphite tint would otherwise colour the label near
+        // black on the dark glass while the window is active.
+        .tint(.primary)
         .fixedSize()
         .help("Limit total download speed")
         .popover(isPresented: $showingCustom, arrowEdge: .bottom) { customForm }

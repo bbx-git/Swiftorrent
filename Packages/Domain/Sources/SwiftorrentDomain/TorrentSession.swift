@@ -213,6 +213,19 @@ public final class TorrentSession {
         persist()
     }
 
+    /// Whether any row in the list has finished downloading.
+    public var hasCompleted: Bool {
+        items.contains { $0.state == .complete }
+    }
+
+    /// Removes every completed torrent from the list. Files stay on disk, and
+    /// paused, failed and active rows are untouched.
+    public func removeCompleted() {
+        for item in items where item.state == .complete {
+            remove(item)
+        }
+    }
+
     /// Discards a torrent still in the add dialog (resolution failed, or the user
     /// dismissed the dialog without starting). Nothing was written to disk yet.
     /// A no-op for anything not in `pendingItems`: once `startDownload` moves the
