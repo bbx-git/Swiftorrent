@@ -347,9 +347,8 @@ Reproduce: `swift build -c release --product swiftorrent-bench`, then
       (2 runs). See `WebSeedDownloader`.
 - [ ] **Make the benchmark statistically sound:** have `benchmark.sh` do N trials and
       alternate client order; report median. Currently single-trial/directional.
-- [ ] **Optional:** teach `swiftorrent-bench` a `--strip-web-seeds` flag so BBB can be
-      forced down the peer pipeline for an apples-to-apples swarm comparison with
-      transmission on the same content.
+- [x] **`--strip-web-seeds` — DONE 2026-10-14.** `swiftorrent-bench --torrent <path>
+      --strip-web-seeds` drops the HTTP sources so the same content comes from the swarm.
 
 ## Post-restructure re-run (2026-10-14)
 

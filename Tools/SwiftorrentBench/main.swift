@@ -11,6 +11,7 @@ import SwiftorrentCore
 //   swiftorrent-bench --torrent <path> [--dest <dir>] [--label <name>]
 //   swiftorrent-bench --magnet "<magnet:...>" [--dest <dir>] [--label <name>]
 //   swiftorrent-bench --magnet "<magnet:...>" --resolve-only [--label <name>]
+//   swiftorrent-bench --torrent <path> --strip-web-seeds   (force the peer swarm)
 //
 // A fresh unique destination is used per run unless --dest is given, so every
 // benchmark starts from a cold cache.
@@ -31,6 +32,7 @@ struct Args {
     var dest: String?
     var label: String = "swiftorrent"
     var resolveOnly = false
+    var stripWebSeeds = false
 }
 
 func parseArgs() -> Args {
@@ -43,6 +45,7 @@ func parseArgs() -> Args {
         case "--dest": args.dest = it.next()
         case "--label": args.label = it.next() ?? args.label
         case "--resolve-only": args.resolveOnly = true
+        case "--strip-web-seeds": args.stripWebSeeds = true
         default:
             FileHandle.standardError.write(Data("Unknown argument: \(flag)\n".utf8))
         }
@@ -128,7 +131,7 @@ if let d = args.dest {
         .appendingPathComponent("swiftorrent-bench-\(UUID().uuidString)", isDirectory: true)
 }
 
-let metainfo: TorrentMetainfo
+var metainfo: TorrentMetainfo
 do {
     if let path = args.torrentPath {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -166,6 +169,20 @@ do {
 if args.resolveOnly {
     FileHandle.standardError.write(Data("--resolve-only requires --magnet\n".utf8))
     exit(2)
+}
+
+if args.stripWebSeeds {
+    // Same content, no HTTP source: the download has to come from the peer swarm.
+    metainfo = TorrentMetainfo(
+        name: metainfo.name,
+        announceURLs: metainfo.announceURLs,
+        files: metainfo.files,
+        pieceLength: metainfo.pieceLength,
+        pieceHashes: metainfo.pieceHashes,
+        totalSize: metainfo.totalSize,
+        infoHash: metainfo.infoHash,
+        infoDictionaryData: metainfo.infoDictionaryData
+    )
 }
 
 let totalBytes = metainfo.files.reduce(Int64(0)) { $0 + $1.length }
