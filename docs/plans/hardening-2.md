@@ -12,6 +12,7 @@ The app leaves nothing on disk about what was downloaded except the files themse
 - [ ] 6. Split `PeerWireClient.swift`, `TorrentSession.swift`, `SwiftorrentRootView.swift` by responsibility (no behaviour change).
 
 2026-10-14: step 3 found a TSan report on the per-file progress array (fixed, merged into `complete`). Step 4 found two real growth bugs (lingering `Task.sleep` timeouts; uTP `Data` buffers), fixed with `DeadlineTests` and `receiveBufferDoesNotKeepConsumedBytes`. ASan run shows first byte ~100 s after resolve (normal build 1.6-2.5 s); not chased, probably handshake timeouts under ASan slowdown. Results in `docs/BENCHMARK.md`.
+2026-10-14: the ASan slow start does not reproduce (1.5 s). Slow magnet starts came from connect timeouts and were fixed: uTP races TCP, 64 metadata probes, web seed fail-fast (see `docs/BENCHMARK.md`, "Magnet slow start").
 
 ## Done when
 - Test for the ephemeral session exists; sanitizer runs are clean (or findings fixed with tests).

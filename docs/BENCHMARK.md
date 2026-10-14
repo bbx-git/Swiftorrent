@@ -449,3 +449,17 @@ Arch ISO without web seeds (1.56 GB, peers only), `swiftorrent-bench`, M-series 
 - Thread Sanitizer over a full download and 3 trackerless magnet resolves: one report (per-file progress array shared out of `PieceDownloadCoordinator`), fixed; then clean. Address Sanitizer over a full magnet download: clean.
 - Memory before: RSS 545 MB at 75 %, heap 702 MB in 3.1 M objects. Two causes: about 510k cancelled `Task.sleep` timeouts kept alive until their 30 s deadline (one per socket read), and uTP receive buffers (`Data.removeFirst`) keeping every byte received (single buffers up to 98 MB). After `withDeadline` (dispatch timer) and byte-array uTP buffers: RSS 100 MB at 75 %, peak 117 MB, heap 44 MB / 20k objects. Throughput unchanged (18.7 MiB/s, swarm-bound).
 - Time Profiler, 45 s: about half a core at about 20 MiB/s. RC4 12 % → rewritten in place over buffer pointers (515 → 1046 MB/s). MSE Diffie-Hellman 7 % (9.4 ms per handshake, bit-serial `BigUInt.mod`) and `rawReceive` memmove 1.7 % left as is: not worth the risk at this CPU cost.
+
+## Magnet slow start (2026-10-14)
+
+A public TV-episode magnet the user found slow (21 trackers, many dead; swarm over 300 peers), `--resolve-only`, 10 runs per build (no content was downloaded). `--utp-probe` over 300 of its peers: 8-17 answer TCP, 19-27 uTP, 11-12 uTP only; TCP connect p50 0.14-0.2 s, tail ~7 s (SYN retries). About 92% answer neither.
+
+| Build | Resolve times (s) | Median |
+|---|---|---|
+| Before: 24 probes, uTP only after TCP fails (8 s + 5 s) | 0.8-0.9 ×4, 13.9-14.2 ×4, 27.7-27.9 ×2 | 14 |
+| uTP races TCP after a 1 s head start | 0.8-1.6 ×5, 8.9-9.1 ×3, 16.8, 19.0 | 5 |
+| Race + 64 concurrent probes | 0.9-5.0 | 3.0 |
+
+Before, the times were whole multiples of ~14 s: every probe slot was pinned by a dead peer for the TCP timeout plus the uTP fallback before trying the next one. Swarm downloads after the change (20 s each): Debian first byte 2.2 s, 15.5 MiB/s avg; Arch 1.4 s, 18.1 MiB/s avg, in line with earlier runs.
+
+Web seeds: a seed that delivers nothing in 5 s is skipped and seeds get 10 s in total before the swarm. Debian with three unreachable `url-list` entries: first byte 13.5 s (was 90+ s; one dead seed alone was 31.9 s). The earlier 100 s first byte under ASan does not reproduce (Arch magnet under ASan: 1.5 s).

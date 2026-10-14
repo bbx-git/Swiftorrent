@@ -13,9 +13,19 @@ func withDeadline<T: Sendable>(
     timeoutError: any Error & Sendable,
     operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
-    let task = Task { try await operation() }
-    let expired = Mutex(false)
+    try await withDisarmableDeadline(duration, timeoutError: timeoutError) { _ in try await operation() }
+}
+
+/// Like `withDeadline`, but `operation` gets a `disarm` closure that calls the
+/// deadline off, e.g. once the first byte has arrived.
+func withDisarmableDeadline<T: Sendable>(
+    _ duration: Duration,
+    timeoutError: any Error & Sendable,
+    operation: @escaping @Sendable (_ disarm: @escaping @Sendable () -> Void) async throws -> T
+) async throws -> T {
     let timer = DispatchSource.makeTimerSource(queue: .global())
+    let task = Task { try await operation { timer.cancel() } }
+    let expired = Mutex(false)
     timer.schedule(deadline: .now() + .nanoseconds(Int(min(duration, .seconds(86_400)).nanoseconds)))
     timer.setEventHandler {
         expired.withLock { $0 = true }

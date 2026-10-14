@@ -209,7 +209,7 @@ public struct MagnetMetadataResolver: Sendable {
     /// is what keeps a magnet from stalling behind unreachable/slow peers while
     /// still finding the occasional slow seed that actually has the metadata.
     private static let maxMetadataPeers = 300
-    private static let maxConcurrentMetadataFetches = 24
+    private static let maxConcurrentMetadataFetches = 64
     private static let metadataPhaseDeadline: Duration = .seconds(90)
 
     private func resolveFromExactSources(

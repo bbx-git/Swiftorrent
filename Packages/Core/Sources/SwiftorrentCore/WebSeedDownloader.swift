@@ -17,6 +17,13 @@ struct WebSeedDownloader: Sendable {
     var segmentSize: Int64 = 1 << 20
     /// Concurrent range requests per file; 1 disables segmenting.
     var maxConnections = 8
+    /// A seed that hasn't delivered its first chunk by then is skipped. A dead
+    /// host otherwise holds the swarm back for the full 30 s request timeout, and
+    /// one that can't send its first 1 MiB segment this fast is slower than peers.
+    var firstByteDeadline: Duration = .seconds(5)
+    /// Total time seeds may take to deliver a first chunk before the download
+    /// moves on to peers, however many dead seeds the torrent lists.
+    var startBudget: Duration = .seconds(10)
 
     init(session: URLSession, rateLimiter: RateLimiter? = nil) {
         self.session = session
@@ -86,9 +93,13 @@ struct WebSeedDownloader: Sendable {
         )
     }
 
+    /// Raised when a seed hasn't delivered anything within `firstByteDeadline`.
+    struct NoFirstByte: Error {}
+
     /// Shared driver: tries each web seed in turn, streaming `files` whole and
     /// then running `afterFiles` (used to backfill boundary slices). Fails over
-    /// to the next seed on any error; rethrows the last error if all seeds fail.
+    /// to the next seed on any error; rethrows the last error if all seeds fail
+    /// or none delivers a first chunk within `startBudget`.
     private func stream(
         files: [TorrentFile],
         writer: TorrentFileWriter,
@@ -97,31 +108,39 @@ struct WebSeedDownloader: Sendable {
         initialDownloaded: Int64,
         totalBytes: Int64,
         progress: @Sendable @escaping (TorrentDownloadProgress) async -> Void,
-        afterFiles: @Sendable (URL) async throws -> Void
+        afterFiles: @escaping @Sendable (URL) async throws -> Void
     ) async throws {
         var lastError: Error?
+        let clock = ContinuousClock()
+        let giveUpAt = clock.now + startBudget
         for webSeedURL in webSeedURLs {
             try Task.checkCancellation()
+            let budget = min(firstByteDeadline, giveUpAt - clock.now)
+            guard budget > .zero else { break }
             do {
-                var downloadedBytes = initialDownloaded
-                var perFileBytes = [Int64](repeating: 0, count: mapper.metainfo.files.count)
-                for file in files {
-                    try Task.checkCancellation()
-                    let sourceURL = webSeedURL.torrentSourceURL(for: file, singleFile: !mapper.metainfo.createsEnclosingDirectory)
-                    let fileBase = downloadedBytes
-                    let baseFileBytes = perFileBytes
-                    let snapshot: @Sendable (Int64) -> [TorrentFileProgress] = { currentFileBytes in
-                        var bytes = baseFileBytes
-                        if file.id < bytes.count { bytes[file.id] = min(currentFileBytes, file.length) }
-                        return mapper.snapshot(perFileBytes: bytes)
+                try await withDisarmableDeadline(budget, timeoutError: NoFirstByte()) { disarm in
+                    var downloadedBytes = initialDownloaded
+                    var perFileBytes = [Int64](repeating: 0, count: mapper.metainfo.files.count)
+                    for file in files {
+                        try Task.checkCancellation()
+                        let sourceURL = webSeedURL.torrentSourceURL(for: file, singleFile: !mapper.metainfo.createsEnclosingDirectory)
+                        let fileBase = downloadedBytes
+                        let baseFileBytes = perFileBytes
+                        let snapshot: @Sendable (Int64) -> [TorrentFileProgress] = { currentFileBytes in
+                            var bytes = baseFileBytes
+                            if file.id < bytes.count { bytes[file.id] = min(currentFileBytes, file.length) }
+                            return mapper.snapshot(perFileBytes: bytes)
+                        }
+                        await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: downloadedBytes, totalBytes: totalBytes, files: snapshot(0)))
+                        downloadedBytes += try await downloadFile(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: downloadedBytes) { currentDownloadedBytes in
+                            disarm()
+                            await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: currentDownloadedBytes, totalBytes: totalBytes, files: snapshot(currentDownloadedBytes - fileBase)))
+                        }
+                        if file.id < perFileBytes.count { perFileBytes[file.id] = file.length }
                     }
-                    await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: downloadedBytes, totalBytes: totalBytes, files: snapshot(0)))
-                    downloadedBytes += try await downloadFile(from: sourceURL, file: file, writer: writer, progressDownloadedBytes: downloadedBytes) { currentDownloadedBytes in
-                        await progress(TorrentDownloadProgress(status: "Downloading from web seed: \(file.path)", downloadedBytes: currentDownloadedBytes, totalBytes: totalBytes, files: snapshot(currentDownloadedBytes - fileBase)))
-                    }
-                    if file.id < perFileBytes.count { perFileBytes[file.id] = file.length }
+                    disarm()
+                    try await afterFiles(webSeedURL)
                 }
-                try await afterFiles(webSeedURL)
                 return
             } catch is CancellationError {
                 throw CancellationError()

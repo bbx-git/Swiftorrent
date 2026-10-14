@@ -12,7 +12,7 @@ import SwiftorrentCore
 //   swiftorrent-bench --magnet "<magnet:...>" [--dest <dir>] [--label <name>]
 //   swiftorrent-bench --magnet "<magnet:...>" --resolve-only [--label <name>]
 //   swiftorrent-bench --torrent <path> --strip-web-seeds   (force the peer swarm)
-//   swiftorrent-bench --torrent <path> --transport tcp|utp|auto   (default auto: TCP, uTP fallback)
+//   swiftorrent-bench --torrent <path> --transport tcp|utp|auto   (default auto: TCP, uTP raced after 1 s)
 //   swiftorrent-bench --torrent <path> --utp-probe          (count peers reachable over TCP / uTP)
 //
 // A fresh unique destination is used per run unless --dest is given, so every
@@ -86,6 +86,7 @@ actor Meter {
     private var peak: Double = 0
     private var total: Int64 = 0
     private var firstByteAt: ContinuousClock.Instant?
+    private var lastStatus = ""
 
     init(label: String) {
         self.label = label
@@ -94,6 +95,10 @@ actor Meter {
 
     func update(_ p: TorrentDownloadProgress) {
         total = p.totalBytes
+        if p.status != lastStatus {
+            lastStatus = p.status
+            print(String(format: "[%@] %5.1fs  status: %@", label, seconds(ContinuousClock.now - start), p.status))
+        }
         if firstByteAt == nil, p.downloadedBytes > 0 {
             firstByteAt = ContinuousClock.now
             let ttfb = seconds(ContinuousClock.now - start)
@@ -186,6 +191,11 @@ if args.resolveOnly {
 if args.utpProbe {
     let result = await UTPProbe.run(metainfo: metainfo, peerID: TorrentDownloader.makePeerID())
     print("UTPPROBE \(args.label) peers=\(result.peers) tcp=\(result.tcpReachable) utp=\(result.utpReachable) utp_only=\(result.utpOnly)")
+    let times = result.tcpConnectSeconds.sorted()
+    if !times.isEmpty {
+        func percentile(_ p: Double) -> Double { times[min(times.count - 1, Int(Double(times.count) * p))] }
+        print(String(format: "TCPCONNECT %@ p50=%.2fs p90=%.2fs p99=%.2fs max=%.2fs", args.label, percentile(0.5), percentile(0.9), percentile(0.99), times.last!))
+    }
     exit(0)
 }
 

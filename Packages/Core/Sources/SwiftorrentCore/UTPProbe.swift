@@ -9,10 +9,12 @@ public struct UTPProbeResult: Sendable {
     public var utpReachable = 0
     /// Peers that refused TCP but answered a uTP SYN: the ones uTP would add.
     public var utpOnly = 0
+    /// Seconds each successful TCP connect took, to size connect timeouts.
+    public var tcpConnectSeconds: [Double] = []
 }
 
 public enum UTPProbe {
-    private static let timeout: TimeInterval = 5
+    private static let timeout: TimeInterval = 10
     private static let concurrency = 50
     private static let discoveryDeadline: Duration = .seconds(25)
 
@@ -21,7 +23,7 @@ public enum UTPProbe {
         var result = UTPProbeResult()
         result.peers = peers.count
 
-        await withTaskGroup(of: (tcp: Bool, utp: Bool).self) { group in
+        await withTaskGroup(of: (tcp: Double?, utp: Bool).self) { group in
             var iterator = peers.makeIterator()
             func addNext() {
                 guard let peer = iterator.next() else { return }
@@ -33,9 +35,12 @@ public enum UTPProbe {
             }
             for _ in 0..<concurrency { addNext() }
             for await outcome in group {
-                if outcome.tcp { result.tcpReachable += 1 }
+                if let seconds = outcome.tcp {
+                    result.tcpReachable += 1
+                    result.tcpConnectSeconds.append(seconds)
+                }
                 if outcome.utp { result.utpReachable += 1 }
-                if outcome.utp, !outcome.tcp { result.utpOnly += 1 }
+                if outcome.utp, outcome.tcp == nil { result.utpOnly += 1 }
                 addNext()
             }
         }
@@ -70,8 +75,10 @@ public enum UTPProbe {
         }
     }
 
-    private static func tcpReachable(_ peer: PeerEndpoint) async -> Bool {
-        guard let port = NWEndpoint.Port(rawValue: peer.port) else { return false }
+    /// Seconds the TCP connect took, or nil if the peer didn't answer.
+    private static func tcpReachable(_ peer: PeerEndpoint) async -> Double? {
+        guard let port = NWEndpoint.Port(rawValue: peer.port) else { return nil }
+        let start = ContinuousClock.now
         let connection = NWConnection(host: NWEndpoint.Host(peer.host), port: port, using: .tcp)
         let queue = DispatchQueue(label: "swiftorrent.utpprobe.tcp")
         let reachable = (try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
@@ -87,7 +94,9 @@ public enum UTPProbe {
             queue.asyncAfter(deadline: .now() + timeout) { once.resume(returning: false) }
         }) ?? false
         connection.cancel()
-        return reachable
+        guard reachable else { return nil }
+        let elapsed = ContinuousClock.now - start
+        return Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
     }
 
     /// Sends a uTP SYN (twice, 2 s apart, as a lost datagram is common) and

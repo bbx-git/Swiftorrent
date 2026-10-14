@@ -69,7 +69,7 @@ public actor PeerWireClient {
     /// Which transports a connection may use. `.auto` is the default; the other
     /// two exist so the benchmark can measure each transport on its own.
     public enum TransportPolicy: Sendable {
-        /// TCP first, uTP when TCP cannot connect.
+        /// TCP with a 1 s head start, then uTP alongside it; the first ready wins.
         case auto
         case tcpOnly
         case utpOnly
@@ -102,8 +102,13 @@ public actor PeerWireClient {
     private let endpoint: PeerEndpoint
     private let infoHash: Data
     private let peerID: Data
-    /// A uTP fallback only adds this much to a dead peer's connect time.
+    /// Cap on a uTP connect once a peer is known to need uTP.
     private static let utpConnectTimeout: TimeInterval = 5
+    /// How long TCP gets on its own before uTP is tried alongside it. Reachable
+    /// peers answer TCP in ~0.2 s (median); in public swarms about 40% of the
+    /// reachable peers answer only uTP, and waiting out the TCP timeout first
+    /// delayed each of those by the full `connectTimeout`.
+    private static let utpHeadStart: Duration = .seconds(1)
     /// Upper bound on how long the TCP connection may take to become ready.
     private let connectTimeout: TimeInterval
     /// Upper bound on any single send/receive wire operation. A peer that goes
@@ -119,8 +124,7 @@ public actor PeerWireClient {
     private let encryptionPolicy: EncryptionPolicy
     private let transportPolicy: TransportPolicy
     private var transport: (any PeerTransport)?
-    /// Set once TCP failed to connect and uTP was used instead (or from the start
-    /// under `.utpOnly`).
+    /// Set once uTP won the connect race (or from the start under `.utpOnly`).
     private var usesUTP: Bool
     /// Once the MSE handshake selects RC4, `sendCipher` encrypts our outgoing
     /// bytes and `recvCipher` decrypts the peer's — both `nil` on a plaintext
@@ -198,29 +202,30 @@ public actor PeerWireClient {
     }
 
     /// Opens the connection and waits for it to become ready (bounded by
-    /// `connectTimeout`). Tries TCP first and falls back to uTP when TCP cannot
-    /// connect; once uTP was needed, reconnects go straight to it. Resets any
-    /// buffered input from a prior attempt.
+    /// `connectTimeout`). Under `.auto`, TCP gets `utpHeadStart`, then uTP is tried
+    /// alongside it and the first one ready is kept; once uTP was used, reconnects
+    /// go straight to it. Resets any buffered input from a prior attempt.
     private func openConnection() async throws {
         try Task.checkCancellation()
         inputBuffer.removeAll(keepingCapacity: true)
-        if !usesUTP {
-            let tcp = try TCPPeerTransport(endpoint: endpoint)
-            transport = tcp
-            do {
-                try await withTimeout(connectTimeout) { try await tcp.open() }
-                return
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                tcp.close()
-                guard transportPolicy == .auto else { throw error }
-                usesUTP = true
-            }
+        if usesUTP {
+            let utp = try UTPPeerTransport(endpoint: endpoint)
+            transport = utp
+            try await withTimeout(min(connectTimeout, Self.utpConnectTimeout)) { try await utp.open() }
+            return
         }
-        let utp = try UTPPeerTransport(endpoint: endpoint)
-        transport = utp
-        try await withTimeout(min(connectTimeout, Self.utpConnectTimeout)) { try await utp.open() }
+        let tcp = try TCPPeerTransport(endpoint: endpoint)
+        guard transportPolicy == .auto else {
+            transport = tcp
+            try await withTimeout(connectTimeout) { try await tcp.open() }
+            return
+        }
+        let endpoint = endpoint
+        let opened = try await withTimeout(connectTimeout) {
+            try await openFirst(primary: tcp, fallback: { try UTPPeerTransport(endpoint: endpoint) }, fallbackDelay: Self.utpHeadStart)
+        }
+        transport = opened.transport
+        usesUTP = opened.isFallback
     }
 
     /// The plaintext BitTorrent handshake. Runs over whatever transport is in

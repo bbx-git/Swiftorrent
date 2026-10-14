@@ -301,3 +301,78 @@ final class UTPPeerTransport: PeerTransport, @unchecked Sendable {
         }
     }
 }
+
+/// Opens `primary`, and also `fallback` once `primary` has failed or still isn't
+/// ready after `fallbackDelay`; keeps whichever is ready first and closes the
+/// other. `fallback` is only created if it is needed.
+func openFirst(
+    primary: any PeerTransport,
+    fallback makeFallback: @escaping @Sendable () throws -> any PeerTransport,
+    fallbackDelay: Duration
+) async throws -> (transport: any PeerTransport, isFallback: Bool) {
+    enum Event: Sendable {
+        case primary((any Error)?)
+        case fallback((any Error)?)
+        case delayElapsed
+    }
+    var fallback: (any PeerTransport)?
+    var result: Result<(transport: any PeerTransport, isFallback: Bool), any Error>?
+    await withTaskGroup(of: Event.self) { group in
+        group.addTask {
+            do { try await primary.open(); return .primary(nil) } catch { return .primary(error) }
+        }
+        group.addTask {
+            try? await Task.sleep(for: fallbackDelay)
+            return .delayElapsed
+        }
+        var primaryFailed = false
+        var fallbackFailed = false
+        var lastError: any Error = PeerWireError.connectionFailed
+        func startFallback() {
+            guard fallback == nil, !fallbackFailed else { return }
+            do {
+                let transport = try makeFallback()
+                fallback = transport
+                group.addTask {
+                    do { try await transport.open(); return .fallback(nil) } catch { return .fallback(error) }
+                }
+            } catch {
+                fallbackFailed = true
+                lastError = error
+            }
+        }
+        for await event in group {
+            switch event {
+            case .primary(nil):
+                result = .success((primary, false))
+            case .fallback(nil):
+                result = .success((fallback!, true))
+            case let .primary(error?):
+                primaryFailed = true
+                lastError = error
+                startFallback()
+            case let .fallback(error?):
+                fallbackFailed = true
+                lastError = error
+            case .delayElapsed:
+                if !primaryFailed { startFallback() }
+            }
+            if result == nil, primaryFailed, fallbackFailed { result = .failure(lastError) }
+            if result != nil { break }
+        }
+        group.cancelAll()
+    }
+    switch result {
+    case let .success(opened):
+        if opened.isFallback { primary.close() } else { fallback?.close() }
+        return opened
+    case let .failure(error):
+        primary.close()
+        fallback?.close()
+        throw error
+    case nil:
+        primary.close()
+        fallback?.close()
+        throw CancellationError()
+    }
+}
