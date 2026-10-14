@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import Network
 @testable import SwiftorrentCore
 import Testing
 
@@ -92,6 +94,254 @@ struct HostileInputTests {
         }
         #expect(throws: TorrentMetainfoError.invalidPieces) {
             try parse(info(pieceCount: 5, length: 20_000))
+        }
+    }
+}
+
+// MARK: - Hostile peer scenarios
+
+/// A loopback peer that completes the BitTorrent handshake and then plays a fixed
+/// script of (delay, bytes) steps, ignoring whatever the client sends.
+private final class ScriptedPeer: @unchecked Sendable {
+    typealias Step = (delay: TimeInterval, bytes: Data)
+
+    private let infoHash: Data
+    private let supportsExtensions: Bool
+    private let script: [Step]
+    private let queue = DispatchQueue(label: "scripted-peer")
+    private let listener: NWListener
+    private let lock = NSLock()
+    private var connections: [NWConnection] = []
+
+    init(infoHash: Data, supportsExtensions: Bool = false, script: [Step]) throws {
+        self.infoHash = infoHash
+        self.supportsExtensions = supportsExtensions
+        self.script = script
+        listener = try NWListener(using: .tcp)
+    }
+
+    func start() async throws -> UInt16 {
+        listener.newConnectionHandler = { [self] connection in
+            lock.lock(); connections.append(connection); lock.unlock()
+            serve(connection)
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            let resume = ResumeOnce(continuation)
+            listener.stateUpdateHandler = { [listener] state in
+                switch state {
+                case .ready:
+                    if let port = listener.port { resume.resume(returning: port.rawValue) }
+                case let .failed(error):
+                    resume.resume(throwing: error)
+                default:
+                    break
+                }
+            }
+            listener.start(queue: queue)
+        }
+    }
+
+    func stop() {
+        listener.cancel()
+        lock.lock(); let all = connections; lock.unlock()
+        all.forEach { $0.cancel() }
+    }
+
+    private func serve(_ connection: NWConnection) {
+        connection.stateUpdateHandler = { [self] state in
+            guard case .ready = state else { return }
+            connection.stateUpdateHandler = nil
+            var reserved = Data(count: 8)
+            if supportsExtensions { reserved[5] = 0x10 }
+            let greeting = Data([19]) + Data("BitTorrent protocol".utf8) + reserved + infoHash + Data(repeating: 7, count: 20)
+            connection.send(content: greeting, completion: .contentProcessed { _ in })
+            // Drain whatever the client sends so its writes never block.
+            drain(connection)
+            var elapsed: TimeInterval = 0
+            for step in script {
+                elapsed += step.delay
+                queue.asyncAfter(deadline: .now() + elapsed) {
+                    connection.send(content: step.bytes, completion: .contentProcessed { _ in })
+                }
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func drain(_ connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [self] data, _, isComplete, error in
+            if error == nil, !isComplete, data != nil { drain(connection) }
+        }
+    }
+}
+
+private func frame(_ id: UInt8, _ payload: Data = Data()) -> Data {
+    var length = Data()
+    length.appendUInt32(UInt32(payload.count + 1))
+    return length + Data([id]) + payload
+}
+
+private func u32(_ value: Int) -> Data {
+    var data = Data()
+    data.appendUInt32(UInt32(value))
+    return data
+}
+
+private actor Claims {
+    private(set) var seenSizes: [Int] = []
+    private var handed: Bool
+
+    /// - Parameter handOut: when `false`, never hands out a piece (only records
+    ///   the availability it was shown).
+    init(handOut: Bool = true) {
+        handed = !handOut
+    }
+
+    func claim(available: Set<Int>) -> Int? {
+        seenSizes.append(available.count)
+        if handed { return nil }
+        handed = true
+        return 0
+    }
+}
+
+@Suite("Hostile peers")
+struct HostilePeerTests {
+    private let infoHash = Data(repeating: 0x5A, count: 20)
+
+    private func makeClient(port: UInt16, snub: TimeInterval = 1.5, idle: TimeInterval = 5) -> PeerWireClient {
+        PeerWireClient(
+            endpoint: PeerEndpoint(host: "127.0.0.1", port: port),
+            infoHash: infoHash,
+            peerID: Data(repeating: 1, count: 20),
+            connectTimeout: 2,
+            ioTimeout: 2,
+            snubTimeout: snub,
+            idleTimeout: idle,
+            encryptionPolicy: .plaintextOnly
+        )
+    }
+
+    private func runDownload(
+        _ client: PeerWireClient,
+        claims: Claims,
+        pieceCount: Int = 1,
+        pieceLength: Int = 10
+    ) async -> Error? {
+        do {
+            try await client.connect()
+            _ = try await client.readInitialAvailability(pieceCount: pieceCount)
+            try await client.downloadPieces(
+                blockSize: 4,
+                pieceLength: { _ in pieceLength },
+                expectedHash: { _ in Data(repeating: 0, count: 20) },
+                claimNextPiece: { available, _, _ in await claims.claim(available: available) },
+                onPieceComplete: { _, _ in },
+                onReturnPiece: { _ in }
+            )
+            return nil
+        } catch {
+            return error
+        }
+    }
+
+    @Test("A bitfield or have beyond the piece count cannot grow availability")
+    func availabilityIsBounded() async throws {
+        let hugeBitfield = frame(5, Data(repeating: 0xFF, count: 200_000))
+        let farHave = frame(4, u32(5_000_000))
+        let peer = try ScriptedPeer(infoHash: infoHash, script: [
+            (0, frame(5, Data([0x80]))),                 // bitfield: piece 0 only, still choked
+            (0.2, hugeBitfield),
+            (0.1, farHave),
+            (0.2, frame(1))                              // unchoke: the client now claims work
+        ])
+        let port = try await peer.start()
+        defer { peer.stop() }
+
+        let client = makeClient(port: port)
+        let claims = Claims(handOut: false)
+        _ = await runDownload(client, claims: claims)
+        await client.close()
+
+        let sizes = await claims.seenSizes
+        #expect(!sizes.isEmpty, "the client never claimed work")
+        #expect(sizes.allSatisfy { $0 <= 1 }, "availability grew to \(sizes)")
+    }
+
+    @Test("A block that is off the request grid drops the peer")
+    func misalignedBlockIsRejected() async throws {
+        // Piece 0 is 10 bytes in blocks of 4; begin = 1 is not a block we asked for.
+        let bogus = frame(7, u32(0) + u32(1) + Data([1, 2, 3, 4]))
+        let peer = try ScriptedPeer(infoHash: infoHash, script: [
+            (0, frame(5, Data([0x80])) + frame(1)),
+            (0.3, bogus)
+        ])
+        let port = try await peer.start()
+        defer { peer.stop() }
+
+        let client = makeClient(port: port)
+        let error = await runDownload(client, claims: Claims())
+        await client.close()
+
+        guard let wire = error as? PeerWireError, case .unexpectedMessage = wire else {
+            Issue.record("Expected unexpectedMessage, got \(String(describing: error))")
+            return
+        }
+    }
+
+    @Test("Keep-alives do not extend the snub timeout")
+    func keepAlivesDoNotDefeatSnubTimeout() async throws {
+        // After unchoking, the peer sends only keep-alives (four zero bytes) every
+        // 100 ms for 4 s and never any data. The snub timeout is 1 s.
+        var script: [ScriptedPeer.Step] = [(0, frame(5, Data([0x80])) + frame(1))]
+        for _ in 0..<40 { script.append((0.1, Data(count: 4))) }
+        let peer = try ScriptedPeer(infoHash: infoHash, script: script)
+        let port = try await peer.start()
+        defer { peer.stop() }
+
+        let client = makeClient(port: port, snub: 1, idle: 5)
+        let start = ContinuousClock.now
+        let error = await runDownload(client, claims: Claims())
+        let elapsed = ContinuousClock.now - start
+        await client.close()
+
+        guard let wire = error as? PeerWireError, case .timedOut = wire else {
+            Issue.record("Expected timedOut, got \(String(describing: error))")
+            return
+        }
+        #expect(elapsed < .seconds(2.5), "snubbed peer was kept for \(elapsed)")
+    }
+
+    @Test("Oversized metadata pieces are rejected")
+    func oversizedMetadataPiece() async throws {
+        // metadata_size 20_000 => two pieces (16 KiB + rest). The peer answers piece 0
+        // with 100 KB instead of 16 KiB.
+        let handshake = frame(20, Data([0]) + BencodeEncoder.encode([
+            "m": .dictionary(["ut_metadata": .integer(3)]),
+            "metadata_size": .integer(20_000)
+        ]))
+        let header = BencodeEncoder.encode(["msg_type": .integer(1), "piece": .integer(0), "total_size": .integer(20_000)])
+        let oversized = frame(20, Data([1]) + header + Data(repeating: 0xAB, count: 100_000))
+        let peer = try ScriptedPeer(infoHash: infoHash, supportsExtensions: true, script: [
+            (0, handshake),
+            (0.2, oversized)
+        ])
+        let port = try await peer.start()
+        defer { peer.stop() }
+
+        let client = makeClient(port: port)
+        try await client.connect()
+        var thrown: Error?
+        do {
+            _ = try await client.fetchMetadata()
+        } catch {
+            thrown = error
+        }
+        await client.close()
+
+        guard let wire = thrown as? PeerWireError, case .metadataUnavailable = wire else {
+            Issue.record("Expected metadataUnavailable, got \(String(describing: thrown))")
+            return
         }
     }
 }

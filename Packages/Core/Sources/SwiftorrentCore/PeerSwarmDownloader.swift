@@ -256,6 +256,7 @@ struct PeerSwarmDownloader: Sendable {
 
         do {
             try await client.downloadPieces(
+                pieceCount: layout.pieceCount,
                 pieceLength: { layout.length(ofPiece: $0) },
                 expectedHash: { metainfo.pieceHashes[$0] },
                 claimNextPiece: { livePieces, isKnown, held in

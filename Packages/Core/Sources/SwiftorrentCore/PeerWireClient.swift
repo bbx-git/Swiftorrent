@@ -138,6 +138,9 @@ public actor PeerWireClient {
     private var metadataSize: Int?
     private var availablePieces = Set<Int>()
     private var availabilityIsKnown = false
+    /// Piece count of the torrent, once known. Bounds `have`/`bitfield` from the
+    /// peer so a hostile one cannot grow `availablePieces` without limit.
+    private var knownPieceCount: Int?
     /// Guards against re-sending our extension handshake when both `connect()` and
     /// `fetchMetadata()` would otherwise send one.
     private var sentExtendedHandshake = false
@@ -373,6 +376,7 @@ public actor PeerWireClient {
     }
 
     public func readInitialAvailability(pieceCount: Int) async throws -> Set<Int> {
+        knownPieceCount = pieceCount
         while !availabilityIsKnown && isChoked {
             try Task.checkCancellation()
             let message = try await readMessage()
@@ -411,6 +415,11 @@ public actor PeerWireClient {
             try Task.checkCancellation()
             try await requestMetadataPiece(piece, extensionID: extensionID)
             let response = try await readMetadataPiece(expectedPiece: piece)
+            // BEP 9: every piece is exactly `pieceSize` bytes except the last. Anything
+            // else is bogus, and without this check a hostile peer could make us
+            // buffer up to a megabyte per piece.
+            let expected = min(pieceSize, metadataSize - piece * pieceSize)
+            guard response.count == expected else { throw PeerWireError.metadataUnavailable }
             metadata.append(response)
         }
 
@@ -459,6 +468,7 @@ public actor PeerWireClient {
     ///   hot path, and returns empty outside endgame.
     public func downloadPieces(
         blockSize: Int = 16 * 1024,
+        pieceCount: Int? = nil,
         pieceLength: @Sendable (Int) -> Int,
         expectedHash: @Sendable (Int) -> Data,
         claimNextPiece: @Sendable (_ available: Set<Int>, _ isKnown: Bool, _ held: Set<Int>) async -> Int?,
@@ -468,6 +478,7 @@ public actor PeerWireClient {
         onPeersDiscovered: (@Sendable ([PeerEndpoint]) async -> Void)? = nil,
         completedElsewhere: (@Sendable (_ held: Set<Int>) async -> Set<Int>)? = nil
     ) async throws {
+        if let pieceCount { knownPieceCount = pieceCount }
         var active: [Int: PieceAssembly] = [:]           // claimed, still assembling
         var requestQueue: [(piece: Int, begin: Int, length: Int)] = []   // not yet requested
         var outstanding = Set<BlockKey>()                // requested, awaiting data
@@ -483,6 +494,10 @@ public actor PeerWireClient {
         // Endgame: throttle how often we ask whether a held piece was completed by
         // another peer, so this stays off the per-block hot path.
         var lastCancelCheck = clock.now
+        // When the last block of data arrived (or when we first started waiting for
+        // one). The snub deadline runs from here and is NOT extended by keep-alives
+        // or other chatter, so a peer cannot hold a worker slot without sending data.
+        var lastDataAt = clock.now
 
         func returnAll() async {
             for index in active.keys { await onReturnPiece(index) }
@@ -552,6 +567,7 @@ public actor PeerWireClient {
                     }
                     guard !requestQueue.isEmpty else { break }
                     let request = requestQueue.removeFirst()
+                    if outstanding.isEmpty { lastDataAt = clock.now }
                     var payload = Data()
                     payload.appendUInt32(UInt32(request.piece))
                     payload.appendUInt32(UInt32(request.begin))
@@ -570,7 +586,10 @@ public actor PeerWireClient {
                 // possible unchoke rather than dropping it. A fired timeout throws
                 // `.timedOut`, which the outer catch turns into a peer replacement.
                 let readTimeout = outstanding.isEmpty ? idleTimeout : snubTimeout
-                let message = try await readMessage(timeout: readTimeout)
+                let snubDeadline: ContinuousClock.Instant? = outstanding.isEmpty
+                    ? nil
+                    : lastDataAt + .seconds(snubTimeout)
+                let message = try await readMessage(timeout: readTimeout, deadline: snubDeadline)
 
                 switch message.id {
                 case 0:
@@ -593,9 +612,13 @@ public actor PeerWireClient {
                     let data = Data(message.payload.dropFirst(8))
                     outstanding.remove(BlockKey(piece: pieceIndex, begin: begin))
                     guard let asm = active[pieceIndex] else { continue }   // stale/unwanted
-                    guard begin >= 0, begin + data.count <= asm.length else {
+                    // We only ever request whole blocks on a fixed grid, so anything else
+                    // is a misbehaving peer.
+                    guard begin >= 0, begin % blockSize == 0, begin < asm.length,
+                          data.count == min(blockSize, asm.length - begin) else {
                         throw PeerWireError.unexpectedMessage
                     }
+                    lastDataAt = clock.now
                     if asm.received.insert(begin).inserted {
                         asm.data.replaceSubrange(begin..<(begin + data.count), with: data)
                         rateWindowBytes += data.count
@@ -634,10 +657,12 @@ public actor PeerWireClient {
             isChoked = false
         case 4:
             guard message.payload.count == 4 else { return }
-            availablePieces.insert(Int(message.payload.readUInt32(at: 0)))
+            let index = Int(message.payload.readUInt32(at: 0))
+            if let limit = pieceCount ?? knownPieceCount, index >= limit { return }
+            availablePieces.insert(index)
             availabilityIsKnown = true
         case 5:
-            availablePieces = Self.parseBitfield(message.payload, pieceCount: pieceCount)
+            availablePieces = Self.parseBitfield(message.payload, pieceCount: pieceCount ?? knownPieceCount)
             availabilityIsKnown = true
         case 20:
             handleExtendedMessage(message.payload)
@@ -680,9 +705,10 @@ public actor PeerWireClient {
         // simply doesn't have the metadata (a leecher) is abandoned in ~1 RTT
         // instead of pinning the slot for the full I/O timeout. The caller then
         // sees `peerMetadataExtensionID`/`metadataSize` still nil and fails fast.
+        let deadline = ContinuousClock.now + .seconds(ioTimeout)
         while !receivedExtendedHandshake {
             try Task.checkCancellation()
-            let message = try await readMessage()
+            let message = try await readMessage(deadline: deadline)
             if message.id == 20 {
                 handleExtendedMessage(message.payload)
             }
@@ -698,9 +724,12 @@ public actor PeerWireClient {
     }
 
     private func readMetadataPiece(expectedPiece: Int) async throws -> Data {
+        // Bounds the whole wait for this piece, so a peer streaming unrelated
+        // messages cannot keep the loop alive indefinitely.
+        let deadline = ContinuousClock.now + .seconds(ioTimeout)
         while true {
             try Task.checkCancellation()
-            let message = try await readMessage()
+            let message = try await readMessage(deadline: deadline)
             guard message.id == 20 else { continue }
             guard let extendedID = message.payload.first else { throw PeerWireError.unexpectedMessage }
             if extendedID == 0 {
@@ -775,13 +804,28 @@ public actor PeerWireClient {
     /// Reads one wire message. `timeout` bounds each underlying socket read; it
     /// defaults to `ioTimeout` (handshake/setup) but `downloadPieces` passes a longer
     /// idle window so a choked-but-alive peer is kept rather than reaped every 30 s.
-    private func readMessage(timeout: TimeInterval? = nil) async throws -> (id: UInt8, payload: Data) {
+    ///
+    /// `deadline` bounds the whole call, keep-alives included: each socket read is
+    /// capped to the time remaining, and an empty (keep-alive) message cannot
+    /// extend it. Without it a peer sending keep-alives forever resets every
+    /// per-read timeout.
+    private func readMessage(
+        timeout: TimeInterval? = nil,
+        deadline: ContinuousClock.Instant? = nil
+    ) async throws -> (id: UInt8, payload: Data) {
         while true {
-            let lengthData = try await receiveExactly(4, timeout: timeout)
+            var perRead = timeout
+            if let deadline {
+                let remaining = ContinuousClock.now.duration(to: deadline)
+                let seconds = Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1e18
+                guard seconds > 0 else { throw PeerWireError.timedOut }
+                perRead = min(timeout ?? ioTimeout, seconds)
+            }
+            let lengthData = try await receiveExactly(4, timeout: perRead)
             let length = Int(lengthData.readUInt32(at: 0))
             if length == 0 { continue }
             guard length <= Self.maxMessageLength else { throw PeerWireError.unexpectedMessage }
-            let body = try await receiveExactly(length, timeout: timeout)
+            let body = try await receiveExactly(length, timeout: perRead)
             guard let id = body.first else { throw PeerWireError.unexpectedMessage }
             return (id, Data(body.dropFirst()))
         }
