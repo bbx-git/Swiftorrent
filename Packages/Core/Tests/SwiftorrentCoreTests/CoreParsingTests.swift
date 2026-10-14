@@ -128,7 +128,7 @@ struct CoreParsingTests {
         #expect(invalid == nil)
     }
 
-    @Test("Tracker requests announce a real peer port")
+    @Test("Tracker requests announce port 0 because we never listen")
     func trackerRequestPort() {
         let request = TrackerRequest(
             announceURL: URL(string: "http://tracker.example.invalid/announce")!,
@@ -148,7 +148,7 @@ struct CoreParsingTests {
             event: nil
         )
 
-        #expect(request.port == 6881)
+        #expect(request.port == 0)
         #expect(customPortRequest.port == 51413)
     }
 

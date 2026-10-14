@@ -15,12 +15,13 @@ public struct TrackerRequest: Sendable {
     public let announceURL: URL
     public let infoHash: Data
     public let peerID: Data
+    /// Always 0 in practice: we never listen (`docs/decisions/0002-download-only-policy.md`).
     public let port: UInt16
     public let downloaded: Int64
     public let left: Int64
     public let event: String?
 
-    public init(announceURL: URL, infoHash: Data, peerID: Data, port: UInt16 = 6881, downloaded: Int64, left: Int64, event: String?) {
+    public init(announceURL: URL, infoHash: Data, peerID: Data, port: UInt16 = 0, downloaded: Int64, left: Int64, event: String?) {
         self.announceURL = announceURL
         self.infoHash = infoHash
         self.peerID = peerID
