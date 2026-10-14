@@ -22,7 +22,7 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 
 ## Next
 1. Optional: if a 10+ s tail with uTP pieces recurs, deprioritise uTP peers in piece assignment.
-2. Optional: a longer trackerless sweep over other info-hashes (only Debian was measured).
+2. Optional: trackerless sweep over a thin swarm (4 well-seeded distro ISOs resolved 20/20, `docs/BENCHMARK.md`).
 
 ## Open problems
 - Inbound-only peers unreachable by design (`docs/decisions/0002-download-only-policy.md`).

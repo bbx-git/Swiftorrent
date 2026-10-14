@@ -418,3 +418,16 @@ Debian 13.7.0 netinst (756 MiB, pure swarm), `TRIALS=3 Scripts/benchmark.sh`, cl
 | new | 1.6 s / 1.8 s | 72.8 s / 78.3 s |
 
 The swarm itself was slow that hour (both builds ~2x the earlier 47-58 s), so compare only within pairs. A persistent DHT node cache was not built: first byte is now on par with tracker-backed torrents.
+
+## Trackerless resolve sweep (2026-10-14)
+
+Info-hash-only magnets (no `tr=`, no web seed), `--resolve-only`, 5 runs each, sequential, same build as the DHT streaming start:
+
+| Torrent | Resolved | Time |
+|---|---|---|
+| Arch 2026.10.01 | 5/5 | 1.2-4.8 s |
+| Debian 13.7 arm64 | 5/5 | 1.7-2.4 s |
+| Kali 2026.2 amd64 | 5/5 | 1.0-3.8 s |
+| Debian 13.7 amd64 | 5/5 | 1.3-2.3 s |
+
+20/20 resolved, median 1.7 s, max 4.8 s. The closest-first DHT result from the Debian-only run holds on three more info-hashes. All four are well-seeded distro ISOs; a thin swarm is not covered.
