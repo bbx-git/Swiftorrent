@@ -42,3 +42,8 @@ Full feature and protocol reference. The short list is in [README.md](../README.
 - DHT support uses BEP 5 `get_peers` queries against public bootstrap nodes and consumes compact IPv4 peers/nodes for magnet metadata and `.torrent` downloads.
 - Magnet metadata resolution uses the extension-protocol reserved bit, extended handshake message ID `20`, and `ut_metadata` request/data messages.
 - Transmission was used only as protocol/architecture reference. No Transmission source code was copied or translated.
+
+## Future work
+
+- **uTP (BEP 29).** Peers that prefer or require uTP over TCP are unreachable today.
+- **Notarization.** Add `Scripts/notarize.sh` so the packaged app passes Gatekeeper on other Macs; see `docs/DISTRIBUTION.md`.
