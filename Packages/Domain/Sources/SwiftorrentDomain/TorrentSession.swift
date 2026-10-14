@@ -206,15 +206,27 @@ public final class TorrentSession {
     }
 
     public func remove(_ item: TorrentItem, deleteFiles: Bool = false) {
-        tasks[item.id]?.cancel()
+        let task = tasks[item.id]
+        task?.cancel()
         tasks[item.id] = nil
         metainfos[item.id] = nil
         if deleteFiles {
-            removeFiles(for: item)
+            // Cancellation is cooperative and the writer recreates paths on every
+            // write, so deleting now could be undone by the task's last write.
+            Task { await removeFiles(for: item, after: task) }
         }
         items.removeAll { $0.id == item.id }
         pendingItems.removeAll { $0.id == item.id }
         persist()
+    }
+
+    /// Cancels every running download and resolve and waits for them to wind
+    /// down (each sends its final tracker announce). Rows keep their state, so
+    /// the next launch resumes them. Used when the app quits.
+    public func stopAll() async {
+        let running = Array(tasks.values)
+        for task in running { task.cancel() }
+        for task in running { await task.value }
     }
 
     /// Whether any row in the list has finished downloading.
@@ -444,7 +456,8 @@ public final class TorrentSession {
         }
     }
 
-    private func removeFiles(for item: TorrentItem) {
+    func removeFiles(for item: TorrentItem, after task: Task<Void, Never>?) async {
+        await task?.value
         // Only delete paths we actually resolved. An unresolved/queued row has no
         // `outputRelativePaths`, and guessing from `item.name` risks deleting an
         // unrelated file that happens to share the display name.

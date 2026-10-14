@@ -54,6 +54,11 @@ public struct SwiftorrentRootView: View {
         .transparentWindow()
         .keepsDialogsAboveWhenActivated()
         .onAppear { DockBadge.followSession(session) }
+        .onChange(of: session.items.map(\.id)) { _, ids in
+            if let selectedItemID, !ids.contains(selectedItemID) {
+                self.selectedItemID = nil
+            }
+        }
     }
 
     private var removalAlertPresented: Binding<Bool> {
@@ -172,6 +177,9 @@ public struct SwiftorrentRootView: View {
                                     deleteFile: { fileID in
                                         session.deleteFile(itemID: item.id, fileID: fileID)
                                     },
+                                    restoreFile: { fileID in
+                                        session.setFileSelected(itemID: item.id, fileID: fileID, isSelected: true)
+                                    },
                                     pause: {
                                         session.pause(itemID: item.id)
                                     },
@@ -263,6 +271,7 @@ private struct TorrentRow: View {
     let item: TorrentItem
     let isSelected: Bool
     let deleteFile: (Int) -> Void
+    let restoreFile: (Int) -> Void
     let pause: () -> Void
     let resume: () -> Void
     let remove: () -> Void
@@ -369,10 +378,8 @@ private struct TorrentRow: View {
 
     private var fileList: some View {
         VStack(spacing: 6) {
-            ForEach(item.files.filter(\.isSelected)) { file in
-                FileRow(file: file) {
-                    deleteFile(file.id)
-                }
+            ForEach(item.files) { file in
+                FileRow(file: file, delete: { deleteFile(file.id) }, restore: { restoreFile(file.id) })
             }
         }
         .padding(.leading, 50)
@@ -423,23 +430,26 @@ private struct TorrentRow: View {
 private struct FileRow: View {
     let file: TorrentItem.FileEntry
     let delete: () -> Void
+    let restore: () -> Void
     @State private var confirmingDelete = false
 
     var body: some View {
         HStack(spacing: 10) {
-            Button(role: .destructive) {
-                confirmingDelete = true
-            } label: {
-                Image(systemName: "trash")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.red)
-            .help("Delete this file from the drive")
-            .alert("Delete File?", isPresented: $confirmingDelete) {
-                Button("Delete", role: .destructive, action: delete)
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("\"\(file.name)\" will be permanently removed from your drive. This cannot be undone.")
+            if file.isSelected {
+                Button(role: .destructive) {
+                    confirmingDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red)
+                .help("Delete this file from the drive")
+            } else {
+                Button(action: restore) {
+                    Image(systemName: "arrow.down.circle")
+                }
+                .buttonStyle(.borderless)
+                .help("Download this file again")
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -447,6 +457,7 @@ private struct FileRow: View {
                     .font(.caption)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .foregroundStyle(file.isSelected ? .primary : .secondary)
 
                 ProgressView(value: file.fraction)
                     .progressViewStyle(.linear)
@@ -459,6 +470,12 @@ private struct FileRow: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+        }
+        .alert("Delete File?", isPresented: $confirmingDelete) {
+            Button("Delete", role: .destructive, action: delete)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\"\(file.name)\" will be permanently removed from your drive. This cannot be undone.")
         }
     }
 }
@@ -477,9 +494,6 @@ private struct SpeedLimitControl: View {
         case kilobytes, megabytes
         var id: String { rawValue }
         var label: String { self == .kilobytes ? "KB/s" : "MB/s" }
-        // Decimal (1000-based) to match the `.file` ByteCountFormatter display,
-        // so a typed "50 KB/s" reads back as exactly "50 KB/s".
-        var multiplier: Int { self == .kilobytes ? 1_000 : 1_000_000 }
     }
 
     private static let presets: [Int] = [
@@ -558,11 +572,7 @@ private struct SpeedLimitControl: View {
     /// Parses the typed value (accepting a comma or dot decimal) into bytes per
     /// second, or `nil` when it isn't a positive number.
     private var parsedBytesPerSecond: Int? {
-        let normalized = customValue
-            .replacingOccurrences(of: ",", with: ".")
-            .trimmingCharacters(in: .whitespaces)
-        guard let value = Double(normalized), value > 0 else { return nil }
-        return Int(value * Double(customUnit.multiplier))
+        SpeedLimitInput.bytesPerSecond(from: customValue, kilobytes: customUnit == .kilobytes)
     }
 
     private func applyCustom() {

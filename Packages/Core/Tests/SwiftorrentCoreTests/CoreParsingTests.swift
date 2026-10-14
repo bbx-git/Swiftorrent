@@ -493,6 +493,20 @@ struct CoreParsingTests {
         #expect(ContinuousClock.now - started < .seconds(3))
     }
 
+    @Test("A download that ends without completing announces stopped")
+    func failedDownloadAnnouncesStopped() async throws {
+        let recorder = RecordingTrackerAnnouncer()
+        let downloader = TorrentDownloader(trackerClient: recorder, dhtClient: MockDHTPeerFinder(peers: []))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8)])
+
+        // No tracker, DHT or web-seed peers: the run fails after the "started" announce.
+        _ = try? await downloader.download(metainfo: metainfo, destination: directory) { _ in }
+
+        #expect(await recorder.events == ["started", "stopped"])
+    }
+
     @Test("Peer wire tears down a silent peer within the timeout window")
     func peerWireTimesOutOnSilentPeer() async throws {
         // A loopback listener that accepts the connection but never sends a
@@ -1291,6 +1305,15 @@ private struct MockTrackerAnnouncer: TrackerAnnouncing {
 
     func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
         peers
+    }
+}
+
+private actor RecordingTrackerAnnouncer: TrackerAnnouncing {
+    private(set) var events: [String] = []
+
+    func announce(_ request: TrackerRequest) async throws -> [PeerEndpoint] {
+        events.append(request.event ?? "")
+        return []
     }
 }
 

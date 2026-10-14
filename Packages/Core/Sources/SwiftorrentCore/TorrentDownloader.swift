@@ -150,52 +150,63 @@ public struct TorrentDownloader: Sendable {
 
         let peerID = Self.makePeerID()
         await progress(TorrentDownloadProgress(status: "Verified existing data. Contacting trackers and DHT", downloadedBytes: initialDownloaded, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
-        let peers = try await collectPeers(for: metainfo, peerID: peerID, downloaded: initialDownloaded, left: downloadTotal - initialDownloaded, event: "started")
-        try Task.checkCancellation()
-        guard !peers.isEmpty else {
-            throw TrackerClientError.invalidResponse
-        }
+        // Pause, removal, quit and failure all end the run without `completed`;
+        // tell the tracker so it drops us instead of listing us until it times out.
+        do {
+            let peers = try await collectPeers(for: metainfo, peerID: peerID, downloaded: initialDownloaded, left: downloadTotal - initialDownloaded, event: "started")
+            try Task.checkCancellation()
+            guard !peers.isEmpty else {
+                throw TrackerClientError.invalidResponse
+            }
 
-        // Nothing writes to disk between the scan above and here (peer
-        // discovery does no I/O), so the cached set is still accurate.
-        let verifiedBytes = bytesCompleted(for: verifiedPieces, layout: layout)
-        if verifiedBytes >= downloadTotal {
+            // Nothing writes to disk between the scan above and here (peer
+            // discovery does no I/O), so the cached set is still accurate.
+            let verifiedBytes = bytesCompleted(for: verifiedPieces, layout: layout)
+            if verifiedBytes >= downloadTotal {
+                try writer.finalize(selectedFileIDs: selection)
+                await announceStopped(for: metainfo, peerID: peerID, downloaded: verifiedBytes)
+                await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
+                return
+            }
+
+            let downloaded = try await PeerSwarmDownloader(maxPeerConnections: maxPeerConnections, rateLimiter: rateLimiter).download(
+                metainfo: metainfo,
+                destination: destination,
+                layout: layout,
+                selectablePieces: selectablePieces,
+                mapper: mapper,
+                downloadTotal: downloadTotal,
+                peers: Array(peers.shuffled().prefix(maxSwarmReservePeers)),
+                peerID: peerID,
+                verifiedPieces: verifiedPieces,
+                initialDownloaded: verifiedBytes,
+                stripRootDirectory: stripRootDirectory,
+                // Periodic re-announce so the swarm reserve never permanently runs dry:
+                // a fresh tracker/DHT lookup (no event — an interval refresh, not
+                // started/stopped) whose peers the supervisor folds into the reserve.
+                // Download-only is preserved: port 0, uploaded 0, as in every announce.
+                refillPeers: {
+                    (try? await self.collectPeers(
+                        for: metainfo,
+                        peerID: peerID,
+                        downloaded: verifiedBytes,
+                        left: downloadTotal - verifiedBytes,
+                        event: nil
+                    )) ?? []
+                },
+                progress: progress
+            )
             try writer.finalize(selectedFileIDs: selection)
-            await announceStopped(for: metainfo, peerID: peerID, downloaded: verifiedBytes)
-            await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: verifiedPieces)))
-            return
+            await announceStopped(for: metainfo, peerID: peerID, downloaded: downloaded)
+            await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: selectablePieces)))
+        } catch {
+            let metainfo = metainfo, left = downloadTotal - initialDownloaded
+            // Detached: this task is usually cancelled, which would abort the announce.
+            await Task.detached {
+                await self.announceStopped(for: metainfo, peerID: peerID, downloaded: initialDownloaded, left: left)
+            }.value
+            throw error
         }
-
-        let downloaded = try await PeerSwarmDownloader(maxPeerConnections: maxPeerConnections, rateLimiter: rateLimiter).download(
-            metainfo: metainfo,
-            destination: destination,
-            layout: layout,
-            selectablePieces: selectablePieces,
-            mapper: mapper,
-            downloadTotal: downloadTotal,
-            peers: Array(peers.shuffled().prefix(maxSwarmReservePeers)),
-            peerID: peerID,
-            verifiedPieces: verifiedPieces,
-            initialDownloaded: verifiedBytes,
-            stripRootDirectory: stripRootDirectory,
-            // Periodic re-announce so the swarm reserve never permanently runs dry:
-            // a fresh tracker/DHT lookup (no event — an interval refresh, not
-            // started/stopped) whose peers the supervisor folds into the reserve.
-            // Download-only is preserved: port 0, uploaded 0, as in every announce.
-            refillPeers: {
-                (try? await self.collectPeers(
-                    for: metainfo,
-                    peerID: peerID,
-                    downloaded: verifiedBytes,
-                    left: downloadTotal - verifiedBytes,
-                    event: nil
-                )) ?? []
-            },
-            progress: progress
-        )
-        try writer.finalize(selectedFileIDs: selection)
-        await announceStopped(for: metainfo, peerID: peerID, downloaded: downloaded)
-        await progress(TorrentDownloadProgress(status: "Complete. Stopped without seeding.", downloadedBytes: downloadTotal, totalBytes: downloadTotal, files: fileSnapshot(for: selectablePieces)))
     }
 
     /// Best-effort final announce. Capped so a slow or dead tracker can't delay
@@ -204,11 +215,12 @@ public struct TorrentDownloader: Sendable {
         for metainfo: TorrentMetainfo,
         peerID: Data,
         downloaded: Int64,
+        left: Int64 = 0,
         cap: Duration = .seconds(3)
     ) async {
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
-                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: 0, event: "stopped", includeDHT: false)
+                _ = try? await collectPeers(for: metainfo, peerID: peerID, downloaded: downloaded, left: left, event: "stopped", includeDHT: false)
             }
             group.addTask {
                 try? await Task.sleep(for: cap)

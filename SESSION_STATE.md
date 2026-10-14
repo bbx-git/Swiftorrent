@@ -22,9 +22,13 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 
 - Hostile-input limits (`docs/decisions/0007-hostile-input-limits.md`): bencode depth 64, piece length <= 128 MiB, piece count must match size, peer availability/metadata/blocks validated, snub timer ignores keep-alives, HTTP bodies capped by `BoundedHTTPClient`. Tests: `HostileInputTests`, `BoundedHTTPTests`, `FuzzTests`.
 - File offsets use `fileEnds` binary search; resume verification is `verifiedPiecesConcurrently` (cancellable). Don't go back to per-piece prefix sums.
+- Custom speed limit text goes through `SpeedLimitInput` (finite, 1 B/s..1 TB/s); never `Int(Double)` on user input.
+- `remove(deleteFiles:)` deletes only after the cancelled download task finishes (`removeFiles(for:after:)`); the writer recreates paths on every write. Test `SessionRemoveFilesTests`.
+- Downloads that end without completing (pause, remove, failure, quit) send a detached `stopped` announce (test `failedDownloadAnnouncesStopped`); quit waits for it via `AppDelegate` + `TorrentSession.stopAll()` (5 s cap, unstructured tasks).
+- Expanded file list shows every file; deselected ones get a re-download button.
 
 ## Next
-Nothing queued. Add items from real bugs or features, not speculation. `Features` and `App` have not been audited.
+Nothing queued. Add items from real bugs or features, not speculation. `Features` and `App` were audited once (only finding: custom speed-limit input trapped on `inf`/`1e30`; fixed in `SpeedLimitInput`).
 
 ## Open problems
 - Inbound-only peers unreachable by design; tracker `port` is 0 (`docs/decisions/0002-download-only-policy.md`, test `trackerRequestPort`).
