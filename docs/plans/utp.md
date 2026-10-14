@@ -13,7 +13,7 @@ Peers that don't answer on TCP (firewalled, TCP-throttled, uTP-preferring) becom
 - [x] 1. `UTPPacket`: 20-byte header encode/decode, selective-ACK extension, unit tests.
 - [x] 1b. **Gate:** bench option that sends a uTP SYN to peers whose TCP connect failed and counts ST_STATE replies. Continue only if a useful share (about 5-10% of the peer list or more) answers; otherwise stop, delete this plan and record why in `docs/decisions/`.
   - Result (2026-10-14, `swiftorrent-bench --utp-probe`, 2 runs each, tmp/utp-probe.log): 758 peers listed, 100 answer TCP, 117 answer uTP, 44 answer uTP only (5.8% of the list; +44% over TCP-reachable). Passes the lower bound; absolute numbers are small because most listed peers are dead on both.
-- [ ] 2. `UTPConnection` state machine (SYN/STATE/DATA/FIN/RST, seq/ack, reorder buffer, selective ACK, RTO retransmit, window) driven through a `DatagramChannel` protocol; loopback tests with simulated loss, reorder and duplication.
+- [x] 2. `UTPConnection` state machine (SYN/STATE/DATA/FIN/RST, seq/ack, reorder buffer, selective ACK, RTO retransmit, window) driven through a `DatagramChannel` protocol; loopback tests with simulated loss, reorder and duplication.
 - [ ] 3. Extract `PeerTransport` from `PeerWireClient` with a TCP implementation; existing tests pass unchanged, no behaviour change.
 - [ ] 4. uTP transport on UDP `NWConnection`, TCP-then-uTP fallback in `connect()`; covers swarm and magnet metadata paths.
 - [ ] 5. Bench flag to force uTP, live validation against the Debian torrent, docs (`FEATURES.md`, `ARCHITECTURE.md`), decision `0006`, delete this plan.
