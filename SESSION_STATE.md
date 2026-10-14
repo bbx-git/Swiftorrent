@@ -2,7 +2,7 @@
 
 _Overwritten at every wrap-up, never appended. Under 30 lines; git has the history. Don't record build or test status._
 
-- **Active plan:** `docs/plans/hardening-2.md`, steps 1-5 done; step 6 (split `PeerWireClient`, `TorrentSession`, `SwiftorrentRootView`) left.
+- **Active plan:** none. Hardening 2 finished (last step split `PeerWireClient`, `TorrentSession`, `SwiftorrentRootView` into per-concern files).
 
 ## What this is
 Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages/Core` (SwiftorrentCore: bencode, trackers, DHT, peer wire over TCP/uTP, MSE, downloader), `Domain` (TorrentSession, store), `Features` (SwiftUI, has a test target), app in `App/Swiftorrent`, bench in `Tools/SwiftorrentBench`.
@@ -17,11 +17,10 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 - `NWConnection` continuations are resume-once (`ResumeOnce`); uTP `receive` fails promptly after close.
 - DHT lookup closest-first (0005); web-seed segments written in order (0004); `stopped` announce capped at 3 s on every non-complete exit.
 - Hostile-input limits (0007; `HostileInputTests`, `BoundedHTTPTests`, `FuzzTests`). `remove(deleteFiles:)` deletes only after the task finishes.
+- `Scripts/build.sh` quits a running copy before installing (a stale running app made a fix look broken).
 - Dock badge is a fixed-size `DockBadge` tile; header glass controls need `.tint(.primary)`.
 
 ## Next
-- Plan step 6 (file splits, no behaviour change).
-- Maybe: `Scripts/build.sh` should quit a running copy before installing (a stale running app made a fix look broken).
 - Bench: `--utp-probe` prints TCP connect percentiles; download runs print each status change with its time.
 
 ## Open problems

@@ -7,15 +7,15 @@ import SwiftorrentCore
 @Observable
 public final class TorrentSession {
     /// Torrents the user has confirmed; these are the rows shown in the list.
-    public private(set) var items: [TorrentItem] = []
+    public internal(set) var items: [TorrentItem] = []
     /// Torrents still being resolved or awaiting file selection in the add
     /// dialog. They are kept out of `items` so a torrent only appears in the
     /// list once the user clicks Download.
-    public private(set) var pendingItems: [TorrentItem] = []
+    public internal(set) var pendingItems: [TorrentItem] = []
     public var destination: URL
     /// Combined download speed across all torrents, in bytes per second. Sampled
     /// once a second from the change in total bytes on disk.
-    public private(set) var downloadSpeed: Int64 = 0
+    public internal(set) var downloadSpeed: Int64 = 0
     /// Combined download throughput cap in bytes per second, or `nil` for
     /// unlimited. Applied across every active download and persisted.
     public var downloadRateLimit: Int? {
@@ -27,17 +27,17 @@ public final class TorrentSession {
         }
     }
 
-    @ObservationIgnored private let logger = Logger(subsystem: "Swiftorrent", category: "Session")
-    private let metainfoParser = TorrentMetainfoParser()
+    @ObservationIgnored let logger = Logger(subsystem: "Swiftorrent", category: "Session")
+    let metainfoParser = TorrentMetainfoParser()
     private let magnetParser = MagnetLinkParser()
     private let magnetResolver = MagnetMetadataResolver()
     private let rateLimiter = RateLimiter()
-    private let downloader: TorrentDownloader
-    private let store: TorrentSessionStore
-    private var tasks: [TorrentItem.ID: Task<Void, Never>] = [:]
-    private var metainfos: [TorrentItem.ID: TorrentMetainfo] = [:]
-    private var speedSampler: Task<Void, Never>?
-    private var checkpointTick = 0
+    let downloader: TorrentDownloader
+    let store: TorrentSessionStore
+    var tasks: [TorrentItem.ID: Task<Void, Never>] = [:]
+    var metainfos: [TorrentItem.ID: TorrentMetainfo] = [:]
+    var speedSampler: Task<Void, Never>?
+    var checkpointTick = 0
 
     public convenience init(destination: URL = DefaultDownloadDirectory.url()) {
         self.init(destination: destination, store: TorrentSessionStore())
@@ -57,88 +57,6 @@ public final class TorrentSession {
         Task { await rateLimiter.setLimit(bytesPerSecond: limit) }
         startSpeedSampler()
         resumeRestoredDownloads()
-    }
-
-    /// Total bytes downloaded across every torrent currently in the list.
-    private var totalDownloadedBytes: Int64 {
-        items.reduce(Int64(0)) { $0 + $1.downloadedBytes }
-    }
-
-    /// Combined download speed formatted for display, e.g. "1.2 MB/s".
-    public var downloadSpeedDescription: String {
-        ByteCountFormatter.string(fromByteCount: downloadSpeed, countStyle: .file) + "/s"
-    }
-
-    /// Samples the combined download rate once a second. Using the delta of total
-    /// bytes on disk means completed or removed torrents naturally stop counting,
-    /// and a transient drop (a removed torrent) clamps to zero rather than going
-    /// negative.
-    private func startSpeedSampler() {
-        speedSampler = Task { [weak self] in
-            let clock = ContinuousClock()
-            // Trailing window of (time, cumulative bytes) samples. Reporting the
-            // delta across the whole window — divided by the *actual* elapsed time
-            // rather than assuming an exact 1s tick — smooths the lumpiness of
-            // piece-granular accounting (bytes land only when a whole piece
-            // verifies), so the readout tracks the true rate instead of swinging
-            // between a near-zero dip and a one-piece spike.
-            var samples: [(time: ContinuousClock.Instant, bytes: Int64)] = []
-            // Per-torrent trailing windows, keyed by item id, feeding the per-row
-            // rate with the same smoothing as the combined figure.
-            var itemWindows: [TorrentItem.ID: [(time: ContinuousClock.Instant, bytes: Int64)]] = [:]
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                guard let self else { return }
-                let now = clock.now
-                let current = self.totalDownloadedBytes
-                samples.append((now, current))
-                // Keep ~4 seconds of history (the most recent 4 one-second ticks).
-                if samples.count > 4 { samples.removeFirst() }
-                let oldest = samples[0]
-                let span = oldest.time.duration(to: now)
-                let seconds = Double(span.components.seconds) + Double(span.components.attoseconds) / 1e18
-                let delta = max(0, current - oldest.bytes)
-                self.downloadSpeed = seconds > 0 ? Int64(Double(delta) / seconds) : 0
-                self.updatePerItemSpeeds(now: now, windows: &itemWindows)
-                // Checkpoint progress to disk every ~10s so a crash mid-download
-                // loses at most a few seconds of progress (resume re-verifies the
-                // actual on-disk bytes regardless).
-                self.checkpointTick += 1
-                if self.checkpointTick >= 10, !self.items.isEmpty {
-                    self.checkpointTick = 0
-                    self.persist()
-                }
-            }
-        }
-    }
-
-    /// Updates each active torrent's per-row rate using the same trailing window
-    /// as the combined figure. Torrents that aren't downloading report 0 and drop
-    /// their history so a paused or finished row never shows a stale rate.
-    private func updatePerItemSpeeds(
-        now: ContinuousClock.Instant,
-        windows: inout [TorrentItem.ID: [(time: ContinuousClock.Instant, bytes: Int64)]]
-    ) {
-        var live = Set<TorrentItem.ID>()
-        for index in items.indices {
-            guard items[index].state == .downloading else {
-                if items[index].downloadSpeed != 0 { items[index].downloadSpeed = 0 }
-                continue
-            }
-            let id = items[index].id
-            live.insert(id)
-            var window = windows[id] ?? []
-            window.append((now, items[index].downloadedBytes))
-            if window.count > 4 { window.removeFirst() }
-            windows[id] = window
-            let oldest = window[0]
-            let span = oldest.time.duration(to: now)
-            let seconds = Double(span.components.seconds) + Double(span.components.attoseconds) / 1e18
-            let delta = max(0, items[index].downloadedBytes - oldest.bytes)
-            items[index].downloadSpeed = seconds > 0 ? Int64(Double(delta) / seconds) : 0
-        }
-        // Forget windows for rows that vanished or stopped downloading.
-        windows = windows.filter { live.contains($0.key) }
     }
 
     public func chooseDestination(_ url: URL) {
@@ -320,7 +238,7 @@ public final class TorrentSession {
     /// Spawns the download task for a torrent already in `items`, routing
     /// failures into the item's `failed` state. Shared by start, resume, and
     /// file-selection relaunch so they stay in lockstep.
-    private func launchDownloadTask(itemID: TorrentItem.ID, metainfo: TorrentMetainfo) {
+    func launchDownloadTask(itemID: TorrentItem.ID, metainfo: TorrentMetainfo) {
         tasks[itemID] = Task {
             defer { tasks[itemID] = nil }
             do {
@@ -342,99 +260,6 @@ public final class TorrentSession {
         }
     }
 
-    /// Toggles whether a file inside a multi-file torrent is downloaded. Used both
-    /// by the add dialog (pending review) and mid-download. A running torrent is
-    /// restarted with the new selection (on-disk pieces are re-verified, so
-    /// progress is preserved).
-    public func setFileSelected(itemID: TorrentItem.ID, fileID: Int, isSelected: Bool) {
-        if let pendingIndex = pendingItems.firstIndex(where: { $0.id == itemID }) {
-            guard let fileIndex = pendingItems[pendingIndex].files.firstIndex(where: { $0.id == fileID }) else { return }
-            pendingItems[pendingIndex].files[fileIndex].isSelected = isSelected
-            return
-        }
-
-        guard let index = items.firstIndex(where: { $0.id == itemID }),
-              let fileIndex = items[index].files.firstIndex(where: { $0.id == fileID }) else {
-            return
-        }
-        guard items[index].files[fileIndex].isSelected != isSelected else { return }
-        items[index].files[fileIndex].isSelected = isSelected
-        persist()
-        guard let metainfo = metainfos[itemID] else { return }
-        // Only relaunch torrents that are actively working; failed rows pick up
-        // the new selection when they next start.
-        guard items[index].state == .downloading || items[index].state == .complete else { return }
-        items[index].state = .downloading
-        items[index].status = "Applying file selection."
-        tasks[itemID]?.cancel()
-        launchDownloadTask(itemID: itemID, metainfo: metainfo)
-    }
-
-    /// Selects or deselects every file in a torrent at once (the dialog's
-    /// "Select All" / "Deselect All" actions).
-    public func setAllFilesSelected(itemID: TorrentItem.ID, isSelected: Bool) {
-        if let pendingIndex = pendingItems.firstIndex(where: { $0.id == itemID }) {
-            for fileIndex in pendingItems[pendingIndex].files.indices {
-                pendingItems[pendingIndex].files[fileIndex].isSelected = isSelected
-            }
-            return
-        }
-        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
-        for fileIndex in items[index].files.indices {
-            items[index].files[fileIndex].isSelected = isSelected
-        }
-        persist()
-    }
-
-    /// Permanently deletes one file of a torrent from disk (its final file and
-    /// any `.tor` partial), then drops it from the selection so it isn't
-    /// refetched. A running download is relaunched to stop fetching it; an idle
-    /// torrent (complete/paused/failed) just loses the file. The torrent's other
-    /// files are untouched.
-    public func deleteFile(itemID: TorrentItem.ID, fileID: Int) {
-        guard let index = items.firstIndex(where: { $0.id == itemID }),
-              let fileIndex = items[index].files.firstIndex(where: { $0.id == fileID }) else {
-            return
-        }
-        deleteFileFromDisk(items[index].files[fileIndex], in: items[index])
-        items[index].files[fileIndex].isSelected = false
-        items[index].files[fileIndex].downloadedBytes = 0
-        recomputeTotals(itemIndex: index)
-        persist()
-
-        // A live download must be relaunched so its piece scheduler drops the
-        // now-deselected file; idle torrents simply keep the smaller selection.
-        if items[index].state == .downloading, let metainfo = metainfos[itemID] {
-            items[index].status = "Applying file selection."
-            tasks[itemID]?.cancel()
-            launchDownloadTask(itemID: itemID, metainfo: metainfo)
-        }
-    }
-
-    private func deleteFileFromDisk(_ file: TorrentItem.FileEntry, in item: TorrentItem) {
-        let destination = item.destination.standardizedFileURL
-        // `outputRelativePaths` already accounts for the strip-root choice and is
-        // indexed by file id; fall back to the torrent-relative path if missing.
-        let relativePath = file.id < item.outputRelativePaths.count ? item.outputRelativePaths[file.id] : file.path
-        let finalURL = destination.appendingPathComponent(relativePath).standardizedFileURL
-        let partialURL = finalURL.appendingPathExtension("tor").standardizedFileURL
-        removeFileIfContained(partialURL, in: destination)
-        removeFileIfContained(finalURL, in: destination)
-        pruneEmptyDirectories(for: [relativePath], in: destination)
-    }
-
-    /// Re-derives the item's byte/progress totals from its currently selected
-    /// files, so deleting a file leaves the row consistent (e.g. a complete
-    /// torrent stays complete over its remaining selection).
-    private func recomputeTotals(itemIndex: Int) {
-        let selected = items[itemIndex].files.filter(\.isSelected)
-        let downloaded = selected.reduce(Int64(0)) { $0 + $1.downloadedBytes }
-        let total = selected.reduce(Int64(0)) { $0 + $1.totalBytes }
-        items[itemIndex].downloadedBytes = downloaded
-        items[itemIndex].totalBytes = total
-        items[itemIndex].progress = total > 0 ? min(1, Double(downloaded) / Double(total)) : 0
-    }
-
     private func applyResolvedMetadata(_ metainfo: TorrentMetainfo, to id: TorrentItem.ID) {
         update(id) {
             $0.name = metainfo.name
@@ -453,54 +278,6 @@ public final class TorrentSession {
         update(id) {
             $0.status = message
             $0.state = .failed
-        }
-    }
-
-    func removeFiles(for item: TorrentItem, after task: Task<Void, Never>?) async {
-        await task?.value
-        // Only delete paths we actually resolved. An unresolved/queued row has no
-        // `outputRelativePaths`, and guessing from `item.name` risks deleting an
-        // unrelated file that happens to share the display name.
-        let relativePaths = item.outputRelativePaths
-        guard !relativePaths.isEmpty else {
-            logger.notice("Skipping disk deletion for unresolved row \"\(item.name, privacy: .private)\": no resolved output paths")
-            return
-        }
-        let destination = item.destination.standardizedFileURL
-        for relativePath in relativePaths {
-            let finalURL = destination.appendingPathComponent(relativePath).standardizedFileURL
-            let partialURL = finalURL.appendingPathExtension("tor").standardizedFileURL
-            removeFileIfContained(partialURL, in: destination)
-            removeFileIfContained(finalURL, in: destination)
-        }
-        pruneEmptyDirectories(for: relativePaths, in: destination)
-    }
-
-    private func removeFileIfContained(_ url: URL, in destination: URL) {
-        let destinationPath = destination.path
-        let path = url.path
-        guard path == destinationPath || path.hasPrefix(destinationPath + "/") else { return }
-        guard FileManager.default.fileExists(atPath: path) else { return }
-        do {
-            try FileManager.default.removeItem(at: url)
-        } catch {
-            logger.error("Failed to delete \(path, privacy: .private): \(error.localizedDescription, privacy: .private)")
-        }
-    }
-
-    private func pruneEmptyDirectories(for relativePaths: [String], in destination: URL) {
-        let directories = Set(relativePaths.map { path in
-            destination.appendingPathComponent(path).deletingLastPathComponent().standardizedFileURL
-        })
-        for directory in directories.sorted(by: { $0.path.count > $1.path.count }) {
-            var current = directory
-            while current.path.hasPrefix(destination.path + "/"), current != destination {
-                guard let contents = try? FileManager.default.contentsOfDirectory(atPath: current.path), contents.isEmpty else {
-                    break
-                }
-                try? FileManager.default.removeItem(at: current)
-                current.deleteLastPathComponent()
-            }
         }
     }
 
@@ -561,7 +338,7 @@ public final class TorrentSession {
     }
 
     /// Mutates an item in whichever list (`items` or `pendingItems`) holds it.
-    private func update(_ id: TorrentItem.ID, mutate: (inout TorrentItem) -> Void) {
+    func update(_ id: TorrentItem.ID, mutate: (inout TorrentItem) -> Void) {
         if let index = items.firstIndex(where: { $0.id == id }) {
             mutate(&items[index])
         } else if let index = pendingItems.firstIndex(where: { $0.id == id }) {
@@ -569,231 +346,4 @@ public final class TorrentSession {
         }
     }
 
-    // MARK: - Persistence
-
-    /// Rebuilds the confirmed list from a saved snapshot. Each item's metainfo is
-    /// reconstructed offline from its stored `info` dictionary; items whose
-    /// metainfo can't be rebuilt are dropped rather than restored broken.
-    private func restore(_ snapshot: PersistedSession) {
-        for persisted in snapshot.items {
-            guard let (item, metainfo) = restoreItem(persisted) else { continue }
-            metainfos[item.id] = metainfo
-            items.append(item)
-        }
-    }
-
-    private func restoreItem(_ persisted: PersistedItem) -> (TorrentItem, TorrentMetainfo)? {
-        let announceURLs = persisted.announceURLs.compactMap { URL(string: $0) }
-        let webSeedURLs = persisted.webSeedURLs.compactMap { URL(string: $0) }
-        let metainfo: TorrentMetainfo
-        do {
-            metainfo = try metainfoParser.parseInfoDictionary(
-                data: persisted.infoDictionaryData,
-                announceURLs: announceURLs,
-                webSeedURLs: webSeedURLs,
-                preferredName: persisted.name
-            )
-        } catch {
-            logger.error("Dropping restored row \"\(persisted.name, privacy: .private)\": stored info dict failed to parse: \(error.localizedDescription, privacy: .public)")
-            return nil
-        }
-
-        let source: TorrentItem.Source = switch persisted.source {
-        case let .torrentFile(path): .torrentFile(URL(fileURLWithPath: path))
-        case let .magnet(text): .magnet(text)
-        }
-        var item = TorrentItem(
-            name: persisted.name,
-            source: source,
-            destination: URL(fileURLWithPath: persisted.destinationPath, isDirectory: true),
-            totalBytes: persisted.totalBytes
-        )
-        item.outputRelativePaths = persisted.outputRelativePaths
-        item.files = persisted.files.map {
-            TorrentItem.FileEntry(id: $0.id, path: $0.path, totalBytes: $0.totalBytes, downloadedBytes: $0.downloadedBytes, isSelected: $0.isSelected)
-        }
-        item.createsEnclosingDirectory = persisted.createsEnclosingDirectory
-        item.stripRootDirectory = persisted.stripRootDirectory
-        item.downloadedBytes = persisted.downloadedBytes
-        item.progress = persisted.progress
-        item.status = persisted.status
-        item.state = TorrentItem.State(rawValue: persisted.state) ?? .paused
-        return (item, metainfo)
-    }
-
-    /// Auto-resumes torrents that were actively downloading when the app last
-    /// quit. Paused/complete/failed rows keep their restored state.
-    private func resumeRestoredDownloads() {
-        for item in items where item.state == .downloading {
-            guard let metainfo = metainfos[item.id] else { continue }
-            update(item.id) { $0.status = "Resuming download." }
-            launchDownloadTask(itemID: item.id, metainfo: metainfo)
-        }
-    }
-
-    /// Serializes the current confirmed list to disk off the main actor. Only
-    /// items with a known metainfo are saved (so they can be rebuilt on launch).
-    private func persist() {
-        let snapshot = currentSnapshot()
-        let store = self.store
-        Task { await store.save(snapshot) }
-    }
-
-    private func currentSnapshot() -> PersistedSession {
-        PersistedSession(
-            destinationPath: destination.path(percentEncoded: false),
-            downloadRateLimit: downloadRateLimit,
-            items: items.compactMap { item in
-                guard let metainfo = metainfos[item.id] else { return nil }
-                return PersistedItem(
-                    id: item.id,
-                    name: item.name,
-                    destinationPath: item.destination.path(percentEncoded: false),
-                    source: persistedSource(item.source),
-                    stripRootDirectory: item.stripRootDirectory,
-                    createsEnclosingDirectory: item.createsEnclosingDirectory,
-                    outputRelativePaths: item.outputRelativePaths,
-                    files: item.files.map {
-                        PersistedItem.File(id: $0.id, path: $0.path, totalBytes: $0.totalBytes, downloadedBytes: $0.downloadedBytes, isSelected: $0.isSelected)
-                    },
-                    totalBytes: item.totalBytes,
-                    downloadedBytes: item.downloadedBytes,
-                    progress: item.progress,
-                    state: item.state.rawValue,
-                    status: item.status,
-                    infoDictionaryData: metainfo.infoDictionaryData,
-                    announceURLs: metainfo.announceURLs.map(\.absoluteString),
-                    webSeedURLs: metainfo.webSeedURLs.map(\.absoluteString)
-                )
-            }
-        )
-    }
-
-    private func persistedSource(_ source: TorrentItem.Source) -> PersistedItem.Source {
-        switch source {
-        case let .torrentFile(url): .torrentFile(path: url.path(percentEncoded: false))
-        case let .magnet(text): .magnet(text: text)
-        }
-    }
-}
-
-public struct TorrentItem: Identifiable, Equatable, Sendable {
-    public enum Source: Equatable, Sendable {
-        case torrentFile(URL)
-        case magnet(String)
-    }
-
-    public enum State: String, Equatable, Sendable {
-        case queued
-        case reviewing
-        case downloading
-        case paused
-        case complete
-        case failed
-    }
-
-    public struct FileEntry: Identifiable, Equatable, Sendable {
-        public let id: Int
-        public let path: String
-        public let totalBytes: Int64
-        public var downloadedBytes: Int64
-        public var isSelected: Bool
-
-        public init(id: Int, path: String, totalBytes: Int64, downloadedBytes: Int64 = 0, isSelected: Bool = true) {
-            self.id = id
-            self.path = path
-            self.totalBytes = totalBytes
-            self.downloadedBytes = downloadedBytes
-            self.isSelected = isSelected
-        }
-
-        public var fraction: Double {
-            guard totalBytes > 0 else { return 0 }
-            return min(1, max(0, Double(downloadedBytes) / Double(totalBytes)))
-        }
-
-        public var name: String {
-            (path as NSString).lastPathComponent
-        }
-
-        public var totalDescription: String {
-            ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
-        }
-    }
-
-    public let id: UUID
-    public var name: String
-    public var source: Source
-    public var destination: URL
-    public var totalBytes: Int64
-    public var outputRelativePaths: [String]
-    public var files: [FileEntry]
-    public var createsEnclosingDirectory: Bool
-    /// Whether the shared top-level torrent folder is stripped from on-disk
-    /// output paths (the "don't create a subfolder" choice from the add dialog).
-    public var stripRootDirectory: Bool
-    public var downloadedBytes: Int64
-    public var progress: Double
-    public var status: String
-    public var state: State
-    /// Live download rate for this torrent in bytes per second. Transient
-    /// (sampled once a second by the session, never persisted); it is 0 unless
-    /// the torrent is actively downloading.
-    public var downloadSpeed: Int64 = 0
-
-    public init(name: String, source: Source, destination: URL, totalBytes: Int64) {
-        self.id = UUID()
-        self.name = name
-        self.source = source
-        self.destination = destination
-        self.totalBytes = totalBytes
-        self.outputRelativePaths = []
-        self.files = []
-        self.createsEnclosingDirectory = false
-        self.stripRootDirectory = false
-        self.downloadedBytes = 0
-        self.progress = 0
-        self.status = "Queued"
-        self.state = .queued
-    }
-
-    public static func failed(name: String, message: String, destination: URL) -> TorrentItem {
-        var item = TorrentItem(name: name, source: .magnet(""), destination: destination, totalBytes: 0)
-        item.status = message
-        item.state = .failed
-        return item
-    }
-
-    public var downloadedDescription: String {
-        ByteCountFormatter.string(fromByteCount: downloadedBytes, countStyle: .file)
-    }
-
-    /// This torrent's live download rate formatted for display, e.g. "1.2 MB/s".
-    public var speedDescription: String {
-        ByteCountFormatter.string(fromByteCount: downloadSpeed, countStyle: .file) + "/s"
-    }
-
-    public var totalDescription: String {
-        totalBytes > 0 ? ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file) : "Unknown"
-    }
-
-    /// Folds a downloader per-file snapshot into the existing entries. An empty
-    /// snapshot means "unchanged" so frequent status-only ticks don't clobber
-    /// the table; user-driven `isSelected` is always preserved.
-    mutating func applyFileProgress(_ snapshot: [TorrentFileProgress]) {
-        guard !snapshot.isEmpty else { return }
-        let bytesByID = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0.downloadedBytes) })
-        for index in files.indices {
-            if let bytes = bytesByID[files[index].id] {
-                files[index].downloadedBytes = bytes
-            }
-        }
-    }
-}
-
-public enum DefaultDownloadDirectory {
-    public static func url() -> URL {
-        FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
-    }
 }

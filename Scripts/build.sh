@@ -46,6 +46,19 @@ codesign --force --sign - "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 
 mkdir -p "$INSTALL_DIR"
+# A running copy keeps executing the old binary after its bundle is replaced,
+# so quit it first: politely (it may need a moment to shut down), then by force.
+if pgrep -xq "$APP_NAME"; then
+    BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST")
+    osascript -e "tell application id \"$BUNDLE_ID\" to quit" > /dev/null 2>&1 || true
+    tries=0
+    while pgrep -xq "$APP_NAME" && [ "$tries" -lt 20 ]; do
+        sleep 0.5
+        tries=$((tries + 1))
+    done
+    pkill -x "$APP_NAME" || true
+    echo "Quit running $APP_NAME"
+fi
 rm -rf "$INSTALLED_APP"
 cp -R "$APP_BUNDLE" "$INSTALLED_APP"
 

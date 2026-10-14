@@ -15,13 +15,14 @@
 ├── Tools/
 │   └── SwiftorrentBench/   headless benchmark executable (Core only), product `swiftorrent-bench`
 ├── Fixtures/               big-buck-bunny.torrent (local/ is gitignored)
-├── Scripts/                build.sh: app-agnostic Release build, .app packaging, install
+├── Scripts/                build.sh: app-agnostic Release build, .app packaging, install (quits a running copy first)
 │                           benchmark.sh: compares swiftorrent-bench with aria2c/transmission-cli
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── BENCHMARK.md        benchmark procedure, results, optimization TODO
 │   ├── WORKFLOW.md         the user's guide (Claude skips it)
 │   ├── decisions/          NNNN-short-title.md
+│   ├── images/             README screenshot
 │   └── plans/              active plans only
 ├── tmp/                    scratch and logs (gitignored)
 ├── CLAUDE.md
@@ -55,3 +56,4 @@ New experimental features or tiny helpers may start in `App/<App>/Incubator/`. M
 - Download-only policy: [decisions/0002-download-only-policy.md](decisions/0002-download-only-policy.md).
 - Hostile-input limits: `BencodeParser.maxDepth`, `TorrentMetainfoParser.maxPieceLength`, `PeerSupply.maxPeers`, and `BoundedHTTPClient` (byte-capped HTTP bodies for trackers, exact sources and web-seed ranges) bound what a torrent, peer, tracker or server can make us allocate. Tests: `HostileInputTests`, `BoundedHTTPTests`, `FuzzTests`.
 - Peer transport: `PeerWireClient` talks to a `PeerTransport` (`TCPPeerTransport`, `UTPPeerTransport` in `PeerTransport.swift`). uTP is a sans-I/O state machine (`UTPConnectionCore`, driven by tests with a virtual clock) plus the `UTPPacket` codec; `UTPProbe` backs `--utp-probe`. See [decisions/0006-utp-outbound-fallback.md](decisions/0006-utp-outbound-fallback.md).
+- Big types are split into extensions by concern, one file each: `PeerWireClient` (connect and wire I/O, `+MSE`, `+Messages` for availability and BEP 9/10/11, `+Download` for the request pipeline) and `TorrentSession` (add/start/pause/resume, `+Files`, `+Speed`, `+Persistence`). Their state stays in the main file, module-internal so the extensions can reach it.
