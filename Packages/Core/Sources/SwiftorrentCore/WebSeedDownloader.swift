@@ -132,7 +132,7 @@ struct WebSeedDownloader: Sendable {
         throw lastError ?? TrackerClientError.invalidResponse
     }
 
-    private struct NeighborSlice {
+    struct NeighborSlice: Equatable {
         let file: TorrentFile
         let fileOffset: Int64
         let length: Int64
@@ -141,12 +141,21 @@ struct WebSeedDownloader: Sendable {
     /// For each selectable piece, the byte ranges that fall inside a deselected
     /// file. These are exactly the boundary slices that whole-file selected
     /// downloads leave missing but a shared piece needs to verify.
-    private func boundaryNeighborSlices(metainfo: TorrentMetainfo, layout: TorrentLayout, selectablePieces: Set<Int>, selection: Set<Int>) -> [NeighborSlice] {
+    func boundaryNeighborSlices(metainfo: TorrentMetainfo, layout: TorrentLayout, selectablePieces: Set<Int>, selection: Set<Int>) -> [NeighborSlice] {
+        // Only the first and last piece of a deselected file can be shared with a
+        // selected neighbor; every piece strictly inside it lies wholly in that
+        // file and is not selectable. Walking the deselected files (rather than
+        // every piece against every file) keeps this linear in the file count.
         var slices: [NeighborSlice] = []
-        for piece in selectablePieces {
-            let pieceRange = layout.range(ofPiece: piece)
-            for file in metainfo.files where !selection.contains(file.id) {
-                let fileRange = layout.range(ofFile: file.id)
+        let pieceLength = Int64(layout.pieceLength)
+        guard pieceLength > 0 else { return slices }
+        for file in metainfo.files where !selection.contains(file.id) {
+            let fileRange = layout.range(ofFile: file.id)
+            guard !fileRange.isEmpty else { continue }
+            let first = Int(fileRange.lowerBound / pieceLength)
+            let last = Int((fileRange.upperBound - 1) / pieceLength)
+            for piece in Set([first, last]).sorted() where selectablePieces.contains(piece) {
+                let pieceRange = layout.range(ofPiece: piece)
                 let low = max(pieceRange.lowerBound, fileRange.lowerBound)
                 let high = min(pieceRange.upperBound, fileRange.upperBound)
                 guard high > low else { continue }

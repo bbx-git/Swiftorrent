@@ -91,7 +91,7 @@ public struct TorrentDownloader: Sendable {
         // Full hash scan once over the selected pieces. `verifiedPieces` is then
         // carried forward and only refreshed for pieces written during this run,
         // so we never re-hash already-valid pieces on the paths below.
-        var verifiedPieces = try writer.verifiedPieces(among: selectablePieces)
+        var verifiedPieces = try await writer.verifiedPiecesConcurrently(among: selectablePieces)
         let initialDownloaded = bytesCompleted(for: verifiedPieces, layout: layout)
         try ensureAvailableCapacity(for: downloadTotal - initialDownloaded, at: destination)
 
@@ -134,7 +134,7 @@ public struct TorrentDownloader: Sendable {
                 // Web seeds only write pieces we did not already have, so verify
                 // just the previously-unverified indices and fold the result in.
                 let unverified = selectablePieces.subtracting(verifiedPieces)
-                verifiedPieces.formUnion(try writer.verifiedPieces(among: unverified))
+                verifiedPieces.formUnion(try await writer.verifiedPiecesConcurrently(among: unverified))
                 let verifiedBytes = bytesCompleted(for: verifiedPieces, layout: layout)
                 if verifiedBytes >= downloadTotal {
                     try writer.finalize(selectedFileIDs: selection)

@@ -15,11 +15,36 @@ struct TorrentFileWriter: Sendable {
     /// and the protocol piece map remain correct.
     let stripRootDirectory: Bool
     private let partialExtension = "tor"
+    /// `fileEnds[i]` is the end offset of file `i` in the linear byte stream, so a
+    /// piece's first file is found by binary search instead of summing the lengths
+    /// of every earlier file for each piece.
+    private let fileEnds: [Int64]
 
     init(metainfo: TorrentMetainfo, destination: URL, stripRootDirectory: Bool = false) {
         self.metainfo = metainfo
         self.destination = destination
         self.stripRootDirectory = stripRootDirectory
+        var running: Int64 = 0
+        fileEnds = metainfo.files.map { file in
+            running += file.length
+            return running
+        }
+    }
+
+    /// Index of the first file whose end lies beyond `offset` (so it, or a later
+    /// file, holds the byte at `offset`). `files.count` when `offset` is past the end.
+    private func firstFile(endingAfter offset: Int64) -> Int {
+        var low = 0
+        var high = fileEnds.count
+        while low < high {
+            let mid = (low + high) / 2
+            if fileEnds[mid] > offset { high = mid } else { low = mid + 1 }
+        }
+        return low
+    }
+
+    private func fileStart(_ index: Int) -> Int64 {
+        fileEnds[index] - metainfo.files[index].length
     }
 
     /// Writes a raw byte range of a single file into its `.tor` partial. Used by
@@ -40,40 +65,69 @@ struct TorrentFileWriter: Sendable {
     /// pieces are written, instead of re-hashing the entire dataset.
     func verifiedPieces<S: Sequence>(among indices: S) throws -> Set<Int> where S.Element == Int {
         var verified = Set<Int>()
-        for pieceIndex in indices {
-            let length = pieceLength(for: pieceIndex)
-            guard let piece = try read(pieceIndex: pieceIndex, length: length),
-                  Data(Insecure.SHA1.hash(data: piece)) == metainfo.pieceHashes[pieceIndex] else {
-                continue
-            }
+        for pieceIndex in indices where try pieceVerifies(pieceIndex) {
             verified.insert(pieceIndex)
         }
         return verified
     }
 
-    func write(piece: Data, pieceIndex: Int) throws {
-        let pieceStart = Int64(pieceIndex * metainfo.pieceLength)
-        var remaining = piece
-        var offsetInTorrent = pieceStart
-
-        for file in metainfo.files {
-            let fileStart = metainfo.files.prefix(file.id).reduce(Int64(0)) { $0 + $1.length }
-            let fileEnd = fileStart + file.length
-            guard offsetInTorrent < fileEnd, offsetInTorrent + Int64(remaining.count) > fileStart else {
-                continue
+    /// Same result as `verifiedPieces(among:)`, but hashes on several cores and
+    /// stops promptly when the surrounding task is cancelled (pausing or removing a
+    /// torrent mid-scan). Each worker takes every `workers`-th piece, so each reads
+    /// the files mostly front to back.
+    func verifiedPiecesConcurrently<S: Sequence>(among indices: S) async throws -> Set<Int> where S.Element == Int {
+        let list = Array(indices)
+        let workers = min(max(ProcessInfo.processInfo.activeProcessorCount, 1), 8, list.count)
+        guard workers > 1 else {
+            var verified = Set<Int>()
+            for pieceIndex in list {
+                try Task.checkCancellation()
+                if try pieceVerifies(pieceIndex) { verified.insert(pieceIndex) }
             }
+            return verified
+        }
+        return try await withThrowingTaskGroup(of: Set<Int>.self) { group in
+            for worker in 0..<workers {
+                group.addTask {
+                    var found = Set<Int>()
+                    var position = worker
+                    while position < list.count {
+                        try Task.checkCancellation()
+                        if try self.pieceVerifies(list[position]) { found.insert(list[position]) }
+                        position += workers
+                    }
+                    return found
+                }
+            }
+            var verified = Set<Int>()
+            for try await found in group { verified.formUnion(found) }
+            return verified
+        }
+    }
 
-            let localStart = max(offsetInTorrent, fileStart)
-            let localEnd = min(offsetInTorrent + Int64(remaining.count), fileEnd)
-            let count = Int(localEnd - localStart)
-            let sourceOffset = Int(localStart - offsetInTorrent)
-            let chunkStart = remaining.index(remaining.startIndex, offsetBy: sourceOffset)
-            let chunkEnd = remaining.index(chunkStart, offsetBy: count)
-            let chunk = Data(remaining[chunkStart..<chunkEnd])
-            try write(chunk: chunk, to: file, at: localStart - fileStart)
-            remaining.removeFirst(sourceOffset + count)
-            offsetInTorrent = localEnd
-            if remaining.isEmpty { break }
+    private func pieceVerifies(_ pieceIndex: Int) throws -> Bool {
+        let length = pieceLength(for: pieceIndex)
+        guard let piece = try read(pieceIndex: pieceIndex, length: length) else { return false }
+        return Data(Insecure.SHA1.hash(data: piece)) == metainfo.pieceHashes[pieceIndex]
+    }
+
+    func write(piece: Data, pieceIndex: Int) throws {
+        let pieceStart = Int64(pieceIndex) * Int64(metainfo.pieceLength)
+        let pieceEnd = pieceStart + Int64(piece.count)
+
+        var index = firstFile(endingAfter: pieceStart)
+        while index < metainfo.files.count {
+            let start = fileStart(index)
+            guard start < pieceEnd else { break }
+            let file = metainfo.files[index]
+            let localStart = max(pieceStart, start)
+            let localEnd = min(pieceEnd, fileEnds[index])
+            if localEnd > localStart {
+                let from = piece.startIndex + Int(localStart - pieceStart)
+                let chunk = Data(piece[from..<(from + Int(localEnd - localStart))])
+                try write(chunk: chunk, to: file, at: localStart - start)
+            }
+            index += 1
         }
     }
 
@@ -145,22 +199,22 @@ struct TorrentFileWriter: Sendable {
     }
 
     func read(pieceIndex: Int, length: Int) throws -> Data? {
-        let pieceStart = Int64(pieceIndex * metainfo.pieceLength)
+        let pieceStart = Int64(pieceIndex) * Int64(metainfo.pieceLength)
         var result = Data()
         result.reserveCapacity(length)
         let pieceEnd = pieceStart + Int64(length)
 
-        for file in metainfo.files {
-            let fileStart = metainfo.files.prefix(file.id).reduce(Int64(0)) { $0 + $1.length }
-            let fileEnd = fileStart + file.length
-            guard pieceStart < fileEnd, pieceEnd > fileStart else {
-                continue
-            }
-
-            let localStart = max(pieceStart, fileStart)
-            let localEnd = min(pieceEnd, fileEnd)
+        var index = firstFile(endingAfter: pieceStart)
+        while index < metainfo.files.count {
+            let start = fileStart(index)
+            guard start < pieceEnd else { break }
+            let file = metainfo.files[index]
+            index += 1
+            let localStart = max(pieceStart, start)
+            let localEnd = min(pieceEnd, fileEnds[index - 1])
+            guard localEnd > localStart else { continue }
             let count = Int(localEnd - localStart)
-            let chunk = try readChunk(from: file, at: localStart - fileStart, count: count)
+            let chunk = try readChunk(from: file, at: localStart - start, count: count)
             guard let chunk, chunk.count == count else {
                 return nil
             }
