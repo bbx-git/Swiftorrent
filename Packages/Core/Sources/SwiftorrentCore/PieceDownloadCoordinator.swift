@@ -10,7 +10,9 @@ actor PieceDownloadCoordinator {
     /// rarest-first piece selection. Mutable because the swarm is dynamic: workers
     /// fold in each freshly connected peer via `addAvailability` so the ordering
     /// keeps refining as peers join and leave.
-    private var availabilityCounts: [Int: Int]
+    /// Indexed by piece; `Int.max` means no peer has been seen with that piece, so
+    /// it sorts as least rare. A flat array keeps the per-claim scan cache-friendly.
+    private var availabilityCounts: [Int]
     private var pendingPieces: Set<Int>
     /// In-flight pieces mapped to the number of peers currently downloading each.
     /// Normally 1, but **endgame** hands the same piece to several peers at once
@@ -29,7 +31,11 @@ actor PieceDownloadCoordinator {
         self.layout = layout
         self.completedPieces = completedPieces
         self.completedBytes = initialDownloaded
-        self.availabilityCounts = availabilityCounts
+        var counts = [Int](repeating: Int.max, count: layout.pieceCount)
+        for (piece, count) in availabilityCounts where piece >= 0 && piece < counts.count {
+            counts[piece] = count
+        }
+        self.availabilityCounts = counts
         self.pendingPieces = selectablePieces.subtracting(completedPieces)
         self.perFileBytes = layout.completedBytesPerFile(completedPieces: completedPieces)
     }
@@ -73,8 +79,8 @@ actor PieceDownloadCoordinator {
     /// counts. Called as the worker pool replaces dead peers so piece ordering
     /// reflects the live swarm rather than just the peers seen at startup.
     func addAvailability(_ pieces: Set<Int>) {
-        for piece in pieces {
-            availabilityCounts[piece, default: 0] += 1
+        for piece in pieces where piece >= 0 && piece < availabilityCounts.count {
+            availabilityCounts[piece] = availabilityCounts[piece] == Int.max ? 1 : availabilityCounts[piece] + 1
         }
     }
 
@@ -86,13 +92,18 @@ actor PieceDownloadCoordinator {
     /// in-flight piece the peer can serve, so several peers race the final pieces and
     /// the tail isn't held hostage by one slow seed.
     func nextPiece(availablePieces: Set<Int>, excluding: Set<Int> = []) -> Int? {
-        let candidates = pendingPieces.intersection(availablePieces)
-        if let piece = candidates.min(by: { left, right in
-            let leftCount = availabilityCounts[left, default: Int.max]
-            let rightCount = availabilityCounts[right, default: Int.max]
-            if leftCount == rightCount { return left < right }
-            return leftCount < rightCount
-        }) {
+        // One pass with no intermediate set: `pendingPieces.intersection(...)` allocated
+        // a set the size of the torrent on every claim, which dominated large torrents.
+        var rarest: Int?
+        var rarestCount = Int.max
+        for piece in pendingPieces where availablePieces.contains(piece) {
+            let count = piece >= 0 && piece < availabilityCounts.count ? availabilityCounts[piece] : Int.max
+            if rarest == nil || count < rarestCount || (count == rarestCount && piece < rarest!) {
+                rarest = piece
+                rarestCount = count
+            }
+        }
+        if let piece = rarest {
             pendingPieces.remove(piece)
             assignments[piece, default: 0] += 1
             return piece
