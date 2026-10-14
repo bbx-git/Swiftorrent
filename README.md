@@ -18,7 +18,7 @@ Full list and protocol notes: [docs/FEATURES.md](docs/FEATURES.md).
 ```sh
 Scripts/build.sh
 ```
-Builds the Release binary with SwiftPM, wraps it in a `.app`, signs it ad hoc and installs it to `~/Applications/`. The app name comes from `App/Resources/Info.plist`, so the script needs no edits per app. The log is in `tmp/build.log`. Unit tests: `swift test -c release -Xswiftc -enable-testing --package-path Packages/Core` (and `Packages/Domain`).
+Builds the Release binary with SwiftPM, wraps it in a `.app`, signs it ad hoc and installs it to `~/Applications/`. The app name comes from `App/Resources/Info.plist`, so the script needs no edits per app. The log is in `tmp/build.log`. Unit tests: `swift test -c release -Xswiftc -enable-testing --package-path Packages/Core` (and `Packages/Domain`, `Packages/Features`).
 
 ## More
 - Project layout and module rules: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)

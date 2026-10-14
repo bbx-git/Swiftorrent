@@ -431,3 +431,15 @@ Info-hash-only magnets (no `tr=`, no web seed), `--resolve-only`, 5 runs each, s
 | Debian 13.7 amd64 | 5/5 | 1.3-2.3 s |
 
 20/20 resolved, median 1.7 s, max 4.8 s. The closest-first DHT result from the Debian-only run holds on three more info-hashes. All four are well-seeded distro ISOs; a thin swarm is not covered.
+
+## After the hostile-input audit (2026-10-14)
+
+Smoke runs with `swiftorrent-bench` on `Fixtures/big-buck-bunny.torrent` (263.6 MiB), single trial, after bounded HTTP bodies, validated peer messages, tracker `port=0` and the writer/verify changes:
+
+| Path | Wall | TTFB | Avg | Peak |
+|---|---|---|---|---|
+| Web seed (8 range segments) | 14.8 s | 0.7 s | 17.8 MiB/s | 29.6 MiB/s |
+| Swarm only (`--strip-web-seeds`) | 16.6 s | 1.5 s | 15.9 MiB/s | 25.2 MiB/s |
+
+Magnet `--resolve-only` (two UDP trackers + DHT): 0.5 s OK. No regression against the numbers above. Resume verification of a 16,000-file torrent went from 34.6 s to 1.1 s (see `ManyFilesTests`).
+
