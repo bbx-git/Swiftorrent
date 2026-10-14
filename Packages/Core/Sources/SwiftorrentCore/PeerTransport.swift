@@ -113,3 +113,185 @@ struct TCPPeerTransport: PeerTransport {
         connection.cancel()
     }
 }
+
+/// uTP (BEP 29) over one UDP `NWConnection` per peer. The protocol itself lives
+/// in `UTPConnectionCore`; this class only moves datagrams, drives its timer and
+/// wakes the callers parked in `open`/`receive`.
+///
+/// Everything touching `core`, the waiters and the timer runs on `queue`, which
+/// is also the queue the `NWConnection` delivers its callbacks on.
+final class UTPPeerTransport: PeerTransport, @unchecked Sendable {
+    private let connection: NWConnection
+    private let queue = DispatchQueue(label: "com.swiftorrent.peerwire.utp")
+    private let timer: DispatchSourceTimer
+    private let core = UTPConnectionCore(connectionID: UInt16.random(in: 1..<UInt16.max))
+    private var connectWaiter: ResumeOnce<Void>?
+    private var readWaiter: ResumeOnce<Data>?
+    private var isShutDown = false
+
+    init(endpoint: PeerEndpoint) throws {
+        guard let port = NWEndpoint.Port(rawValue: endpoint.port) else {
+            throw PeerWireError.connectionFailed
+        }
+        connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: port, using: .udp)
+        timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.schedule(deadline: .distantFuture)
+        timer.resume()
+    }
+
+    func open() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let waiter = ResumeOnce(continuation)
+                queue.async { [self] in
+                    guard !isShutDown else {
+                        waiter.resume(throwing: CancellationError())
+                        return
+                    }
+                    connectWaiter = waiter
+                    connection.stateUpdateHandler = { [self] state in
+                        switch state {
+                        case .ready:
+                            connection.stateUpdateHandler = nil
+                            transmit(core.open(now: Self.now))
+                            receiveDatagram()
+                            armTimer()
+                        case .failed, .waiting, .cancelled:
+                            connection.stateUpdateHandler = nil
+                            shutDown()
+                        default:
+                            break
+                        }
+                    }
+                    connection.start(queue: queue)
+                }
+            }
+        } onCancel: {
+            close()
+        }
+    }
+
+    func send(_ data: Data) async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                queue.async { [self] in
+                    guard !isShutDown, core.isEstablished else {
+                        continuation.resume(throwing: PeerWireError.disconnected)
+                        return
+                    }
+                    transmit(core.write(data, now: Self.now))
+                    armTimer()
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            close()
+        }
+    }
+
+    func receive() async throws -> Data {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                let waiter = ResumeOnce(continuation)
+                queue.async { [self] in
+                    readWaiter = waiter
+                    serviceWaiters()
+                }
+            }
+        } onCancel: {
+            close()
+        }
+    }
+
+    func close() {
+        queue.async { [self] in
+            guard !isShutDown else { return }
+            transmit(core.close(now: Self.now))
+            shutDown()
+        }
+    }
+
+    // MARK: On `queue`
+
+    private static var now: UInt64 { DispatchTime.now().uptimeNanoseconds / 1000 }
+
+    private func transmit(_ packets: [UTPPacket]) {
+        for packet in packets {
+            connection.send(content: packet.encoded(), completion: .idempotent)
+        }
+    }
+
+    private func receiveDatagram() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [self] data, _, _, error in
+            guard !isShutDown else { return }
+            if error != nil {
+                shutDown()
+                return
+            }
+            if let data, let packet = UTPPacket(data) {
+                transmit(core.receive(packet, now: Self.now))
+                serviceWaiters()
+                armTimer()
+            }
+            receiveDatagram()
+        }
+    }
+
+    private func tick() {
+        guard !isShutDown else { return }
+        transmit(core.tick(now: Self.now))
+        serviceWaiters()
+        armTimer()
+    }
+
+    private func armTimer() {
+        guard !isShutDown, let deadline = core.nextDeadline else {
+            timer.schedule(deadline: .distantFuture)
+            return
+        }
+        let now = Self.now
+        timer.schedule(deadline: .now() + .microseconds(Int(deadline > now ? deadline - now : 0)))
+    }
+
+    /// Wakes the connect and read waiters if their condition now holds, and
+    /// tears everything down once the connection has failed or ended.
+    private func serviceWaiters() {
+        if let waiter = connectWaiter {
+            if core.isEstablished {
+                connectWaiter = nil
+                waiter.resume(returning: ())
+            } else if core.state == .closed {
+                connectWaiter = nil
+                waiter.resume(throwing: PeerWireError.connectionFailed)
+            }
+        }
+        if let waiter = readWaiter {
+            if core.inboundCount > 0 {
+                let result = core.read(maxBytes: 65536, now: Self.now)
+                readWaiter = nil
+                transmit(result.packets)
+                waiter.resume(returning: result.data)
+            } else if core.state == .closed || core.remoteFinished {
+                readWaiter = nil
+                waiter.resume(throwing: PeerWireError.disconnected)
+            }
+        }
+        if core.state == .closed { shutDown() }
+    }
+
+    private func shutDown() {
+        guard !isShutDown else { return }
+        isShutDown = true
+        timer.cancel()
+        connection.cancel()
+        if let waiter = connectWaiter {
+            connectWaiter = nil
+            waiter.resume(throwing: PeerWireError.connectionFailed)
+        }
+        if let waiter = readWaiter {
+            readWaiter = nil
+            waiter.resume(throwing: PeerWireError.disconnected)
+        }
+    }
+}

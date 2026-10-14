@@ -89,6 +89,8 @@ public actor PeerWireClient {
     private let endpoint: PeerEndpoint
     private let infoHash: Data
     private let peerID: Data
+    /// A uTP fallback only adds this much to a dead peer's connect time.
+    private static let utpConnectTimeout: TimeInterval = 5
     /// Upper bound on how long the TCP connection may take to become ready.
     private let connectTimeout: TimeInterval
     /// Upper bound on any single send/receive wire operation. A peer that goes
@@ -103,6 +105,8 @@ public actor PeerWireClient {
     private let idleTimeout: TimeInterval
     private let encryptionPolicy: EncryptionPolicy
     private var transport: (any PeerTransport)?
+    /// Set once TCP failed to connect and uTP was used instead.
+    private var usesUTP = false
     /// Once the MSE handshake selects RC4, `sendCipher` encrypts our outgoing
     /// bytes and `recvCipher` decrypts the peer's — both `nil` on a plaintext
     /// connection. RC4 is a stream cipher, so running bytes through in order works
@@ -176,16 +180,29 @@ public actor PeerWireClient {
         }
     }
 
-    /// Opens the TCP connection and waits for it to become ready (bounded by
-    /// `connectTimeout`). Resets any buffered input from a prior attempt.
+    /// Opens the connection and waits for it to become ready (bounded by
+    /// `connectTimeout`). Tries TCP first and falls back to uTP when TCP cannot
+    /// connect; once uTP was needed, reconnects go straight to it. Resets any
+    /// buffered input from a prior attempt.
     private func openConnection() async throws {
         try Task.checkCancellation()
         inputBuffer.removeAll(keepingCapacity: true)
-        let transport = try TCPPeerTransport(endpoint: endpoint)
-        self.transport = transport
-        try await withTimeout(connectTimeout) {
-            try await transport.open()
+        if !usesUTP {
+            let tcp = try TCPPeerTransport(endpoint: endpoint)
+            transport = tcp
+            do {
+                try await withTimeout(connectTimeout) { try await tcp.open() }
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                tcp.close()
+                usesUTP = true
+            }
         }
+        let utp = try UTPPeerTransport(endpoint: endpoint)
+        transport = utp
+        try await withTimeout(min(connectTimeout, Self.utpConnectTimeout)) { try await utp.open() }
     }
 
     /// The plaintext BitTorrent handshake. Runs over whatever transport is in
