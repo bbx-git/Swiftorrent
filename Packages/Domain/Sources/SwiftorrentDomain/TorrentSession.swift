@@ -155,9 +155,13 @@ public final class TorrentSession {
         tasks[id] = Task {
             defer { tasks[id] = nil }
             do {
-                let data = try Data(contentsOf: url)
+                // This task inherits the main actor; read and parse the file off it
+                // so a large torrent (tens of thousands of files) cannot stall the UI.
+                let parser = metainfoParser
+                let metainfo = try await Task.detached(priority: .userInitiated) {
+                    try parser.parse(data: Data(contentsOf: url))
+                }.value
                 try Task.checkCancellation()
-                let metainfo = try metainfoParser.parse(data: data)
                 metainfos[id] = metainfo
                 applyResolvedMetadata(metainfo, to: id)
             } catch is CancellationError {
