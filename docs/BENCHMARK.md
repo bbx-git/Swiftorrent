@@ -391,3 +391,30 @@ An intermediate version (no re-seed on empty walks) was 18/20; the two failures 
 ## Swarm, 3 trials (2026-10-14)
 
 Debian 13.7.0 netinst (756 MiB, pure swarm), `TRIALS=3 Scripts/benchmark.sh`, client order alternating. Median wall time: **Swiftorrent 18.8 s**, aria2c 20.4 s, transmission-cli 73.4 s. Swiftorrent TTFB 1.8-4.5 s, peak 58 MiB/s.
+
+## Three more swarms (2026-10-14)
+
+`TRIALS=2 Scripts/benchmark.sh`, client order alternating, sequential. All three are official ISO torrents with the web seed removed (the `.torrent` was rewritten without `url-list`; info-hash unchanged), so every client uses the peer swarm. Median wall time over 2 trials:
+
+| Torrent | Size | Swiftorrent | aria2c | transmission-cli | Swiftorrent TTFB | Swiftorrent peak |
+|---|---|---|---|---|---|---|
+| Kali 2026.2 netinst amd64 | 743 MiB | 18.2 s | **16.5 s** | 109 s | 1.4-1.5 s | 61.6 MiB/s |
+| Debian 13.7 arm64 netinst | 701 MiB | **19.7 s** | 24.0 s | 114 s | 1.9-3.7 s | 58.1 MiB/s |
+| Arch 2026.10.01 | 1.5 GiB | **52.6 s** | 97.9 s | 162 s | 4.5-8.7 s | 51.3 MiB/s |
+
+- aria2c wins Kali by ~2 s (trial 1: Swiftorrent 16.6 s vs aria2c 17.3 s; trial 2: 19.7 s vs 15.6 s), so it is a tie within noise.
+- Arch is a thinner swarm: every client was slower and aria2c took ~98 s in both trials. Swiftorrent's TTFB was the weakest here (8.7 s, then 4.5 s).
+- transmission-cli was slowest everywhere (TTFB 7-85 s, wall 85-172 s).
+- The fourth planned run (Arch with web seed kept) was stopped after Swiftorrent's first trial (32.8 s, TTFB 0.7 s, 47.7 MiB/s avg) because the benchmark saturated the user's connection. Not compared.
+- Ubuntu 24.04.5 live server (3.7 GiB) and Debian live LXDE (3.5 GiB) were skipped: over the 2 GB cap.
+
+## DHT streaming start (2026-10-14)
+
+`collectPeers` now takes DHT peers batch by batch (`DHTPeerFinding.peers(for:onPeers:)`) instead of waiting for the whole walk, so a tracker-less torrent starts after the 3 s fast-start grace with whatever the DHT has found. Arch (DHT + web seed only; web seed stripped), Swiftorrent only, old and new binary alternating on the same swarm, 2 rounds:
+
+| | TTFB | Wall |
+|---|---|---|
+| old | 4.5 s / 4.0 s | 90.9 s / 86.2 s |
+| new | 1.6 s / 1.8 s | 72.8 s / 78.3 s |
+
+The swarm itself was slow that hour (both builds ~2x the earlier 47-58 s), so compare only within pairs. A persistent DHT node cache was not built: first byte is now on par with tracker-backed torrents.

@@ -218,10 +218,11 @@ public struct TorrentDownloader: Sendable {
         }
     }
 
-    /// A peer-discovery task-group signal: either a source (tracker or DHT)
-    /// reporting in, the short fast-start grace period elapsing, or the hard
-    /// deadline firing.
+    /// A peer-discovery signal: peers streamed in by the DHT, a source (tracker
+    /// or DHT) reporting its final result, the short fast-start grace period
+    /// elapsing, or the hard deadline firing.
     private enum CollectSignal {
+        case streamed([PeerEndpoint])
         case source(Result<[PeerEndpoint], Error>)
         case fastStartElapsed
         case deadline
@@ -237,8 +238,11 @@ public struct TorrentDownloader: Sendable {
     ) async throws -> [PeerEndpoint] {
         var peers: Set<PeerEndpoint> = []
         var lastError: Error?
+        // Sources push into one stream so the DHT can report peers batch by batch
+        // while its walk is still running (a task-group child returns only once).
+        let (signals, continuation) = AsyncStream.makeStream(of: CollectSignal.self)
 
-        await withTaskGroup(of: CollectSignal.self) { group in
+        await withTaskGroup(of: Void.self) { group in
             for url in metainfo.announceURLs {
                 group.addTask {
                     do {
@@ -251,9 +255,9 @@ public struct TorrentDownloader: Sendable {
                             left: left ?? metainfo.totalSize,
                             event: event
                         )
-                        return .source(.success(try await trackerClient.announce(request)))
+                        continuation.yield(.source(.success(try await trackerClient.announce(request))))
                     } catch {
-                        return .source(.failure(error))
+                        continuation.yield(.source(.failure(error)))
                     }
                 }
             }
@@ -262,9 +266,10 @@ public struct TorrentDownloader: Sendable {
                 group.addTask {
                     do {
                         try Task.checkCancellation()
-                        return .source(.success(try await dhtClient.peers(for: metainfo.infoHash)))
+                        let all = try await dhtClient.peers(for: metainfo.infoHash, onPeers: { continuation.yield(.streamed($0)) })
+                        continuation.yield(.source(.success(all)))
                     } catch {
-                        return .source(.failure(error))
+                        continuation.yield(.source(.failure(error)))
                     }
                 }
             }
@@ -274,7 +279,7 @@ public struct TorrentDownloader: Sendable {
             // some peers to work with.
             group.addTask {
                 try? await Task.sleep(for: Self.fastStartDeadline)
-                return .fastStartElapsed
+                if !Task.isCancelled { continuation.yield(.fastStartElapsed) }
             }
 
             // Deadline sentinel: don't let the whole download wait on the slowest
@@ -283,13 +288,13 @@ public struct TorrentDownloader: Sendable {
             // with peers in hand, or this fires — whichever comes first.
             group.addTask {
                 try? await Task.sleep(for: Self.peerDiscoveryDeadline)
-                return .deadline
+                if !Task.isCancelled { continuation.yield(.deadline) }
             }
 
             let realSources = metainfo.announceURLs.count + (includeDHT ? 1 : 0)
             var reported = 0
             var fastStartElapsed = false
-            collectLoop: for await signal in group {
+            collectLoop: for await signal in signals {
                 if Task.isCancelled {
                     break collectLoop
                 }
@@ -298,6 +303,8 @@ public struct TorrentDownloader: Sendable {
                     break collectLoop
                 case .fastStartElapsed:
                     fastStartElapsed = true
+                case let .streamed(endpoints):
+                    peers.formUnion(endpoints)
                 case let .source(result):
                     reported += 1
                     switch result {
@@ -310,12 +317,13 @@ public struct TorrentDownloader: Sendable {
                 // Stop as soon as we have plenty, every tracker/DHT has answered, or
                 // the fast-start grace period has passed and we already have some
                 // peers (so first byte isn't gated on a slow straggler, typically
-                // the DHT — its peers still arrive later via the swarm supervisor's
+                // the DHT — its later peers still arrive via the swarm supervisor's
                 // periodic re-announce).
                 if peers.count >= Self.enoughPeersToStart || reported >= realSources || (fastStartElapsed && !peers.isEmpty) {
                     break collectLoop
                 }
             }
+            continuation.finish()
             group.cancelAll()
         }
 
@@ -361,6 +369,7 @@ extension TrackerClient: TrackerAnnouncing {}
 
 protocol DHTPeerFinding: Sendable {
     func peers(for infoHash: Data) async throws -> [PeerEndpoint]
+    func peers(for infoHash: Data, onPeers: @Sendable ([PeerEndpoint]) async -> Void) async throws -> [PeerEndpoint]
 }
 
 extension DHTClient: DHTPeerFinding {}

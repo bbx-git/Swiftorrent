@@ -434,6 +434,26 @@ struct CoreParsingTests {
         #expect(Set(peers) == [trackerPeer, sharedPeer, dhtPeer])
     }
 
+    @Test("Streamed DHT peers start the swarm while the walk is still running")
+    func streamedDHTPeersDoNotWaitForTheWalk() async throws {
+        let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8)])
+        let dhtPeer = PeerEndpoint(host: "192.0.2.30", port: 6881)
+        let downloader = TorrentDownloader(
+            trackerClient: HangingTrackerAnnouncer(),
+            dhtClient: StreamingThenHangingDHT(peer: dhtPeer)
+        )
+
+        let started = ContinuousClock.now
+        let peers = try await downloader.collectPeers(
+            for: metainfo,
+            peerID: Data(repeating: 1, count: 20),
+            event: "started"
+        )
+
+        #expect(peers == [dhtPeer])
+        #expect(ContinuousClock.now - started < .seconds(6))
+    }
+
     @Test("Torrent downloader skips DHT for stopped announces")
     func torrentDownloaderSkipsDHTForStoppedAnnounce() async throws {
         let metainfo = makeMetainfo(pieceLength: 4, pieces: [Data("abcd".utf8)])
@@ -1286,6 +1306,26 @@ private struct MockDHTPeerFinder: DHTPeerFinding {
 
     func peers(for infoHash: Data) async throws -> [PeerEndpoint] {
         peers
+    }
+
+    func peers(for infoHash: Data, onPeers: @Sendable ([PeerEndpoint]) async -> Void) async throws -> [PeerEndpoint] {
+        await onPeers(peers)
+        return peers
+    }
+}
+
+/// Reports one peer right away, then keeps "walking" for a minute.
+private struct StreamingThenHangingDHT: DHTPeerFinding {
+    let peer: PeerEndpoint
+
+    func peers(for infoHash: Data) async throws -> [PeerEndpoint] {
+        try await peers(for: infoHash, onPeers: { _ in })
+    }
+
+    func peers(for infoHash: Data, onPeers: @Sendable ([PeerEndpoint]) async -> Void) async throws -> [PeerEndpoint] {
+        await onPeers([peer])
+        try await Task.sleep(for: .seconds(60))
+        return [peer]
     }
 }
 
