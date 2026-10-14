@@ -102,15 +102,7 @@ public actor PeerWireClient {
     private let snubTimeout: TimeInterval
     private let idleTimeout: TimeInterval
     private let encryptionPolicy: EncryptionPolicy
-    private var connection: NWConnection?
-    /// A dedicated **serial** queue for this connection's `NWConnection` callbacks.
-    /// Network.framework schedules state/send/receive handlers onto the queue passed
-    /// to `start`; a *concurrent* queue (e.g. `.global()`) lets the multi-shot
-    /// `stateUpdateHandler` fire `.ready`/`.cancelled` on two threads at once, which
-    /// can resume the connect continuation twice (a fatal "continuation misuse").
-    /// A serial queue keeps callbacks ordered so the `resumeOnce` guard below is
-    /// enough to make the transition strictly single-resume.
-    private let connectionQueue = DispatchQueue(label: "com.swiftorrent.peerwire.connection")
+    private var transport: (any PeerTransport)?
     /// Once the MSE handshake selects RC4, `sendCipher` encrypts our outgoing
     /// bytes and `recvCipher` decrypts the peer's — both `nil` on a plaintext
     /// connection. RC4 is a stream cipher, so running bytes through in order works
@@ -189,48 +181,10 @@ public actor PeerWireClient {
     private func openConnection() async throws {
         try Task.checkCancellation()
         inputBuffer.removeAll(keepingCapacity: true)
-        guard let port = NWEndpoint.Port(rawValue: endpoint.port) else {
-            throw PeerWireError.connectionFailed
-        }
-        let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: port, using: .tcp)
-        self.connection = connection
-        let queue = connectionQueue
+        let transport = try TCPPeerTransport(endpoint: endpoint)
+        self.transport = transport
         try await withTimeout(connectTimeout) {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    // `stateUpdateHandler` is multi-shot and can race the `onCancel`
-                    // below (which cancels the connection, delivering `.cancelled`),
-                    // so funnel every resume through a once-only guard to make the
-                    // "resume more than once" fatal error impossible.
-                    let resume = ResumeOnce(continuation)
-                    connection.stateUpdateHandler = { state in
-                        switch state {
-                        case .ready:
-                            connection.stateUpdateHandler = nil
-                            resume.resume(returning: ())
-                        case let .failed(error):
-                            connection.stateUpdateHandler = nil
-                            resume.resume(throwing: error)
-                        case let .waiting(error):
-                            // Without waitForConnectivity, NWConnection parks unreachable or
-                            // refused peers in `.waiting` indefinitely. Fail fast instead.
-                            connection.stateUpdateHandler = nil
-                            connection.cancel()
-                            resume.resume(throwing: error)
-                        case .cancelled:
-                            // Reached when `onCancel` (or `.waiting` above) cancels the
-                            // connection; resume so the continuation never leaks.
-                            connection.stateUpdateHandler = nil
-                            resume.resume(throwing: CancellationError())
-                        default:
-                            break
-                        }
-                    }
-                    connection.start(queue: queue)
-                }
-            } onCancel: {
-                connection.cancel()
-            }
+            try await transport.open()
         }
     }
 
@@ -634,8 +588,8 @@ public actor PeerWireClient {
     }
 
     public func close() {
-        connection?.cancel()
-        connection = nil
+        transport?.close()
+        transport = nil
     }
 
     private func handlePeerStateMessage(_ message: (id: UInt8, payload: Data), pieceCount: Int? = nil) {
@@ -817,7 +771,7 @@ public actor PeerWireClient {
 
     private func send(_ data: Data) async throws {
         try Task.checkCancellation()
-        guard let connection else { throw PeerWireError.disconnected }
+        guard let transport else { throw PeerWireError.disconnected }
         let outgoing: Data
         if var cipher = sendCipher {
             outgoing = cipher.process(data)
@@ -826,19 +780,7 @@ public actor PeerWireClient {
             outgoing = data
         }
         try await withTimeout(ioTimeout) {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    connection.send(content: outgoing, completion: .contentProcessed { error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else {
-                            continuation.resume()
-                        }
-                    })
-                }
-            } onCancel: {
-                connection.cancel()
-            }
+            try await transport.send(outgoing)
         }
     }
 
@@ -867,30 +809,16 @@ public actor PeerWireClient {
     /// Appends one socket read to the raw input buffer.
     private func fillInputBuffer(timeout: TimeInterval) async throws {
         try Task.checkCancellation()
-        guard let connection else { throw PeerWireError.disconnected }
+        guard let transport else { throw PeerWireError.disconnected }
         let chunk = try await withTimeout(timeout) {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else if let data, !data.isEmpty {
-                            continuation.resume(returning: data)
-                        } else {
-                            continuation.resume(throwing: PeerWireError.disconnected)
-                        }
-                    }
-                }
-            } onCancel: {
-                connection.cancel()
-            }
+            try await transport.receive()
         }
         inputBuffer.append(contentsOf: chunk)
     }
 
     /// Races `operation` against a sleeping timer. If the timer wins, the
     /// structured task group cancels the operation task on scope exit, whose
-    /// `onCancel` cancels the underlying `NWConnection`, so the parked
+    /// cancellation handler closes the underlying transport, so the parked
     /// continuation resumes and nothing leaks. Surfaced error is `.timedOut`.
     private func withTimeout<T: Sendable>(
         _ seconds: TimeInterval,
