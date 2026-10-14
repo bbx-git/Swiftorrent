@@ -77,7 +77,7 @@ struct WebSeedDownloader: Sendable {
                 // Fill the deselected-neighbor slices of any shared boundary pieces.
                 for slice in neighborSlices {
                     try Task.checkCancellation()
-                    let sourceURL = webSeedURL.appendingTorrentRelativePath(slice.file.path)
+                    let sourceURL = webSeedURL.torrentSourceURL(for: slice.file, singleFile: !metainfo.createsEnclosingDirectory)
                     let data = try await self.fetchRange(from: sourceURL, offset: slice.fileOffset, length: slice.length)
                     try writer.writeFileChunk(data, to: slice.file, atFileOffset: slice.fileOffset)
                     await self.rateLimiter?.consume(data.count)
@@ -107,7 +107,7 @@ struct WebSeedDownloader: Sendable {
                 var perFileBytes = [Int64](repeating: 0, count: mapper.metainfo.files.count)
                 for file in files {
                     try Task.checkCancellation()
-                    let sourceURL = webSeedURL.appendingTorrentRelativePath(file.path)
+                    let sourceURL = webSeedURL.torrentSourceURL(for: file, singleFile: !mapper.metainfo.createsEnclosingDirectory)
                     let fileBase = downloadedBytes
                     let baseFileBytes = perFileBytes
                     let snapshot: @Sendable (Int64) -> [TorrentFileProgress] = { currentFileBytes in
@@ -346,6 +346,14 @@ struct WebSeedDownloader: Sendable {
 }
 
 extension URL {
+    /// The URL to fetch `file` from on this web seed (BEP 19). A single-file
+    /// torrent whose `url-list` entry does not end in `/` names the file itself, so
+    /// it is used as is; otherwise the torrent-relative path is appended.
+    func torrentSourceURL(for file: TorrentFile, singleFile: Bool) -> URL {
+        if singleFile, !absoluteString.hasSuffix("/") { return self }
+        return appendingTorrentRelativePath(file.path)
+    }
+
     func appendingTorrentRelativePath(_ path: String) -> URL {
         path.split(separator: "/").reduce(self) { url, component in
             url.appendingPathComponent(String(component))

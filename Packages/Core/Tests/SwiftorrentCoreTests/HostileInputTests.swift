@@ -391,3 +391,30 @@ struct PeerAddressTests {
         #expect(handed > 0)
     }
 }
+
+@Suite("Web-seed URLs")
+struct WebSeedURLTests {
+    private let single = TorrentFile(id: 0, path: "disc.iso", length: 10)
+    private let nested = TorrentFile(id: 1, path: "Album/CD 1/01.flac", length: 10)
+
+    @Test("A single-file url-list entry without a trailing slash is used as is (BEP 19)")
+    func singleFileUsedAsIs() {
+        let url = URL(string: "https://mirror.test/pub/disc.iso")!
+
+        #expect(url.torrentSourceURL(for: single, singleFile: true).absoluteString == "https://mirror.test/pub/disc.iso")
+    }
+
+    @Test("A single-file entry that is a directory gets the file name appended")
+    func singleFileDirectory() {
+        let url = URL(string: "https://mirror.test/pub/")!
+
+        #expect(url.torrentSourceURL(for: single, singleFile: true).absoluteString == "https://mirror.test/pub/disc.iso")
+    }
+
+    @Test("Multi-file torrents append the torrent-relative path")
+    func multiFileAppends() {
+        let url = URL(string: "https://mirror.test/pub")!
+
+        #expect(url.torrentSourceURL(for: nested, singleFile: false).absoluteString == "https://mirror.test/pub/Album/CD%201/01.flac")
+    }
+}
