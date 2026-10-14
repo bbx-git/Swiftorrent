@@ -360,3 +360,14 @@ Debian 13.7.0 netinst (756 MiB, pure swarm), single trial, sequential, after the
 | transmission-cli | 93.4 s | 6.4 s | n/a | 52 MB/s |
 
 Swiftorrent is on par with aria2c and finished well ahead of transmission. The swarm path is unaffected by the restructure.
+
+## Magnet path on the new layout (2026-10-14)
+
+`swiftorrent-bench --magnet ... --resolve-only`, Debian 13.7.0 netinst, 2 runs per form, same swarm snapshot:
+
+| Form | Run 1 | Run 2 |
+|---|---|---|
+| Tracker-backed | 1.1 s OK | 1.3 s OK |
+| Trackerless (DHT only) | 58.9 s OK | 90.1 s FAIL `metadataUnavailable` |
+
+Tracker-backed resolution matches the pre-restructure ~1 s. DHT-only is still possible but variable (one of two hit the 90 s phase budget), as in the 2026-08-15 sweep. The restructure did not regress the magnet path.

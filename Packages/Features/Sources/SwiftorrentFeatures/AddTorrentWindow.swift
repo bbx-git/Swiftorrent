@@ -63,12 +63,10 @@ public struct AddTorrentWindow: View {
     }
 
     @ViewBuilder private func reviewBody(_ item: TorrentItem) -> some View {
-        let selectedCount = item.files.filter(\.isSelected).count
-        let selectedBytes = item.files.filter(\.isSelected).reduce(Int64(0)) { $0 + $1.totalBytes }
-        let selectedBytesDescription = ByteCountFormatter.string(fromByteCount: selectedBytes, countStyle: .file)
+        let summary = FileSelectionSummary(files: item.files)
 
         HStack {
-            Text("\(selectedCount) of \(item.files.count) files · \(selectedBytesDescription)")
+            Text(summary.description)
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
@@ -133,7 +131,7 @@ public struct AddTorrentWindow: View {
             .keyboardShortcut(.defaultAction)
             .buttonStyle(.borderedProminent)
             .tint(.swiftorrentGraphite)
-            .disabled(selectedCount == 0)
+            .disabled(summary.selectedCount == 0)
         }
     }
 

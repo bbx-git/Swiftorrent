@@ -50,6 +50,6 @@ New experimental features or tiny helpers may start in `App/<App>/Incubator/`. M
 ## Swiftorrent specifics
 - Package directories are `Core`, `Domain`, `Features`; their modules keep the `Swiftorrent` prefix (`SwiftorrentCore`, `SwiftorrentDomain`, `SwiftorrentFeatures`) to avoid generic module names.
 - The root `Package.swift` depends on the three packages by path. The executable target `Swiftorrent` (`App/Swiftorrent`) must match `CFBundleExecutable`.
-- Run each package's tests with `--package-path Packages/<Name>`; `Features` has no test target yet.
+- Run each package's tests with `--package-path Packages/<Name>`.
 - `Tools/SwiftorrentBench` is a second root executable target that depends only on Core. It is not part of the app bundle.
 - Download-only policy: [decisions/0002-download-only-policy.md](decisions/0002-download-only-policy.md).

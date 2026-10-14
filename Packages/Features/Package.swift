@@ -22,6 +22,10 @@ let package = Package(
                 .product(name: "SwiftorrentDomain", package: "Domain")
             ],
             swiftSettings: [.defaultIsolation(MainActor.self)]
+        ),
+        .testTarget(
+            name: "SwiftorrentFeaturesTests",
+            dependencies: ["SwiftorrentFeatures"]
         )
     ]
 )
