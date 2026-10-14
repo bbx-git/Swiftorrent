@@ -46,4 +46,3 @@ Full feature and protocol reference. The short list is in [README.md](../README.
 ## Future work
 
 - **uTP (BEP 29).** Peers that prefer or require uTP over TCP are unreachable today.
-- **Notarization.** Add `Scripts/notarize.sh` so the packaged app passes Gatekeeper on other Macs; see `docs/DISTRIBUTION.md`.

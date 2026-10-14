@@ -15,7 +15,7 @@ Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages
 - Web-seed segments are written strictly in order; resume depends on the partial file being a contiguous prefix (`docs/decisions/0004-web-seed-ordered-segments.md`).
 
 ## Next
-1. Future work (in `docs/FEATURES.md`): uTP, notarization (`Scripts/notarize.sh`); both need the user's direction.
+1. Future work (in `docs/FEATURES.md`): uTP; needs the user's direction.
 2. Optional: a longer trackerless sweep over other info-hashes (only Debian was measured).
 
 ## Open problems

@@ -8,5 +8,5 @@ The app is a SwiftPM executable (`Package.swift`). `Scripts/build.sh` runs `swif
 
 ## Consequences
 - No `.xcodeproj`, no Xcode setup step; Claude can create everything.
-- No iOS apps, entitlements or notarization. Distribution would add `Scripts/notarize.sh` and a Developer ID later.
+- No iOS apps, entitlements or notarization (see `docs/DISTRIBUTION.md` if the app is ever distributed).
 - Alternative rejected: committed Xcode project plus inline `xcodebuild` commands. It needs manual Xcode setup per app.
