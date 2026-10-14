@@ -55,4 +55,4 @@ Scripts/build.sh
 4. Finish with a one-line summary.
 
 ## Lessons
-- _none yet_
+- When migrating a project to the template, rewrite its README/SESSION_STATE to the template's shape (README ~30 lines, details in `docs/`); don't patch the old files.
