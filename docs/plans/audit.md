@@ -11,60 +11,60 @@ torrents, resume verification). Found by reading all of `Packages/Core` and
 Every fix starts with a failing regression test. One commit per step.
 
 **Crashes and resource exhaustion (hostile input)**
-- [ ] 1. Bencode: cap nesting depth (~64). A deeply nested `llll…` from any
+- [x] 1. Bencode: cap nesting depth (~64). A deeply nested `llll…` from any
       tracker, DHT node, PEX peer or metadata blows the 512 KB task stack.
-- [ ] 2. Metainfo validation: reject negative file lengths, overflow in the size
+- [x] 2. Metainfo validation: reject negative file lengths, overflow in the size
       sum (traps today), `piece length` above a sane cap (allocates
       `Data(count: pieceLength)` per piece), and a piece-hash count that does not
       match `ceil(totalSize / pieceLength)` (negative last-piece length traps).
-- [ ] 3. Peer wire memory: `downloadPieces` parses bitfields with no piece count
+- [x] 3. Peer wire memory: `downloadPieces` parses bitfields with no piece count
       (1 MiB bitfield -> ~8M-entry set per peer) and accepts `have` indices
       beyond the torrent; metadata pieces are not capped at 16 KiB (a hostile
       peer can make `fetchMetadata` buffer ~640 MiB); block `begin`/length are
       not checked against the request grid.
-- [ ] 4. Snub/idle timers reset on any message, so a peer sending keep-alives or
+- [x] 4. Snub/idle timers reset on any message, so a peer sending keep-alives or
       `have`s forever pins a worker slot (and the metadata loops). Base the
       timeout on the last data block, and bound `readMetadataPiece` by a deadline.
-- [ ] 5. Bounded network bodies: HTTP tracker reply, exact-source `.torrent`,
+- [x] 5. Bounded network bodies: HTTP tracker reply, exact-source `.torrent`,
       web-seed range/segment (`session.data` buffers the whole body; a `200` to
       a range request downloads the entire file into memory). Sequential web
       seed keeps writing past `file.length` (disk fill).
-- [ ] 6. Peer address hygiene: drop loopback/unspecified/multicast/broadcast
+- [x] 6. Peer address hygiene: drop loopback/unspecified/multicast/broadcast
       endpoints from trackers, PEX and DHT; cap `PeerSupply` growth (PEX can
       feed it without bound).
 
 **Bugs**
-- [ ] 7. Single-file web seed: BEP 19 uses a `url-list` entry without a trailing
+- [x] 7. Single-file web seed: BEP 19 uses a `url-list` entry without a trailing
       `/` as-is; we always append the file name (`.../x.iso/x.iso` -> 404).
       Confirm with a test before changing.
-- [ ] 8. `verifiedPieces` is not cancellable: pausing or removing during a
+- [x] 8. `verifiedPieces` is not cancellable: pausing or removing during a
       resume hash scan blocks until the scan finishes (folded into step 10).
 
 **Stale code**
-- [ ] 9. Remove unused `PeerWireClient.currentAvailability`, `isEncrypted`,
+- [x] 9. Remove unused `PeerWireClient.currentAvailability`, `isEncrypted`,
       `RateLimiter.currentLimit`, `TorrentMetainfo.displaySize`,
       `TorrentLayout.fileCount`, `TorrentFileWriter.preparePartialFile`. Fix
       doc comments that contradict the code (tracker port, see Open questions).
 
 **Performance** (baseline with `swiftorrent-bench` / a synthetic many-file
 fixture first; drop a step if the gain is under ~5%)
-- [ ] 10. `TorrentFileWriter.write/read` recompute file offsets with a prefix sum
+- [x] 10. `TorrentFileWriter.write/read` recompute file offsets with a prefix sum
       per file per piece (O(files^2) per piece); use `TorrentLayout` offsets
       with binary search. Hash resume verification across cores and check
       cancellation. Same O(pieces x files) in `boundaryNeighborSlices`.
-- [ ] 11. Sequential web seed iterates `AsyncBytes` one byte at a time with a
+- [-] 11. Sequential web seed iterates `AsyncBytes` one byte at a time with a
       cancellation check per byte; read in chunks.
-- [ ] 12. Throttle progress to the main actor (<= 10 Hz). Today every verified
+- [x] 12. Throttle progress to the main actor (<= 10 Hz). Today every verified
       piece sends an all-files snapshot and rebuilds a dictionary on the main
       thread.
-- [ ] 13. Read/parse `.torrent` files and restore the session off the main
+- [x] 13. Read/parse `.torrent` files and restore the session off the main
       actor (the `Task` in `TorrentSession` inherits `@MainActor`).
-- [ ] 14. Measure-first, likely skip: per-operation `withTimeout` task groups on
+- [x] 14. Measure-first, likely skip: per-operation `withTimeout` task groups on
       every socket read; `PieceDownloadCoordinator.nextPiece` O(pending) per
       claim; MSE modexp uses bitwise division (~0.1 s CPU per handshake).
 
 **Guard**
-- [ ] 15. Seeded mutation (fuzz) tests: `BencodeParser`, `TorrentMetainfoParser`,
+- [x] 15. Seeded mutation (fuzz) tests: `BencodeParser`, `TorrentMetainfoParser`,
       `UTPPacket.init?`, `UTPConnectionCore.receive`, DHT/PEX/compact-peer
       parsers, `MagnetLinkParser`. Must never trap and must finish in bounded
       time.
@@ -92,6 +92,20 @@ Fold into a step above if touched anyway; otherwise leave.
 - Session deletion, directory pruning and `items.first(where:)` per progress
   tick run on the main actor.
 - `.torrent` files are read with no size cap.
+
+## Scope changes
+- 2026-10-14, step 6: loopback peers are kept (the swarm tests and local swarms use
+  127.0.0.1); only unspecified, multicast, broadcast and reserved addresses drop.
+- 2026-10-14, step 8: folded into step 10 (`verifiedPiecesConcurrently` is cancellable).
+- 2026-10-14, step 10: 16,000 one-KB files: write 13.9 s -> 3.2 s, verify 34.6 s -> 1.1 s.
+- 2026-10-14, step 11: skipped. `AsyncBytes` measured at ~50 MiB/s (one core) on
+  the in-process stub; only the sequential fallback uses it, and the segmented
+  path covers servers that honor `Range`. Revisit if a real server is faster.
+- 2026-10-14, step 13: only `.torrent` parsing moved off the main actor; session
+  restore at launch stays synchronous so the list is populated before the UI appears.
+- 2026-10-14, step 14: MSE handshake measured at 8.9 ms (left). Piece claims
+  at 100k pieces were 2.5 ms; now a one-pass scan over a flat counts array.
+  Per-read `withTimeout` task groups were not measured and are left.
 
 ## Open questions
 - Tracker `port`: decision 0002 and `docs/FEATURES.md` say `port=0`, but

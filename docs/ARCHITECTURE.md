@@ -53,4 +53,5 @@ New experimental features or tiny helpers may start in `App/<App>/Incubator/`. M
 - Run each package's tests with `--package-path Packages/<Name>`.
 - `Tools/SwiftorrentBench` is a second root executable target that depends only on Core. It is not part of the app bundle.
 - Download-only policy: [decisions/0002-download-only-policy.md](decisions/0002-download-only-policy.md).
+- Hostile-input limits: `BencodeParser.maxDepth`, `TorrentMetainfoParser.maxPieceLength`, `PeerSupply.maxPeers`, and `BoundedHTTPClient` (byte-capped HTTP bodies for trackers, exact sources and web-seed ranges) bound what a torrent, peer, tracker or server can make us allocate. Tests: `HostileInputTests`, `BoundedHTTPTests`, `FuzzTests`.
 - Peer transport: `PeerWireClient` talks to a `PeerTransport` (`TCPPeerTransport`, `UTPPeerTransport` in `PeerTransport.swift`). uTP is a sans-I/O state machine (`UTPConnectionCore`, driven by tests with a virtual clock) plus the `UTPPacket` codec; `UTPProbe` backs `--utp-probe`. See [decisions/0006-utp-outbound-fallback.md](decisions/0006-utp-outbound-fallback.md).
