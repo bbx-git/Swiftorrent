@@ -26,18 +26,32 @@ public enum DHTClientError: Error, LocalizedError {
 }
 
 public struct DHTClient: Sendable {
+    typealias NodeQuery = @Sendable (DHTNodeEndpoint, Data, Data) async throws -> DHTGetPeersResponse
+
     private let bootstrapNodes: [DHTNodeEndpoint]
     private let queryLimit: Int
     private let parallelQueries: Int
+    private let nodeQuery: NodeQuery?
 
     public init(
         bootstrapNodes: [DHTNodeEndpoint] = Self.defaultBootstrapNodes,
         queryLimit: Int = 80,
         parallelQueries: Int = 8
     ) {
+        self.init(bootstrapNodes: bootstrapNodes, queryLimit: queryLimit, parallelQueries: parallelQueries, nodeQuery: nil)
+    }
+
+    /// Test seam: `nodeQuery` replaces the UDP `get_peers` exchange.
+    init(
+        bootstrapNodes: [DHTNodeEndpoint],
+        queryLimit: Int,
+        parallelQueries: Int,
+        nodeQuery: NodeQuery?
+    ) {
         self.bootstrapNodes = bootstrapNodes
         self.queryLimit = queryLimit
         self.parallelQueries = parallelQueries
+        self.nodeQuery = nodeQuery
     }
 
     /// Queries the DHT for peers on `infoHash`, returning them all at once.
@@ -68,49 +82,80 @@ public struct DHTClient: Sendable {
         var visited = Set<String>()
         var queried = 0
         var lastError: Error?
+        var reseeds = 0
 
-        while !queued.isEmpty, queried < queryLimit, peers.count < 96 {
-            try Task.checkCancellation()
-            let batch = queued.prefix(parallelQueries).filter { visited.insert(Self.key(for: $0)).inserted }
-            queued.removeFirst(min(parallelQueries, queued.count))
-            if batch.isEmpty { continue }
-            queried += batch.count
-
-            var fresh: [PeerEndpoint] = []
-            await withTaskGroup(of: Result<DHTGetPeersResponse, Error>.self) { group in
-                for node in batch {
+        // Sliding window: a finished query is replaced immediately, so one dead
+        // node never holds up the rest. The nearest known node is always asked
+        // next, so the walk converges on the info-hash instead of wandering.
+        await withTaskGroup(of: Result<DHTGetPeersResponse, Error>.self) { group in
+            var inFlight = 0
+            while true {
+                while inFlight < parallelQueries, queried < queryLimit, peers.count < 96,
+                      let node = Self.popClosest(from: &queued, to: infoHash) {
+                    guard visited.insert(Self.key(for: node)).inserted else { continue }
+                    queried += 1
+                    inFlight += 1
                     group.addTask {
                         do {
+                            if let nodeQuery {
+                                return .success(try await nodeQuery(node, infoHash, nodeID))
+                            }
                             return .success(try await queryGetPeers(node: node, infoHash: infoHash, nodeID: nodeID))
                         } catch {
                             return .failure(error)
                         }
                     }
                 }
-
-                for await result in group {
-                    switch result {
-                    case let .success(response):
-                        for peer in response.peers where peers.insert(peer).inserted {
-                            fresh.append(peer)
-                        }
-                        for node in response.nodes where !visited.contains(Self.key(for: node)) {
-                            queued.append(node)
-                        }
-                    case let .failure(error):
-                        lastError = error
+                guard inFlight > 0, let result = await group.next() else {
+                    // The walk died without a peer (silent routers, or nodes that
+                    // never answered): ask the bootstrap nodes again before giving up.
+                    if peers.isEmpty, reseeds < 2, queried < queryLimit, !Task.isCancelled {
+                        reseeds += 1
+                        visited.removeAll()
+                        queued = bootstrapNodes
+                        continue
                     }
+                    break
+                }
+                inFlight -= 1
+
+                switch result {
+                case let .success(response):
+                    let fresh = response.peers.filter { peers.insert($0).inserted }
+                    for node in response.nodes where !visited.contains(Self.key(for: node)) {
+                        queued.append(node)
+                    }
+                    if !fresh.isEmpty {
+                        await onPeers(fresh)
+                    }
+                case let .failure(error):
+                    lastError = error
+                }
+                if Task.isCancelled || peers.count >= 96 {
+                    group.cancelAll()
                 }
             }
-            if !fresh.isEmpty {
-                await onPeers(fresh)
-            }
         }
+        try Task.checkCancellation()
 
         if peers.isEmpty, let lastError {
             throw lastError
         }
         return Array(peers).shuffled()
+    }
+
+    /// Removes and returns the queued node nearest to `infoHash` by XOR distance.
+    /// Nodes without a known id (bootstrap routers) count as nearest, so they are
+    /// asked first.
+    static func popClosest(from queue: inout [DHTNodeEndpoint], to infoHash: Data) -> DHTNodeEndpoint? {
+        func distance(_ node: DHTNodeEndpoint) -> [UInt8] {
+            guard let id = node.id, id.count == infoHash.count else { return [UInt8](repeating: 0, count: infoHash.count) }
+            return zip(id, infoHash).map { $0 ^ $1 }
+        }
+        guard let index = queue.indices.min(by: { distance(queue[$0]).lexicographicallyPrecedes(distance(queue[$1])) }) else {
+            return nil
+        }
+        return queue.remove(at: index)
     }
 
     private func queryGetPeers(node: DHTNodeEndpoint, infoHash: Data, nodeID: Data) async throws -> DHTGetPeersResponse {
@@ -197,7 +242,7 @@ public struct DHTClient: Sendable {
 
     private func receive(on connection: NWConnection) async throws -> Data {
         try Task.checkCancellation()
-        return try await withTimeout(seconds: .seconds(7)) {
+        return try await withTimeout(seconds: .seconds(3)) {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
                     connection.receiveMessage { data, _, _, error in
@@ -273,7 +318,9 @@ public struct DHTClient: Sendable {
     public static let defaultBootstrapNodes: [DHTNodeEndpoint] = [
         DHTNodeEndpoint(host: "router.bittorrent.com", port: 6881),
         DHTNodeEndpoint(host: "dht.transmissionbt.com", port: 6881),
-        DHTNodeEndpoint(host: "router.utorrent.com", port: 6881)
+        DHTNodeEndpoint(host: "router.utorrent.com", port: 6881),
+        DHTNodeEndpoint(host: "dht.libtorrent.org", port: 25401),
+        DHTNodeEndpoint(host: "dht.aelitis.com", port: 6881)
     ]
 }
 

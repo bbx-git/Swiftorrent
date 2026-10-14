@@ -372,3 +372,20 @@ Swiftorrent is on par with aria2c and finished well ahead of transmission. The s
 | Trackerless (DHT only) | 58.9 s OK | 90.1 s FAIL `metadataUnavailable` |
 
 Tracker-backed resolution matches the pre-restructure ~1 s. DHT-only is still possible but variable (one of two hit the 90 s phase budget), as in the 2026-08-15 sweep. The restructure did not regress the magnet path.
+
+## DHT closest-first lookup (2026-10-14)
+
+`DHTClient` now asks the queued node nearest to the info-hash (XOR distance) next, keeps a sliding window of 8 queries instead of waiting for the slowest of each batch, re-seeds from the bootstrap routers (max 2 times) if a walk ends without a peer, uses a 3 s per-query timeout, and bootstraps from two more routers.
+
+Trackerless Debian 13.7.0 magnet, `--resolve-only`, same machine and day:
+
+| | Resolved | Time (OK runs) |
+|---|---|---|
+| Before (5 runs) | 3/5 (2 `timedOut`) | 29-54 s |
+| After (20 runs) | 20/20 | median 1.9 s, max 9 s |
+
+An intermediate version (no re-seed on empty walks) was 18/20; the two failures were walks that died without any peer.
+
+## Swarm, 3 trials (2026-10-14)
+
+Debian 13.7.0 netinst (756 MiB, pure swarm), `TRIALS=3 Scripts/benchmark.sh`, client order alternating. Median wall time: **Swiftorrent 18.8 s**, aria2c 20.4 s, transmission-cli 73.4 s. Swiftorrent TTFB 1.8-4.5 s, peak 58 MiB/s.
