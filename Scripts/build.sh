@@ -34,6 +34,9 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 cp "$BIN_PATH/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$INFO_PLIST" "$APP_BUNDLE/Contents/Info.plist"
+for icon in "$ROOT_DIR"/App/Resources/*.icns; do
+    [ -e "$icon" ] && cp "$icon" "$APP_BUNDLE/Contents/Resources/"
+done
 for bundle in "$BIN_PATH"/*.bundle; do
     [ -e "$bundle" ] && cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"
 done
