@@ -138,6 +138,11 @@ struct PeerSwarmDownloader: Sendable {
             if await coordinator.isComplete { return nil }
             guard let peer = await awaitNextPeer(supply: supply, coordinator: coordinator) else { return lastError }
 
+            // One slot per connection, shared by every running torrent. Held for the
+            // whole session (connect through drain) and released on every exit.
+            do { try await ConnectionBudget.swarm.acquire() } catch { return CancellationError() }
+            defer { ConnectionBudget.swarm.release() }
+
             let client = PeerWireClient(endpoint: peer, infoHash: context.metainfo.infoHash, peerID: context.peerID)
             do {
                 try Task.checkCancellation()
@@ -145,7 +150,7 @@ struct PeerSwarmDownloader: Sendable {
                 // worker dialing a replacement doesn't stomp the "Downloading from N
                 // peers" line the others are showing.
                 if await context.active.count == 0 {
-                    await context.progress(TorrentDownloadProgress(status: "Connecting to peers", downloadedBytes: await coordinator.downloadedBytes, totalBytes: context.downloadTotal))
+                    await context.progress(TorrentDownloadProgress(status: "Connecting to peers", downloadedBytes: await coordinator.downloadedBytes, totalBytes: context.downloadTotal, liveBytes: await coordinator.liveBytes))
                 }
                 try await withTimeout(seconds: .seconds(20)) {
                     try await client.connect()
@@ -167,7 +172,7 @@ struct PeerSwarmDownloader: Sendable {
 
             _ = await context.active.increment(client)
             let peers = await context.active.snapshot()
-            await context.progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: await coordinator.downloadedBytes, totalBytes: context.downloadTotal, connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
+            await context.progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: await coordinator.downloadedBytes, totalBytes: context.downloadTotal, liveBytes: await coordinator.liveBytes, connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
 
             let outcome = await drainPeer(client: client, supply: supply, coordinator: coordinator, writer: writer, context: context)
             await client.close()
@@ -272,7 +277,7 @@ struct PeerSwarmDownloader: Sendable {
                     let (downloaded, perFileBytes) = await coordinator.complete(pieceIndex: pieceIndex)
                     guard let perFileBytes else { return }
                     let peers = await active.snapshot()
-                    await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: downloaded, totalBytes: downloadTotal, files: mapper.snapshot(perFileBytes: perFileBytes), connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
+                    await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: downloaded, totalBytes: downloadTotal, liveBytes: await coordinator.liveBytes, files: mapper.snapshot(perFileBytes: perFileBytes), connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
                 },
                 onReturnPiece: { pieceIndex in
                     await coordinator.returnPiece(pieceIndex)
@@ -281,9 +286,9 @@ struct PeerSwarmDownloader: Sendable {
                     // Pace at block granularity so the shared cap holds smoothly, and
                     // refresh the verified total on a throttle so the row stays lively.
                     await limiter?.consume(blockBytes)
-                    if let verified = await coordinator.progressTick() {
+                    if let tick = await coordinator.progressTick(receivedBlockBytes: blockBytes) {
                         let peers = await active.snapshot()
-                        await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: verified, totalBytes: downloadTotal, connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
+                        await progress(TorrentDownloadProgress(status: Self.downloadingStatus(peerCount: peers.connected), downloadedBytes: tick.verified, totalBytes: downloadTotal, liveBytes: tick.live, connectedPeers: peers.connected, unchokedPeers: peers.unchoked))
                     }
                 },
                 onPeersDiscovered: { peers in

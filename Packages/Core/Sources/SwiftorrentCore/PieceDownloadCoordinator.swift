@@ -22,6 +22,10 @@ actor PieceDownloadCoordinator {
     private var assignments: [Int: Int] = [:]
     private var completedPieces: Set<Int>
     private var completedBytes: Int64
+    /// Block payload received this run, verified or not (including bytes of pieces
+    /// later discarded). Drives the live speed; `downloadedBytes` stays verified-only.
+    private var receivedBytes: Int64 = 0
+    private let initialDownloaded: Int64
     private var perFileBytes: [Int64]
     private let clock = ContinuousClock()
     private var lastReport: ContinuousClock.Instant?
@@ -31,6 +35,7 @@ actor PieceDownloadCoordinator {
         self.layout = layout
         self.completedPieces = completedPieces
         self.completedBytes = initialDownloaded
+        self.initialDownloaded = initialDownloaded
         var counts = [Int](repeating: Int.max, count: layout.pieceCount)
         for (piece, count) in availabilityCounts where piece >= 0 && piece < counts.count {
             counts[piece] = count
@@ -48,16 +53,24 @@ actor PieceDownloadCoordinator {
         completedBytes
     }
 
-    /// A throttled progress ping for the per-block download callback: returns the
-    /// current verified total at most every 200 ms (`nil` in between) so a fast
-    /// download can't flood the progress channel. The reported number moves only
-    /// when pieces actually complete, which is fine — with a wide worker pool a
-    /// piece finishes every second or two, keeping the bar lively but monotonic.
-    func progressTick() -> Int64? {
+    /// Verified bytes plus everything received since this run started: unlike
+    /// `downloadedBytes` it moves with every block, so a speed derived from it
+    /// reacts within a second even while the first 4 MiB piece is still assembling.
+    var liveBytes: Int64 {
+        initialDownloaded + receivedBytes
+    }
+
+    /// Counts a received block and returns a throttled progress ping for the
+    /// per-block download callback: at most every 200 ms (`nil` in between) so a
+    /// fast download can't flood the progress channel. `verified` moves only when
+    /// pieces complete (monotonic, never rewound by a dropped piece); `live` moves
+    /// with every block.
+    func progressTick(receivedBlockBytes: Int) -> (verified: Int64, live: Int64)? {
+        receivedBytes += Int64(receivedBlockBytes)
         let now = clock.now
         if let last = lastReport, now - last < .milliseconds(200) { return nil }
         lastReport = now
-        return completedBytes
+        return (completedBytes, liveBytes)
     }
 
     var isComplete: Bool {

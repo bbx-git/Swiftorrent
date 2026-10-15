@@ -33,6 +33,29 @@ struct ProgressThrottleTests {
         #expect(burst.allSatisfy { $0 == nil })
         #expect(later == [100])
     }
+
+    @Test("Live bytes count received blocks before their piece verifies")
+    func liveBytesCountInFlightBlocks() async throws {
+        let coordinator = makeCoordinator()
+
+        let first = await coordinator.progressTick(receivedBlockBytes: 4)
+        #expect(first?.verified == 0)
+        #expect(first?.live == 4)
+
+        // Inside the 200 ms window: throttled, but the bytes are still counted.
+        #expect(await coordinator.progressTick(receivedBlockBytes: 3) == nil)
+        try await Task.sleep(for: .milliseconds(250))
+        let later = await coordinator.progressTick(receivedBlockBytes: 1)
+        #expect(later?.live == 8)
+        #expect(later?.verified == 0)
+
+        // The piece's last bytes arrive and it verifies: verified catches up with
+        // live, and the piece is not counted twice.
+        _ = await coordinator.progressTick(receivedBlockBytes: 2)
+        _ = await coordinator.complete(pieceIndex: 0)
+        #expect(await coordinator.downloadedBytes == 10)
+        #expect(await coordinator.liveBytes == 10)
+    }
 }
 
 private extension Sequence {

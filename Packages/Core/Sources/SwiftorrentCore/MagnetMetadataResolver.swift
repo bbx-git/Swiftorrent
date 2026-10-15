@@ -11,14 +11,12 @@ public struct MagnetMetadataProgress: Sendable {
 
 public enum MagnetMetadataResolverError: Error, LocalizedError {
     case noSupportedTrackers
-    case noPeers
     case metadataHashMismatch
     case exactSourceInvalid
 
     public var errorDescription: String? {
         switch self {
         case .noSupportedTrackers: "No supported trackers or DHT bootstrap nodes are available for this magnet link yet."
-        case .noPeers: "Trackers did not return any usable peers."
         case .metadataHashMismatch: "Downloaded magnet metadata did not match the magnet info hash."
         case .exactSourceInvalid: "The exact-source torrent did not match the magnet info hash."
         }
@@ -83,26 +81,44 @@ public struct MagnetMetadataResolver: Sendable {
         // probing serially — or giving up after one pass — stalls or fails. The
         // cursor therefore **recycles**: workers keep handshaking peers (a peer
         // that was busy or still fetching metadata itself may serve on a later
-        // pass) until one delivers verified metadata or the phase deadline fires.
+        // pass) until one delivers verified metadata or the user cancels.
         // Peers gossiped by the swarm via inbound PEX during these probes are fed
         // back in too, so the phase reaches seeds beyond the tracker/DHT set (the
         // swarm-download path already does this).
         let cursor = PeerCursor(maxPeers: Self.maxMetadataPeers)
-        let fetchErrors = ErrorBox()
         let discoveryErrors = ErrorBox()
 
-        let metainfo = try await withThrowingTaskGroup(of: ResolveSignal.self) { group in
+        let metainfo = try await withThrowingTaskGroup(of: TorrentMetainfo?.self) { group in
             group.addTask {
-                await discoverPeers(
-                    trackers: trackers,
-                    magnet: magnet,
-                    peerID: peerID,
-                    into: cursor,
-                    errors: discoveryErrors,
-                    progress: progress
-                )
-                await cursor.finishDiscovery()
-                return .discoveryFinished
+                // Rounds of discovery, forever: a magnet that nobody answers yet (a
+                // fresh upload, a busy network, a client full of downloads) keeps
+                // looking like in other clients, and the user ends it with cancel.
+                // Peers found in any round feed the same cursor the probes draw on.
+                let started = ContinuousClock.now
+                while !Task.isCancelled {
+                    await discoverPeers(
+                        trackers: trackers,
+                        magnet: magnet,
+                        peerID: peerID,
+                        into: cursor,
+                        errors: discoveryErrors,
+                        progress: progress
+                    )
+                    let known = await cursor.count
+                    let elapsed = Self.elapsedDescription(since: started)
+                    if known == 0 {
+                        let reason = await discoveryErrors.lastError?.localizedDescription
+                        await progress(MagnetMetadataProgress(
+                            status: "No peers found yet, retrying (\(elapsed))" + (reason.map { ": \($0)" } ?? "")
+                        ))
+                    } else {
+                        await progress(MagnetMetadataProgress(
+                            status: "Waiting for a peer that has the metadata, \(known) known, retrying (\(elapsed))"
+                        ))
+                    }
+                    try? await Task.sleep(for: Self.rediscoveryInterval)
+                }
+                return nil
             }
 
             for _ in 0..<Self.maxConcurrentMetadataFetches {
@@ -112,17 +128,19 @@ public struct MagnetMetadataResolver: Sendable {
                     // answers wait for peers instead of exiting.
                     while let peer = try await cursor.next() {
                         do {
-                            let infoData = try await withTimeout(seconds: .seconds(15)) {
-                                try await fetchMetadata(from: peer, magnet: magnet, peerID: peerID) {
-                                    // Peer accepted our TCP + BitTorrent handshake, so it is
-                                    // reachable — worth retrying. ~3 of 4 swarm peers are NAT'd
-                                    // and never get here; concentrating retries on the reachable
-                                    // minority is what finds the rare metadata-serving seed.
-                                    await cursor.markReachable(peer)
-                                } onPeersDiscovered: { discovered in
-                                    // Feed PEX-gossiped peers back into the pool so the metadata
-                                    // phase expands beyond the initial tracker/DHT set.
-                                    await cursor.add(discovered)
+                            let infoData = try await ConnectionBudget.resolve.withSlot {
+                                try await withTimeout(seconds: .seconds(15)) {
+                                    try await fetchMetadata(from: peer, magnet: magnet, peerID: peerID) {
+                                        // Peer accepted our TCP + BitTorrent handshake, so it is
+                                        // reachable — worth retrying. ~3 of 4 swarm peers are NAT'd
+                                        // and never get here; concentrating retries on the reachable
+                                        // minority is what finds the rare metadata-serving seed.
+                                        await cursor.markReachable(peer)
+                                    } onPeersDiscovered: { discovered in
+                                        // Feed PEX-gossiped peers back into the pool so the metadata
+                                        // phase expands beyond the initial tracker/DHT set.
+                                        await cursor.add(discovered)
+                                    }
                                 }
                             }
                             let hash = Data(Insecure.SHA1.hash(data: infoData))
@@ -136,81 +154,49 @@ public struct MagnetMetadataResolver: Sendable {
                                 preferredName: magnet.displayName
                             )
                             await cursor.release(peer)
-                            return .resolved(metainfo)
+                            return metainfo
                         } catch is CancellationError {
                             await cursor.release(peer)
                             throw CancellationError()
                         } catch {
                             await cursor.release(peer)
-                            await fetchErrors.record(error)
                         }
                     }
-                    return .workerFinished
+                    return nil
                 }
             }
 
-            // Deadline sentinel bounding the whole phase, so a dead swarm errors in
-            // seconds-to-a-minute instead of hanging while a live-but-slow seed
-            // still gets found.
-            group.addTask {
-                try? await Task.sleep(for: Self.metadataPhaseDeadline)
-                return .deadline
-            }
-
+            // The first worker to deliver verified metadata ends the phase; there is
+            // no deadline. Only cancellation (the user's cancel, the add window
+            // closing) ends it otherwise.
             var resolved: TorrentMetainfo?
-            var liveWorkers = Self.maxConcurrentMetadataFetches
-            consume: for try await signal in group {
-                switch signal {
-                case let .resolved(metainfo):
-                    resolved = metainfo
-                    break consume
-                case .deadline:
-                    break consume
-                case .discoveryFinished:
-                    // Sources are done, but peers already found are still being
-                    // probed (and may still gossip more via PEX) — keep going.
-                    continue
-                case .workerFinished:
-                    // A worker only runs out of peers when the cursor is empty and
-                    // discovery is over, i.e. nothing was ever found. Once every
-                    // worker has hit that, there is nothing left to wait for.
-                    liveWorkers -= 1
-                    if liveWorkers == 0 { break consume }
-                }
+            for try await result in group where result != nil {
+                resolved = result
+                break
             }
             group.cancelAll()
             return resolved
         }
 
-        if let metainfo {
-            await progress(MagnetMetadataProgress(status: "Metadata resolved: \(metainfo.name)"))
-            return metainfo
-        }
-
-        // No peer ever reached the cursor means the failure was in discovery, so
-        // surface the tracker/DHT error rather than a stale fetch error.
-        if await cursor.count == 0 {
-            throw await discoveryErrors.lastError ?? MagnetMetadataResolverError.noPeers
-        }
-        throw await fetchErrors.lastError ?? MagnetMetadataResolverError.noPeers
+        guard let metainfo else { throw CancellationError() }
+        await progress(MagnetMetadataProgress(status: "Metadata resolved: \(metainfo.name)"))
+        return metainfo
     }
 
-    /// What a child of the resolve task group reports back.
-    private enum ResolveSignal: Sendable {
-        case resolved(TorrentMetainfo)
-        case discoveryFinished
-        case workerFinished
-        case deadline
-    }
-
-    /// Upper bound on peers probed for metadata per magnet, how many probes run
-    /// at once, and the wall-clock budget for the whole metadata phase. Trying a
-    /// wide slice of the swarm concurrently — and retrying it until the deadline —
-    /// is what keeps a magnet from stalling behind unreachable/slow peers while
-    /// still finding the occasional slow seed that actually has the metadata.
+    /// Upper bound on peers probed for metadata per magnet, and how many probes
+    /// run at once. Trying a wide slice of the swarm concurrently — and retrying it
+    /// until the user cancels — is what keeps a magnet from stalling behind
+    /// unreachable/slow peers while still finding the occasional slow seed that
+    /// actually has the metadata. Probes also draw on `ConnectionBudget.resolve`.
     private static let maxMetadataPeers = 300
     private static let maxConcurrentMetadataFetches = 64
-    private static let metadataPhaseDeadline: Duration = .seconds(90)
+    /// Pause between discovery rounds (tracker announces and a DHT lookup each).
+    private static let rediscoveryInterval: Duration = .seconds(30)
+
+    private static func elapsedDescription(since start: ContinuousClock.Instant) -> String {
+        let seconds = Int(start.duration(to: .now).components.seconds)
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
 
     private func resolveFromExactSources(
         magnet: MagnetLink,
