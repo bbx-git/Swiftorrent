@@ -307,6 +307,7 @@ public final class TorrentSession {
             item.status = progress.status
             item.totalBytes = progress.totalBytes
             item.downloadedBytes = progress.downloadedBytes
+            item.liveBytes = progress.liveBytes
             item.progress = progress.fractionCompleted
             item.applyFileProgress(progress.files)
             item.state = progress.fractionCompleted >= 1 ? .complete : .downloading

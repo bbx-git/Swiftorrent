@@ -64,6 +64,9 @@ public struct TorrentItem: Identifiable, Equatable, Sendable {
     /// (sampled once a second by the session, never persisted); it is 0 unless
     /// the torrent is actively downloading.
     public var downloadSpeed: Int64 = 0
+    /// Verified bytes plus blocks received for pieces still assembling. Transient
+    /// like `downloadSpeed`; the speed is derived from it, the progress bar is not.
+    public var liveBytes: Int64 = 0
 
     public init(name: String, source: Source, destination: URL, totalBytes: Int64) {
         self.id = UUID()

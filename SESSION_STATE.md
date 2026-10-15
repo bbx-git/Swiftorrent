@@ -8,6 +8,8 @@ _Overwritten at every wrap-up, never appended. Under 30 lines; git has the histo
 Download-only BitTorrent client (macOS 26, SwiftUI, no deps). Modules: `Packages/Core` (SwiftorrentCore: bencode, trackers, DHT, peer wire over TCP/uTP, MSE, downloader), `Domain` (TorrentSession, store), `Features` (SwiftUI, has a test target), app in `App/Swiftorrent`, bench in `Tools/SwiftorrentBench`.
 
 ## Recent fixes (don't regress)
+- Adding with many torrents (decision 0010): `ConnectionBudget` shared across torrents, separate pool for resolve probes, magnet resolve never times out (status shows retries; tests `ConnectionBudgetTests`, `PatientResolveTests`). Speed from `liveBytes` (`SpeedWindow`, `ProgressThrottleTests`); the bar is verified-only.
+- Finder-launched app has a 256-fd soft limit: 100 peers x TCP+uTP plus a second magnet resolve hit "Too many open files" and showed "The network operation timed out." `FileDescriptorLimit.raise()` runs at app start (test `FileDescriptorLimitTests`). The terminal bench has 1M, so it never reproduced.
 - Choked peers give way: dropped after 60 s choked when untried peers wait, even if they keep sending HAVEs (decision 0009, `ChokedPeerTimeoutTests`). Progress carries connected/unchoked counts; the bench prints them.
 - Slow start: uTP races TCP after a 1 s head start (`openFirst`, test `TransportRaceTests`, decision 0006); magnet resolver probes 64 peers at once; a web seed with no first chunk in 5 s is skipped, 10 s total before the swarm (tests in `WebSeedSegmentTests`). Numbers in `docs/BENCHMARK.md`, "Magnet slow start".
 - No download traces (decision 0008): all HTTP uses `URLSession.traceless` (test `TracelessHTTPTests`); torrent names/paths log `.private`.
