@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftorrentCore
 import SwiftorrentDomain
 import SwiftorrentFeatures
 
@@ -36,6 +37,10 @@ struct SwiftorrentApp: App {
     // both scenes below, so the main window and every add-torrent window operate
     // on the same live session instead of each getting its own.
     @State private var session = TorrentSession()
+
+    init() {
+        FileDescriptorLimit.raise()
+    }
 
     var body: some Scene {
         // A singleton window, not `WindowGroup`: this is a single-window utility
